@@ -36,6 +36,9 @@ string customDir = Path.Combine(AppContext.BaseDirectory, "custom_versioned");
 string customVersionStore = Path.Combine(AppContext.BaseDirectory, "custom_versions_store");
 Directory.CreateDirectory(customDir);
 
+// --- Eigene Lock-Verwaltung mit persistentem Audit-Trail (Override-Demo, siehe DemoAuditingLockManager) ---
+string lockAuditFile = Path.Combine(AppContext.BaseDirectory, "locks", "lock_audit.log");
+
 // --- Benutzer-DB (lokal; später per LDAP/AD austauschbar) ---------------------
 var identities = new InMemoryIdentityBackend()
     .AddUser(Domain, User, Password, userSid: "S-1-5-21-100-200-300-1001");
@@ -64,6 +67,8 @@ await using SmbServer server = SmbServerBuilder.Create()
             customVersionStore,
             msg => Console.WriteLine($"[customver] {msg}")),
     })
+    // Eigene Lock-Verwaltung einklinken (Default wäre der prozesslokale InMemoryLockManager).
+    .UseLockManager(new DemoAuditingLockManager(lockAuditFile, log: msg => Console.WriteLine($"[locks] {msg}")))
     .WithLogger(msg => Console.WriteLine($"[server] {msg}"))
     .Build();
 
@@ -71,6 +76,7 @@ await server.StartAsync();
 Console.WriteLine($"Share 'Files':          {shareDir}");
 Console.WriteLine($"Share 'Versions':       {versionDir} (Lib-Default, In-Memory)");
 Console.WriteLine($"Share 'CustomVersions': {customDir} (eigene Impl, persistent → {customVersionStore})");
+Console.WriteLine($"Lock-Audit:             {lockAuditFile} (eigener ILockManager)");
 Console.WriteLine($"Anmeldung:              {Domain}\\{User} / {Password}");
 Console.WriteLine();
 

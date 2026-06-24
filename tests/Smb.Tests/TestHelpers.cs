@@ -314,6 +314,47 @@ internal static class TestHelpers
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
     }
 
+    /// <summary>Baut einen LOCK-Request mit beliebig vielen Lock-/Unlock-Elementen.</summary>
+    public static byte[] BuildLockRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, (ulong Offset, ulong Length, uint Flags)[] locks,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(24 + locks.Length * 24);
+        body.WriteUInt16(48);                      // StructureSize
+        body.WriteUInt16((ushort)locks.Length);    // LockCount
+        body.WriteUInt32(0);                       // LockSequenceNumber/Index
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        foreach ((ulong Offset, ulong Length, uint Flags) l in locks)
+        {
+            body.WriteUInt64(l.Offset);
+            body.WriteUInt64(l.Length);
+            body.WriteUInt32(l.Flags);
+            body.WriteUInt32(0);                   // Reserved
+        }
+
+        byte[] header = BuildHeader(SmbCommand.Lock, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    /// <summary>Baut einen CHANGE_NOTIFY-Request für ein Verzeichnis-Handle.</summary>
+    public static byte[] BuildChangeNotifyRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, uint completionFilter, ushort flags = 0,
+        uint outputBufferLength = 65536, byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(32);
+        body.WriteUInt16(32);              // StructureSize
+        body.WriteUInt16(flags);
+        body.WriteUInt32(outputBufferLength);
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        body.WriteUInt32(completionFilter);
+        body.WriteUInt32(0);               // Reserved
+
+        byte[] header = BuildHeader(SmbCommand.ChangeNotify, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
     private static byte[] Finish(byte[] header, byte[] body, ulong messageId, byte[]? signingKey, SmbSigningAlgorithmId alg)
     {
         byte[] message = Concat(header, body);

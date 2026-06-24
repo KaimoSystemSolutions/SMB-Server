@@ -11,6 +11,12 @@ public interface IFileHandle : IDisposable
     string Path { get; }
     bool IsDirectory { get; }
     FileEntryInfo GetInfo();
+
+    /// <summary>
+    /// Realer Pfad im zugrunde liegenden Dateisystem — für CHANGE_NOTIFY-Watcher, OS-Locks u.ä.,
+    /// die einen echten Pfad brauchen. <c>null</c>, wenn das Backend keinen hat (virtuell/In-Memory).
+    /// </summary>
+    string? PhysicalPath => null;
 }
 
 /// <summary>

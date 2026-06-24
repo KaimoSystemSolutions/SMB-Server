@@ -125,11 +125,11 @@ public class DispatcherEndToEndTests
         var (dispatcher, _, conn) = NewServer();
         dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
 
-        // LOCK ist noch nicht implementiert (Phase ≥M5) → STATUS_NOT_SUPPORTED.
-        byte[] lockReq = TestHelpers.Concat(
-            TestHelpers.BuildHeader(SmbCommand.Lock, 1, sessionId: 0),
+        // OPLOCK_BREAK ist noch nicht implementiert → STATUS_NOT_SUPPORTED.
+        byte[] obReq = TestHelpers.Concat(
+            TestHelpers.BuildHeader(SmbCommand.OplockBreak, 1, sessionId: 0),
             new byte[24]);
-        byte[] resp = dispatcher.ProcessMessage(conn, lockReq);
+        byte[] resp = dispatcher.ProcessMessage(conn, obReq);
         Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(resp).Status);
     }
 

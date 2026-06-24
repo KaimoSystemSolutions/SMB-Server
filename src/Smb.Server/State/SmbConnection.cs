@@ -74,4 +74,28 @@ public sealed class SmbConnection
 
     /// <summary>Vergibt eine neue, eindeutige (volatile) FileId für ein Open (Context §13).</summary>
     public ulong AllocateFileId() => (ulong)Interlocked.Increment(ref _fileIdCounter);
+
+    // --- Asynchrone (out-of-band) Antworten: blockierende Locks, später ChangeNotify/Oplocks ---
+
+    private long _asyncIdCounter;
+
+    /// <summary>Vergibt eine neue, pro Connection eindeutige AsyncId (Context §4, ASYNC-Header).</summary>
+    public ulong AllocateAsyncId() => (ulong)Interlocked.Increment(ref _asyncIdCounter);
+
+    /// <summary>
+    /// Vom Host gesetzter, serialisierter Sendekanal für eine bereits fertige (Header+Body, ggf.
+    /// signierte) SMB2-Antwort. Verschlüsselung und NBSS-Rahmung übernimmt der Host. Erlaubt es,
+    /// die <i>finale</i> Antwort einer asynchron ausstehenden Operation out-of-band zu senden.
+    /// </summary>
+    public Func<byte[], Task>? SendRawAsync { get; set; }
+
+    /// <summary>Ausstehende asynchrone Operationen (MessageId → Eintrag), für CANCEL/Teardown.</summary>
+    public ConcurrentDictionary<ulong, PendingAsyncRequest> PendingRequests { get; } = new();
+
+    /// <summary>Bricht alle ausstehenden asynchronen Operationen ab (Connection-Teardown).</summary>
+    public void CancelAllPending()
+    {
+        foreach (PendingAsyncRequest p in PendingRequests.Values) p.Cancel();
+        PendingRequests.Clear();
+    }
 }

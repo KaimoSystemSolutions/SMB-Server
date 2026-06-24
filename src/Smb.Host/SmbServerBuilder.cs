@@ -6,6 +6,8 @@ using Smb.FileSystem.Versioning;
 using Smb.Protocol.Enums;
 using Smb.Server;
 using Smb.Server.Authorization;
+using Smb.Server.Locking;
+using Smb.Server.Notification;
 
 namespace Smb.Host;
 
@@ -127,6 +129,28 @@ public sealed class SmbServerBuilder
         Func<ShareAccessContext, bool>? isVisible = null)
     {
         _options.ShareAccessPolicy = new DelegateSharePolicy(authorizeConnect, isVisible);
+        return this;
+    }
+
+    /// <summary>
+    /// Setzt die Byte-Range-Lock-Verwaltung (SMB2 LOCK, Context §15). Default ist prozesslokal
+    /// (<see cref="InMemoryLockManager"/>); eine eigene <see cref="ILockManager"/>-Implementierung
+    /// kann das Locking z.B. ans Betriebssystem oder einen Cluster delegieren.
+    /// </summary>
+    public SmbServerBuilder UseLockManager(ILockManager lockManager)
+    {
+        _options.LockManager = lockManager;
+        return this;
+    }
+
+    /// <summary>
+    /// Setzt die Quelle für CHANGE_NOTIFY (Context §16). Default überwacht echte Verzeichnisse via
+    /// <see cref="FileSystemWatcher"/>; eine eigene <see cref="IDirectoryWatcher"/>-Implementierung
+    /// kann an inotify, ZFS-Events o.ä. andocken, oder <see cref="NullDirectoryWatcher"/> schaltet ab.
+    /// </summary>
+    public SmbServerBuilder UseDirectoryWatcher(IDirectoryWatcher watcher)
+    {
+        _options.DirectoryWatcher = watcher;
         return this;
     }
 

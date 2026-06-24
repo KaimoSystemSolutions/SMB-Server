@@ -87,9 +87,9 @@ public sealed partial class Smb2Dispatcher
             }
 
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} tid={header.TreeId} len={segment.Length} charge={header.CreditCharge}");
-            ResponseSegment response = DispatchOne(connection, header, segment);
-            _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {response.Header.Status}");
-            segments.Add(response);
+            ResponseSegment? response = DispatchOne(connection, header, segment);
+            _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(keine Antwort)")}");
+            if (response is { } seg) segments.Add(seg);
 
             if (header.NextCommand == 0) break;
             offset += segmentLength;
@@ -98,7 +98,7 @@ public sealed partial class Smb2Dispatcher
         return AssembleResponse(segments);
     }
 
-    private ResponseSegment DispatchOne(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment? DispatchOne(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
     {
         try
         {
@@ -119,6 +119,9 @@ public sealed partial class Smb2Dispatcher
                 SmbCommand.SetInfo => HandleSetInfo(connection, header, segment),
                 SmbCommand.Flush => HandleFlush(connection, header, segment),
                 SmbCommand.Ioctl => HandleIoctl(connection, header, segment),
+                SmbCommand.Lock => HandleLock(connection, header, segment),
+                SmbCommand.Cancel => HandleCancel(connection, header, segment),
+                SmbCommand.ChangeNotify => HandleChangeNotify(connection, header, segment),
                 _ => BuildError(header, NtStatus.NotSupported),
             };
         }

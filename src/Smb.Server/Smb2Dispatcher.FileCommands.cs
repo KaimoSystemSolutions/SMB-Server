@@ -211,6 +211,7 @@ public sealed partial class Smb2Dispatcher
 
         FileEntryInfo? info = (flags & CloseMessage.FlagPostQueryAttributes) != 0 ? open.LocalOpen?.GetInfo() : null;
         session.Opens.TryRemove(open.Key, out _);
+        ReleaseLocks(connection, open);
         open.LocalOpen?.Dispose();
 
         byte[] body = info is null
@@ -241,6 +242,8 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, err == NtStatus.Success ? NtStatus.FileClosed : err);
 
         uint length = Math.Min(req.Length, connection.MaxReadSize);
+        if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, length, forWrite: false))
+            return BuildError(header, NtStatus.FileLockConflict);
         var buffer = new byte[length];
         FileStoreResult<int> result = store.Read(open.LocalOpen, (long)req.Offset, buffer);
         if (!result.IsSuccess)
@@ -272,6 +275,9 @@ public sealed partial class Smb2Dispatcher
 
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err) || open.LocalOpen is null)
             return BuildError(header, err == NtStatus.Success ? NtStatus.FileClosed : err);
+
+        if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, (ulong)req.Data.Length, forWrite: true))
+            return BuildError(header, NtStatus.FileLockConflict);
 
         FileStoreResult<int> result = store.Write(open.LocalOpen, (long)req.Offset, req.Data);
         if (!result.IsSuccess)

@@ -5,10 +5,11 @@ Microsoft Open Specifications (MS-SMB2, MS-FSCC, MS-NLMP, MS-ERREF, MS-SPNG, MS-
 Grundlage und Faktencheck: [`SMB2-3_Server_Context.md`](../SMB2-3_Server_Context.md).
 
 > **Reifegrad.** Diese Lib ist ein **korrektes, voll getestetes Fundament** (Meilensteine
-> M1–M3 vollständig, M4 teilweise; siehe [Roadmap](#roadmap)). Der wire-/krypto-kritische
-> Kern ist gegen offizielle Testvektoren verifiziert. Datei-I/O (CREATE/READ/WRITE/…) ist als
-> Backend-Schnittstelle vorgezeichnet, aber noch nicht implementiert — diese Commands
-> antworten aktuell mit `STATUS_NOT_SUPPORTED`.
+> M1–M5 weitgehend fertig; siehe [Roadmap](#roadmap)). Der wire-/krypto-kritische Kern ist
+> gegen offizielle Testvektoren verifiziert. Datei-I/O (CREATE/READ/WRITE/QUERY_*/SET_INFO/
+> CLOSE) läuft über ein `IFileStore`-Backend (`LocalFileStore`); Byte-Range-**LOCK** ist inkl.
+> blockierender Locks (`STATUS_PENDING` + Interim-Antwort, `CANCEL`) implementiert und über
+> einen austauschbaren `ILockManager` verdrahtet.
 
 ## Schnellstart
 
@@ -108,7 +109,7 @@ Build & Tests:
 dotnet test
 ```
 
-Die Suite (67 Tests) deckt u.a. ab:
+Die Suite (106 Tests) deckt u.a. ab:
 
 - **Offizielle Krypto-Vektoren:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5),
   NTOWFv2 (MS-NLMP §4.2-Beispiel).
@@ -129,11 +130,11 @@ Die Suite (67 Tests) deckt u.a. ab:
 | M2 Negotiate (inkl. 3.1.1-Contexts, Preauth-Hash) | ✅ |
 | M3 Auth (SPNEGO + **echtes NTLMv2-Login**, Key-Derivation, Signing) | ✅ (MIC-Verifikation noch offen) |
 | M4 Tree & Dateizugriff (CREATE/READ/QUERY_DIRECTORY/QUERY_INFO/CLOSE) | ✅ über `LocalFileStore` |
-| M5 Schreiben (WRITE ✅; SET_INFO/Rename/Locks offen) | 🟡 |
+| M5 Schreiben (WRITE, SET_INFO/Rename/Delete ✅; **Byte-Range-LOCK ✅** inkl. blockierend + CANCEL, austauschbarer `ILockManager`) | ✅ |
 | M6 Encryption & Härtung (Transform-Pfad) | 🟡 Krypto fertig; Per-Share-Verdrahtung offen |
 | Share-Enumeration (srvsvc NetrShareEnum über DCERPC/IPC$, IOCTL FSCTL_PIPE_TRANSCEIVE) | ✅ |
 | SMB1→SMB2 Negotiate-Upgrade (§6.1, für impacket u.a.) | ✅ |
-| M7 Oplocks/Leases/ChangeNotify/Compound-Feinschliff | ⬜ |
+| M7 **CHANGE_NOTIFY ✅** (austauschbarer `IDirectoryWatcher`, Default `FileSystemWatcher`); Oplocks/Leases/Compound-Feinschliff offen | 🟡 |
 | Native Windows-Explorer-Interop (volle FSCC/IOCTL-Abdeckung, Secure Negotiate) | ⬜ |
 | M8 Kerberos, LDAP-Backend, Multichannel, Durable Handles, DFS, QUIC, RDMA | ⬜ |
 

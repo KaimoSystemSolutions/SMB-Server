@@ -254,6 +254,7 @@ internal sealed class LocalFileHandle : IFileHandle
     public string Path { get; }
     public bool DeleteOnClose { get; set; }
     public bool IsDirectory => Directory.Exists(FullPath);
+    public string? PhysicalPath => FullPath;
 
     public FileEntryInfo GetInfo()
     {

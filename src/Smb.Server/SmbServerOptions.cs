@@ -2,6 +2,8 @@ using Smb.Auth;
 using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Server.Authorization;
+using Smb.Server.Locking;
+using Smb.Server.Notification;
 
 namespace Smb.Server;
 
@@ -67,6 +69,21 @@ public sealed class SmbServerOptions
     /// Eigene Policy setzen, um pro User/Gruppe zu filtern und Rechte zu begrenzen.
     /// </summary>
     public IShareAccessPolicy ShareAccessPolicy { get; set; } = new AllowAllSharePolicy();
+
+    /// <summary>
+    /// Byte-Range-Lock-Verwaltung (SMB2 LOCK, Context §15). Default
+    /// <see cref="InMemoryLockManager"/> (prozesslokal). Eigene Implementierung setzen, um z.B.
+    /// ans Betriebssystem oder einen Cluster zu delegieren.
+    /// </summary>
+    public ILockManager LockManager { get; set; } = new InMemoryLockManager();
+
+    /// <summary>
+    /// Quelle für Verzeichnis-Änderungen (SMB2 CHANGE_NOTIFY, Context §16). Default
+    /// <see cref="FileSystemDirectoryWatcher"/> (überwacht echte Pfade). Auf
+    /// <see cref="NullDirectoryWatcher"/> setzen, um CHANGE_NOTIFY abzuschalten
+    /// (→ <c>STATUS_NOT_SUPPORTED</c>), oder eine eigene Quelle (inotify, ZFS-Events …) einklinken.
+    /// </summary>
+    public IDirectoryWatcher DirectoryWatcher { get; set; } = new FileSystemDirectoryWatcher();
 
     /// <summary>Validiert die Konfiguration und wirft bei Fehlkonfiguration.</summary>
     public void Validate()
