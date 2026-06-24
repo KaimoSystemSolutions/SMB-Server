@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Reine Wire-Typen: Header, Requests, Responses, Enums, Negotiate-Contexts.
+       KEIN I/O, KEIN State. Span<byte>-basiert, Little-Endian. (Context §2) -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Protocol</RootNamespace>
+    <AssemblyName>Smb.Protocol</AssemblyName>
+  </PropertyGroup>
+</Project>

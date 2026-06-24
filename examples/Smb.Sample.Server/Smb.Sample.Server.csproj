@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Lauffähiges Beispiel: zeigt Konfiguration, Auth-Provider und Autorisierungs-Hooks. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Smb.Sample.Server</RootNamespace>
+    <AssemblyName>Smb.Sample.Server</AssemblyName>
+    <!-- Beispielcode braucht keine XML-Doku. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Smb.Host\Smb.Host.csproj" />
+  </ItemGroup>
+
+  <!-- Den 'shared'-Ordner neben die Binärdatei kopieren, damit der relative Share-Pfad existiert. -->
+  <ItemGroup>
+    <Content Include="shared\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>shared\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+  </ItemGroup>
+</Project>

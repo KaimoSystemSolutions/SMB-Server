@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD (AES-CCM/GCM),
+       SP800-108 KDF, SHA-512 Preauth-Hash. Krypto ausschließlich über die .NET-BCL
+       (System.Security.Cryptography) — keine Eigenbau-Primitive (Context §20). -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Crypto</RootNamespace>
+    <AssemblyName>Smb.Crypto</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />
+  </ItemGroup>
+</Project>

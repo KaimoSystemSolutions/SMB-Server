@@ -1,0 +1,349 @@
+using Smb.Protocol.Constants;
+using Smb.Protocol.Enums;
+using Smb.Protocol.Messages;
+using Smb.Protocol.Wire;
+
+namespace Smb.Tests;
+
+/// <summary>Hilfsfunktionen zum Bauen von Test-Nachrichten (Request-Seite, die die Lib selbst nicht serialisiert).</summary>
+internal static class TestHelpers
+{
+    /// <summary>Baut einen 64-Byte-SMB2-SYNC-Request-Header.</summary>
+    public static byte[] BuildHeader(SmbCommand command, ulong messageId, ulong sessionId = 0,
+        uint treeId = 0, Smb2HeaderFlags flags = Smb2HeaderFlags.None, ushort creditRequest = 1)
+    {
+        var header = new Smb2Header
+        {
+            Command = command,
+            MessageId = messageId,
+            SessionId = sessionId,
+            TreeId = treeId,
+            Flags = flags,
+            CreditRequestResponse = creditRequest,
+            CreditCharge = 1,
+        };
+        return header.ToArray();
+    }
+
+    /// <summary>Baut einen kompletten NEGOTIATE-Request (Header + Body), optional mit 3.1.1-Contexts.</summary>
+    public static byte[] BuildNegotiateRequest(
+        IReadOnlyList<SmbDialect> dialects,
+        SmbSecurityMode securityMode = SmbSecurityMode.SigningEnabled,
+        IReadOnlyList<SmbCipherId>? ciphers = null,
+        IReadOnlyList<SmbSigningAlgorithmId>? signingAlgs = null)
+    {
+        bool with311 = dialects.Contains(SmbDialect.Smb311);
+        var body = new GrowableWriter(128);
+
+        body.WriteUInt16(36);                          // StructureSize
+        body.WriteUInt16((ushort)dialects.Count);      // DialectCount
+        body.WriteUInt16((ushort)securityMode);        // SecurityMode
+        body.WriteUInt16(0);                           // Reserved
+        body.WriteUInt32((uint)Smb2Capabilities.LargeMtu); // Capabilities
+        body.WriteBytes(new byte[16]);                 // ClientGuid
+
+        int negCtxOffsetPos = body.Position;
+        body.WriteUInt32(0);                           // NegotiateContextOffset (patch)
+        body.WriteUInt16(0);                           // NegotiateContextCount (patch)
+        body.WriteUInt16(0);                           // Reserved2
+
+        foreach (SmbDialect d in dialects) body.WriteUInt16((ushort)d);
+
+        var contexts = new List<NegotiateContext>();
+        if (with311)
+        {
+            contexts.Add(new PreauthIntegrityContext
+            {
+                HashAlgorithms = [PreauthHashAlgorithm.Sha512],
+                Salt = new byte[32],
+            });
+            if (ciphers is not null)
+                contexts.Add(new EncryptionContext { Ciphers = ciphers });
+            if (signingAlgs is not null)
+                contexts.Add(new SigningContext { Algorithms = signingAlgs });
+        }
+
+        if (contexts.Count > 0)
+        {
+            // 8-Byte-Alignment relativ zum Nachrichtenbeginn (Header = 64, also Body-Pos + 64).
+            PadToAbs8(body);
+            int ctxStartAbs = Smb2Header.Size + body.Position;
+            body.PatchUInt32(negCtxOffsetPos, (uint)ctxStartAbs);
+            body.PatchUInt16(negCtxOffsetPos + 4, (ushort)contexts.Count);
+
+            for (int i = 0; i < contexts.Count; i++)
+            {
+                if (i > 0) PadToAbs8(body);
+                contexts[i].Write(body);
+            }
+        }
+
+        byte[] header = BuildHeader(SmbCommand.Negotiate, 0);
+        return Concat(header, body.ToArray());
+    }
+
+    /// <summary>Baut einen SESSION_SETUP-Request (Header + Body) mit gegebenem Token.</summary>
+    public static byte[] BuildSessionSetupRequest(ulong messageId, ulong sessionId, byte[] token,
+        Smb2HeaderFlags flags = Smb2HeaderFlags.None, byte[]? signingKey = null,
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(64);
+        body.WriteUInt16(25);                 // StructureSize
+        body.WriteByte(0);                    // Flags
+        body.WriteByte((byte)SmbSecurityMode.SigningEnabled); // SecurityMode
+        body.WriteUInt32((uint)Smb2Capabilities.None);        // Capabilities
+        body.WriteUInt32(0);                  // Channel
+        int secOffPos = body.Position;
+        body.WriteUInt16(0);                  // SecurityBufferOffset (patch)
+        body.WriteUInt16((ushort)token.Length);
+        body.WriteUInt64(0);                  // PreviousSessionId
+        int bufStart = body.Position;
+        body.WriteBytes(token);
+        body.PatchUInt16(secOffPos, (ushort)(Smb2Header.Size + bufStart));
+
+        byte[] header = BuildHeader(SmbCommand.SessionSetup, messageId, sessionId, flags: flags);
+        byte[] message = Concat(header, body.ToArray());
+
+        if (signingKey is not null)
+            SignInPlace(message, messageId, signingKey, alg);
+        return message;
+    }
+
+    /// <summary>Baut einen TREE_CONNECT-Request zu <c>\\server\share</c>.</summary>
+    public static byte[] BuildTreeConnectRequest(ulong messageId, ulong sessionId, string uncPath,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        byte[] pathBytes = System.Text.Encoding.Unicode.GetBytes(uncPath);
+        var body = new GrowableWriter(32);
+        body.WriteUInt16(9);                  // StructureSize
+        body.WriteUInt16(0);                  // Flags/Reserved
+        int pathOffPos = body.Position;
+        body.WriteUInt16(0);                  // PathOffset (patch)
+        body.WriteUInt16((ushort)pathBytes.Length);
+        int pathStart = body.Position;
+        body.WriteBytes(pathBytes);
+        body.PatchUInt16(pathOffPos, (ushort)(Smb2Header.Size + pathStart));
+
+        byte[] header = BuildHeader(SmbCommand.TreeConnect, messageId, sessionId);
+        byte[] message = Concat(header, body.ToArray());
+        if (signingKey is not null) SignInPlace(message, messageId, signingKey, alg);
+        return message;
+    }
+
+    /// <summary>Baut einen ECHO-Request, optional signiert.</summary>
+    public static byte[] BuildEchoRequest(ulong messageId, ulong sessionId = 0,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new byte[4];
+        var w = new SpanWriter(body);
+        w.WriteUInt16(4);
+        w.WriteUInt16(0);
+
+        byte[] header = BuildHeader(SmbCommand.Echo, messageId, sessionId);
+        byte[] message = Concat(header, body);
+        if (signingKey is not null) SignInPlace(message, messageId, signingKey, alg);
+        return message;
+    }
+
+    /// <summary>Baut einen CREATE-Request (öffnet Datei/Verzeichnis).</summary>
+    public static byte[] BuildCreateRequest(ulong messageId, ulong sessionId, uint treeId, string name,
+        uint desiredAccess, uint disposition, uint options, byte[]? signingKey = null,
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        byte[] nameBytes = System.Text.Encoding.Unicode.GetBytes(name);
+        var body = new GrowableWriter(64 + nameBytes.Length);
+        body.WriteUInt16(57);              // StructureSize
+        body.WriteByte(0);                 // SecurityFlags
+        body.WriteByte(0);                 // RequestedOplockLevel
+        body.WriteUInt32(2);               // ImpersonationLevel = Impersonation
+        body.WriteUInt64(0);               // SmbCreateFlags
+        body.WriteUInt64(0);               // Reserved
+        body.WriteUInt32(desiredAccess);
+        body.WriteUInt32(0);               // FileAttributes
+        body.WriteUInt32(0x00000007);      // ShareAccess = READ|WRITE|DELETE
+        body.WriteUInt32(disposition);
+        body.WriteUInt32(options);
+        int nameOffPos = body.Position;
+        body.WriteUInt16(0);               // NameOffset (patch)
+        body.WriteUInt16((ushort)nameBytes.Length);
+        body.WriteUInt32(0);               // CreateContextsOffset
+        body.WriteUInt32(0);               // CreateContextsLength
+        int nameStart = body.Position;
+        if (nameBytes.Length > 0) body.WriteBytes(nameBytes);
+        else body.WriteByte(0);            // StructureSize "+1"
+        body.PatchUInt16(nameOffPos, (ushort)(Smb2Header.Size + nameStart));
+
+        byte[] header = BuildHeader(SmbCommand.Create, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    public static byte[] BuildQueryDirectoryRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, byte infoClass, string pattern, uint outputBufferLength,
+        byte flags = 0, byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        byte[] patternBytes = System.Text.Encoding.Unicode.GetBytes(pattern);
+        var body = new GrowableWriter(40 + patternBytes.Length);
+        body.WriteUInt16(33);              // StructureSize
+        body.WriteByte(infoClass);
+        body.WriteByte(flags);
+        body.WriteUInt32(0);               // FileIndex
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        int nameOffPos = body.Position;
+        body.WriteUInt16(0);               // FileNameOffset (patch)
+        body.WriteUInt16((ushort)patternBytes.Length);
+        body.WriteUInt32(outputBufferLength);
+        int nameStart = body.Position;
+        if (patternBytes.Length > 0) body.WriteBytes(patternBytes);
+        body.PatchUInt16(nameOffPos, (ushort)(patternBytes.Length > 0 ? Smb2Header.Size + nameStart : 0));
+
+        byte[] header = BuildHeader(SmbCommand.QueryDirectory, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    public static byte[] BuildReadRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, uint length, ulong offset,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(50);
+        body.WriteUInt16(49);              // StructureSize
+        body.WriteByte(0);                 // Padding
+        body.WriteByte(0);                 // Flags
+        body.WriteUInt32(length);
+        body.WriteUInt64(offset);
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        body.WriteUInt32(0);               // MinimumCount
+        body.WriteUInt32(0);               // Channel
+        body.WriteUInt32(0);               // RemainingBytes
+        body.WriteUInt16(0);               // ReadChannelInfoOffset
+        body.WriteUInt16(0);               // ReadChannelInfoLength
+        body.WriteByte(0);                 // Buffer (StructureSize "+1")
+
+        byte[] header = BuildHeader(SmbCommand.Read, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    public static byte[] BuildCloseRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, byte[]? signingKey = null,
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(24);
+        body.WriteUInt16(24);              // StructureSize
+        body.WriteUInt16(0);               // Flags
+        body.WriteUInt32(0);               // Reserved
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+
+        byte[] header = BuildHeader(SmbCommand.Close, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    public static byte[] BuildWriteRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, ulong offset, byte[] data,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(48 + data.Length);
+        body.WriteUInt16(49);              // StructureSize
+        int dataOffPos = body.Position;
+        body.WriteUInt16(0);               // DataOffset (patch)
+        body.WriteUInt32((uint)data.Length);
+        body.WriteUInt64(offset);
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        body.WriteUInt32(0);               // Channel
+        body.WriteUInt32(0);               // RemainingBytes
+        body.WriteUInt16(0);               // WriteChannelInfoOffset
+        body.WriteUInt16(0);               // WriteChannelInfoLength
+        body.WriteUInt32(0);               // Flags
+        int dataStart = body.Position;
+        body.WriteBytes(data);
+        body.PatchUInt16(dataOffPos, (ushort)(Smb2Header.Size + dataStart));
+
+        byte[] header = BuildHeader(SmbCommand.Write, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    public static byte[] BuildSetInfoRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, byte infoType, byte fileInfoClass, byte[] buffer,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(40 + buffer.Length);
+        body.WriteUInt16(33);              // StructureSize
+        body.WriteByte(infoType);
+        body.WriteByte(fileInfoClass);
+        body.WriteUInt32((uint)buffer.Length);
+        int offPos = body.Position;
+        body.WriteUInt16(0);               // BufferOffset (patch)
+        body.WriteUInt16(0);               // Reserved
+        body.WriteUInt32(0);               // AdditionalInformation
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        int bufStart = body.Position;
+        body.WriteBytes(buffer);
+        body.PatchUInt16(offPos, (ushort)(Smb2Header.Size + bufStart));
+
+        byte[] header = BuildHeader(SmbCommand.SetInfo, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    public static byte[] BuildIoctlRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, uint ctlCode, byte[] input,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(56 + input.Length);
+        body.WriteUInt16(57);              // StructureSize
+        body.WriteUInt16(0);               // Reserved
+        body.WriteUInt32(ctlCode);
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+        int inOffPos = body.Position;
+        body.WriteUInt32(0);               // InputOffset (patch)
+        body.WriteUInt32((uint)input.Length);
+        body.WriteUInt32(0);               // MaxInputResponse
+        body.WriteUInt32(0);               // OutputOffset
+        body.WriteUInt32(0);               // OutputCount
+        body.WriteUInt32(65536);           // MaxOutputResponse
+        body.WriteUInt32(1);               // Flags = IS_FSCTL
+        body.WriteUInt32(0);               // Reserved2
+        int inStart = body.Position;
+        body.WriteBytes(input);
+        body.PatchUInt32(inOffPos, (uint)(input.Length > 0 ? Smb2Header.Size + inStart : 0));
+
+        byte[] header = BuildHeader(SmbCommand.Ioctl, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    private static byte[] Finish(byte[] header, byte[] body, ulong messageId, byte[]? signingKey, SmbSigningAlgorithmId alg)
+    {
+        byte[] message = Concat(header, body);
+        if (signingKey is not null) SignInPlace(message, messageId, signingKey, alg);
+        return message;
+    }
+
+    private static void SignInPlace(byte[] message, ulong messageId, byte[] signingKey, SmbSigningAlgorithmId alg)
+    {
+        // SMB2_FLAGS_SIGNED setzen (Offset 16).
+        uint flags = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(message.AsSpan(16, 4));
+        flags |= (uint)Smb2HeaderFlags.Signed;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(message.AsSpan(16, 4), flags);
+        Smb.Crypto.Smb2Signer.SignInPlace(alg, signingKey, message, messageId, isServer: false, isCancel: false);
+    }
+
+    private static void PadToAbs8(GrowableWriter w)
+    {
+        int abs = Smb2Header.Size + w.Position;
+        int pad = (8 - (abs % 8)) % 8;
+        if (pad > 0) w.WriteZeros(pad);
+    }
+
+    public static byte[] Concat(byte[] a, byte[] b)
+    {
+        var r = new byte[a.Length + b.Length];
+        a.CopyTo(r, 0);
+        b.CopyTo(r, a.Length);
+        return r;
+    }
+
+    public static bool IsSmb2(ReadOnlySpan<byte> data) => SmbProtocolIds.IsSmb2(data);
+}

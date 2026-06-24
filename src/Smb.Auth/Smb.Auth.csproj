@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- GSS/SPNEGO-Abstraktion: IGssMechanism + ISpnegoNegotiator + IIdentityBackend
+       (Context §9). NTLM heute, Kerberos/LDAP später — ohne Eingriff in die SMB-Schicht. -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Auth</RootNamespace>
+    <AssemblyName>Smb.Auth</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />
+    <ProjectReference Include="..\Smb.Crypto\Smb.Crypto.csproj" />
+  </ItemGroup>
+</Project>

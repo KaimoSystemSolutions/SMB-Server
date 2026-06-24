@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Transport (TCP-445-Listener), Hosting, Konfiguration (Context §2, §3). -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Host</RootNamespace>
+    <AssemblyName>Smb.Host</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Server\Smb.Server.csproj" />
+  </ItemGroup>
+</Project>

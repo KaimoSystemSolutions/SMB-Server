@@ -1,0 +1,3 @@
+Beispiel-Notizdatei.
+Zeile 2.
+Zeile 3.

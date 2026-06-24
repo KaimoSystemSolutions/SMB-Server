@@ -1,0 +1,5 @@
+Hallo aus dem SMB-Share!
+
+Diese Datei liegt im Ordner examples/Smb.Sample.Server/shared/ und wird
+über die Smb-Server-Lib bereitgestellt. Wenn du diesen Text über einen
+SMB-Client liest, funktioniert Login + Share-Zugriff.

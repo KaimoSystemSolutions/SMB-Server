@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- IShare / IFileStore: NTFS-Semantik auf ein beliebiges Backend mappen (Context §2). -->
+  <PropertyGroup>
+    <RootNamespace>Smb.FileSystem</RootNamespace>
+    <AssemblyName>Smb.FileSystem</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />
+  </ItemGroup>
+</Project>

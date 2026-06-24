@@ -1,0 +1,18 @@
+<Project>
+  <!--
+    Gemeinsame Build-Einstellungen für alle Projekte der SMB-2/3-Server-Lib.
+    Siehe SMB2-3_Server_Context.md §2 (Architektur) und §20 (Sicherheits-Defaults).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- CS1591: fehlende XML-Doku ist für interne Wire-Strukturen ok. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+</Project>

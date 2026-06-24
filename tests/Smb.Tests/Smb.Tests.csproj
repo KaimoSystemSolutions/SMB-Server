@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Tests brauchen keine XML-Doku; xUnit-Analyzer-Warnungen nicht als Fehler. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Smb.Protocol\Smb.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Crypto\Smb.Crypto.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Auth\Smb.Auth.csproj" />
+    <ProjectReference Include="..\..\src\Smb.FileSystem\Smb.FileSystem.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Server\Smb.Server.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Host\Smb.Host.csproj" />
+  </ItemGroup>
+</Project>
