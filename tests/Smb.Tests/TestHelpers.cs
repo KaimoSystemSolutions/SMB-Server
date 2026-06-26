@@ -130,6 +130,21 @@ internal static class TestHelpers
         return message;
     }
 
+    /// <summary>Baut einen LOGOFF-Request (StructureSize 4), optional signiert.</summary>
+    public static byte[] BuildLogoffRequest(ulong messageId, ulong sessionId,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new byte[4];
+        var w = new SpanWriter(body);
+        w.WriteUInt16(4); // StructureSize
+        w.WriteUInt16(0); // Reserved
+
+        byte[] header = BuildHeader(SmbCommand.Logoff, messageId, sessionId);
+        byte[] message = Concat(header, body);
+        if (signingKey is not null) SignInPlace(message, messageId, signingKey, alg);
+        return message;
+    }
+
     /// <summary>Baut einen ECHO-Request, optional signiert.</summary>
     public static byte[] BuildEchoRequest(ulong messageId, ulong sessionId = 0,
         byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)

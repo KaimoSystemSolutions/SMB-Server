@@ -64,8 +64,16 @@ public static class Smb3KeyDerivation
         bool aes256 = cipherId is SmbCipherId.Aes256Ccm or SmbCipherId.Aes256Gcm;
         int cipherKeyLen = aes256 ? 32 : 16;
 
-        // KDK für die Cipher-Keys: bei AES-256 der volle GSS-Key, sonst der 16-Byte-Key.
-        ReadOnlySpan<byte> cipherKdk = aes256 ? fullSessionKey : sessionKey;
+        // [AUDIT-2026-06] KDK für ALLE abgeleiteten Keys ist die auf 16 Byte gekürzte SessionKey —
+        // auch für AES-256-Cipher-Keys (nur die Output-Länge L wird 256, nicht die KDK-Länge).
+        // MS-SMB2 §3.3.5.5.3 setzt Session.SessionKey = erste 16 Byte des GSS-Keys; §3.1.4.2 nutzt
+        // genau diese als K1. Früher wurde fälschlich der volle GSS-Key als KDK genommen — bei NTLM
+        // (16-Byte-Key) wirkungsgleich, hätte aber Kerberos+AES-256 inkompatibel gemacht.
+        // ⚠️ Vor Kerberos-Support gegen eine echte Windows-Interop-Aufzeichnung gegenprüfen.
+        // Siehe docs/SECURITY_AUDIT.md (Finding M3). Der Parameter fullSessionKey bleibt für eine
+        // etwaige künftige Nutzung in der Signatur, wird aber bewusst nicht mehr als KDK verwendet.
+        _ = fullSessionKey;
+        ReadOnlySpan<byte> cipherKdk = sessionKey;
 
         byte[] signingKey, encKey, decKey, appKey;
 

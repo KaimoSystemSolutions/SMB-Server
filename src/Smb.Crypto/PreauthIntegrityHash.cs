@@ -21,8 +21,9 @@ public sealed class PreauthIntegrityHash
     /// <summary>Schreibt <c>H = SHA512(H ‖ message)</c> fort.</summary>
     public void Append(ReadOnlySpan<byte> message)
     {
+        // [AUDIT-2026-06] zuvor: identischer toter Ternary-Zweig (combinedLen<=4096 ? new[] : new[]).
         int combinedLen = _value.Length + message.Length;
-        byte[] buffer = combinedLen <= 4096 ? new byte[combinedLen] : new byte[combinedLen];
+        byte[] buffer = new byte[combinedLen];
         _value.CopyTo(buffer, 0);
         message.CopyTo(buffer.AsSpan(_value.Length));
         _value = SHA512.HashData(buffer);

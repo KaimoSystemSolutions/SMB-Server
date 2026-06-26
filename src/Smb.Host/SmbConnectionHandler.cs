@@ -108,12 +108,16 @@ internal sealed class SmbConnectionHandler
             transportEncrypted = true;
 
             // Der Client hat Verschlüsselung aktiviert (z.B. smbprotocol mit dem Default
-            // require_encryption=True). Eine erfolgreich entschlüsselte Nachricht ist durch
-            // das AEAD bereits integritätsgeschützt — sie wird NICHT zusätzlich signiert
-            // (MS-SMB2 §3.1.4.1). Ab jetzt verschlüsseln wir auch die Antworten dieser Session
+            // require_encryption=True). Ab jetzt verschlüsseln wir auch die Antworten dieser Session
             // (§3.3.4.1.4: war der Request verschlüsselt, MUSS die Antwort verschlüsselt sein).
+            //
+            // [AUDIT-2026-06] Eine erfolgreich entschlüsselte Nachricht ist durch das AEAD bereits
+            // authentifiziert und wird nicht zusätzlich signiert (§3.1.4.1). Das wird jetzt PRO FRAME
+            // im Dispatcher behandelt (VerifyInboundSignature überspringt verschlüsselte Frames).
+            // Früher wurde hier session.SigningRequired DAUERHAFT gelöscht — ein Downgrade, sobald ein
+            // späterer Klartext-Frame durchkam (z.B. RejectUnencryptedAccess=false). Nicht mehr.
+            // Siehe docs/SECURITY_AUDIT.md (Finding M2).
             session.EncryptData = true;
-            session.SigningRequired = false;
         }
 
         return _dispatcher.ProcessMessage(connection, message, transportEncrypted);
@@ -155,7 +159,7 @@ internal sealed class SmbConnectionHandler
                 && tree.EncryptData);
         if (!encrypt) return response;
 
-        byte[] nonce = NewNonce(connection.CipherId);
+        byte[] nonce = BuildNonce(connection.CipherId, outSession.NextEncryptionNonce());
         return Smb2Transform.Encrypt(connection.CipherId, outSession.EncryptionKey, sessionId, nonce, response);
     }
 
@@ -179,8 +183,18 @@ internal sealed class SmbConnectionHandler
         return true;
     }
 
-    private static byte[] NewNonce(Smb.Protocol.Enums.SmbCipherId cipher)
-        => System.Security.Cryptography.RandomNumberGenerator.GetBytes(Smb2Transform.NonceLength(cipher));
+    /// <summary>
+    /// [AUDIT-2026-06] Baut die AEAD-Nonce aus einem monoton steigenden Session-Zähler (NICHT zufällig).
+    /// MS-SMB2 §3.3.4.1.4 verlangt einen je EncryptionKey eindeutigen Nonce-Wert; ein zufälliger
+    /// 11/12-Byte-Wert läuft in die Geburtstagsgrenze (bei AES-GCM ist Nonce-Wiederholung fatal).
+    /// Der Zähler (LE in den ersten 8 Byte; Rest 0) garantiert Eindeutigkeit pro Session/Key.
+    /// </summary>
+    private static byte[] BuildNonce(SmbCipherId cipher, ulong counter)
+    {
+        var nonce = new byte[Smb2Transform.NonceLength(cipher)];
+        BinaryPrimitives.WriteUInt64LittleEndian(nonce.AsSpan(0, 8), counter);
+        return nonce;
+    }
 
     private static async Task<bool> TryReadExactAsync(Stream stream, Memory<byte> buffer, CancellationToken ct)
     {

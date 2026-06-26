@@ -30,6 +30,7 @@ public enum NtStatus : uint
     RangeNotLocked = 0xC000007E,
     LogonFailure = 0xC000006D,
     NotSupported = 0xC00000BB,
+    InsufficientResources = 0xC000009A,
     BadNetworkName = 0xC00000BE,
     Cancelled = 0xC0000120,
     FileClosed = 0xC0000128,

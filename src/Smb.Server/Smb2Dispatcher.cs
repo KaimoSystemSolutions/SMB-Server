@@ -30,6 +30,14 @@ public sealed partial class Smb2Dispatcher
 
     private readonly Action<string>? _log;
 
+    /// <summary>
+    /// [AUDIT-2026-06] Kam der gerade verarbeitete Frame über einen TRANSFORM-Header (verschlüsselt)?
+    /// Pro <see cref="ProcessMessage"/>-Aufruf gesetzt. Da ProcessMessage je Connection-Dispatcher
+    /// sequenziell läuft, ist dieses Feld innerhalb eines Aufrufs eindeutig. Steuert das Überspringen
+    /// der Eingangs-Signaturprüfung (AEAD authentifiziert bereits, §3.1.4.1).
+    /// </summary>
+    private bool _frameWasEncrypted;
+
     public Smb2Dispatcher(SmbServerState server, Action<string>? logger = null)
     {
         _server = server;
@@ -48,6 +56,8 @@ public sealed partial class Smb2Dispatcher
         // mit DialectRevision 0x02FF (Wildcard) antworten; danach kommt das echte SMB2-NEGOTIATE.
         if (SmbProtocolIds.IsSmb1(message) && message.Length > 4 && message[4] == 0x72 /* SMB_COM_NEGOTIATE */)
             return BuildSmb1WildcardNegotiateResponse();
+
+        _frameWasEncrypted = transportEncrypted; // [AUDIT-2026-06] gilt für alle Segmente dieses Frames.
 
         var segments = new List<ResponseSegment>();
         int offset = 0;
@@ -109,13 +119,19 @@ public sealed partial class Smb2Dispatcher
             if (!transportEncrypted && RequiresEncryptedTransport(connection, header))
                 return BuildError(header, NtStatus.AccessDenied);
 
+            // [AUDIT-2026-06] MessageId gegen das Sequenz-/Credit-Fenster prüfen (§3.3.5.2.3).
+            // Bisher toter Code (CreditManager.IsWithinWindow wurde nie aufgerufen) → Replays und
+            // wild springende MessageIds wurden akzeptiert. Siehe docs/SECURITY_AUDIT.md (Finding H2).
+            if (!ValidateSequence(connection, header))
+                return BuildError(header, NtStatus.InvalidParameter);
+
             return header.Command switch
             {
                 SmbCommand.Negotiate => HandleNegotiate(connection, header, segment),
                 SmbCommand.SessionSetup => HandleSessionSetup(connection, header, segment),
                 SmbCommand.TreeConnect => HandleTreeConnect(connection, header, segment),
                 SmbCommand.TreeDisconnect => HandleTreeDisconnect(connection, header, segment),
-                SmbCommand.Logoff => HandleLogoff(connection, header),
+                SmbCommand.Logoff => HandleLogoff(connection, header, segment),
                 SmbCommand.Echo => HandleEcho(connection, header, segment),
                 SmbCommand.Create => HandleCreate(connection, header, segment),
                 SmbCommand.Close => HandleClose(connection, header, segment),
@@ -162,6 +178,33 @@ public sealed partial class Smb2Dispatcher
         if (!connection.Sessions.TryGetValue(header.SessionId, out SmbSession? session)) return false;
         if (session.EncryptData) return true;
         return session.TreeConnects.TryGetValue(header.TreeId, out SmbTreeConnect? tree) && tree.EncryptData;
+    }
+
+    /// <summary>
+    /// [AUDIT-2026-06] Prüft die MessageId gegen das gültige Sequenzfenster und zieht dessen untere
+    /// Grenze nach (§3.3.5.2.3). Ausnahmen: vor abgeschlossenem NEGOTIATE; NEGOTIATE selbst; CANCEL
+    /// (referenziert eine bereits konsumierte MessageId und trägt keine neue); Related-Compound-
+    /// Elemente (werden mit dem Lead-Element gebündelt). Anfragen treffen pro Verbindung monoton
+    /// steigend ein (TCP ist geordnet), daher genügt das Nachziehen der Untergrenze.
+    /// </summary>
+    private static bool ValidateSequence(SmbConnection connection, Smb2Header header)
+    {
+        if (!connection.NegotiateDone) return true;
+        if (header.Command is SmbCommand.Negotiate or SmbCommand.Cancel) return true;
+        if (header.Flags.HasFlag(Smb2HeaderFlags.RelatedOperations)) return true;
+
+        ushort charge = Math.Max(header.CreditCharge, (ushort)1);
+        ulong start = connection.SequenceWindowStart;
+        ulong size = connection.SequenceWindowSize == 0 ? 1 : connection.SequenceWindowSize;
+
+        if (!CreditManager.IsWithinWindow(header.MessageId, start, size) ||
+            !CreditManager.IsWithinWindow(header.MessageId + charge - 1, start, size))
+            return false;
+
+        ulong consumedUpTo = header.MessageId + charge;
+        if (consumedUpTo > connection.SequenceWindowStart)
+            connection.SequenceWindowStart = consumedUpTo;
+        return true;
     }
 
     /// <summary>
@@ -478,10 +521,15 @@ public sealed partial class Smb2Dispatcher
 
     // --- LOGOFF / ECHO ---
 
-    private ResponseSegment HandleLogoff(SmbConnection connection, Smb2Header header)
+    private ResponseSegment HandleLogoff(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
+        // [AUDIT-2026-06] LOGOFF prüfte zuvor — anders als alle anderen Session-Handler — KEINE
+        // Signatur; ein eingeschleustes LOGOFF konnte eine signaturpflichtige Session abreißen.
+        // Siehe docs/SECURITY_AUDIT.md (Finding M4).
+        if (!VerifyInboundSignature(session, header, segment))
+            return BuildError(header, NtStatus.AccessDenied);
 
         connection.Sessions.TryRemove(session.SessionId, out _);
         _server.SessionGlobalList.TryRemove(session.SessionId, out _);
@@ -529,8 +577,14 @@ public sealed partial class Smb2Dispatcher
     /// Prüft die Signatur eingehender Nachrichten, wenn die Session Signing verlangt
     /// (Context §10 Eingangsprüfung). Nicht-signierungspflichtige Sessions passieren.
     /// </summary>
-    private static bool VerifyInboundSignature(SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment)
+    private bool VerifyInboundSignature(SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment)
     {
+        // [AUDIT-2026-06] Verschlüsselt empfangene Frames sind durch das AEAD bereits authentifiziert
+        // (§3.1.4.1) und tragen keine Signatur. Früher löschte der Host dafür session.SigningRequired
+        // dauerhaft (Downgrade-Risiko, sobald RejectUnencryptedAccess aus war) — jetzt überspringen wir
+        // nur die Prüfung dieses einen Frames, ohne die Session-Policy zu verändern.
+        // Siehe docs/SECURITY_AUDIT.md (Finding M2).
+        if (_frameWasEncrypted) return true;
         if (!session.SigningRequired) return true;
         if (!header.Flags.HasFlag(Smb2HeaderFlags.Signed)) return false;
 

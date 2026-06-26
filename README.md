@@ -104,6 +104,11 @@ ISpnegoNegotiator  ──>  IGssMechanism (NTLM heute, Kerberos später)
   (Default an) abgelehnt; ein verschlüsselter Share auf einer Verbindung ohne 3.x-Cipher → `ACCESS_DENIED`.
 - Krypto ausschließlich über die .NET-BCL (`System.Security.Cryptography`).
 
+> **Sicherheits-Audit:** Stand und offene Punkte siehe [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md)
+> (behobene Findings sind im Code mit `[AUDIT-2026-06]` markiert und durch `AuditFixTests` abgesichert).
+> Noch offen u.a.: NTLM-MIC-Verifikation (O1), QUERY_DIRECTORY-Paging (O2). ⚠️ AES-256-Key-Derivation
+> (M3) vor Kerberos-Einsatz gegen eine echte Windows-Interop-Aufzeichnung gegenprüfen.
+
 ## Verifikation
 
 Build & Tests:
@@ -112,7 +117,7 @@ Build & Tests:
 dotnet test
 ```
 
-Die Suite (126 Tests) deckt u.a. ab:
+Die Suite (131 Tests) deckt u.a. ab:
 
 - **Offizielle Krypto-Vektoren:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5),
   NTOWFv2 (MS-NLMP §4.2-Beispiel).
@@ -130,6 +135,8 @@ Die Suite (126 Tests) deckt u.a. ab:
 - Oplocks: Grant des angeforderten Levels auf einem Solo-Open (Batch/Exclusive), Herabstufung auf
   Level II + OPLOCK_BREAK-Notification bei einem zweiten Open derselben Datei, Acknowledgment-Quittung,
   Freigabe beim CLOSE; Lease-Break-Acknowledgment (noch) → `STATUS_NOT_SUPPORTED`.
+- Audit-Fixes (`AuditFixTests`): LOGOFF-Signaturpflicht, MessageId-Sequenzfenster (Replay/Out-of-Window
+  abgelehnt), MaximalAccess-Durchsetzung beim CREATE, Obergrenze ausstehender async-Operationen.
 
 ## Roadmap
 

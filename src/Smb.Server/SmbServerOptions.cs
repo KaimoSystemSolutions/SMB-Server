@@ -66,6 +66,15 @@ public sealed class SmbServerOptions
     /// <summary>Maximal pro Antwort gewährte Credits (Cap, Context §7).</summary>
     public ushort MaxCreditsPerResponse { get; set; } = 512;
 
+    /// <summary>
+    /// [AUDIT-2026-06] Obergrenze gleichzeitig ausstehender asynchroner Operationen je Verbindung
+    /// (blockierende LOCKs, CHANGE_NOTIFY). Schützt vor Ressourcen-Erschöpfung (jede ausstehende
+    /// Operation hält einen <c>PendingRequest</c> und ggf. einen Dateisystem-Watcher). Wird die
+    /// Grenze erreicht, lehnt der Server weitere async-Anforderungen mit
+    /// <c>STATUS_INSUFFICIENT_RESOURCES</c> ab. Siehe docs/SECURITY_AUDIT.md (Finding H1).
+    /// </summary>
+    public int MaxOutstandingRequests { get; set; } = 512;
+
     /// <summary>SPNEGO-Negotiator (Auth). Pflicht — z.B. NTLM-basiert oder (Test) <see cref="DevSpnegoNegotiator"/>.</summary>
     public ISpnegoNegotiator? SpnegoNegotiator { get; set; }
 

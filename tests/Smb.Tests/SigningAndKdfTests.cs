@@ -47,18 +47,25 @@ public class SigningAndKdfTests
     }
 
     [Fact]
-    public void Smb3KeyDerivation_311Aes256_UsesFullKeyForCipher_And32ByteCipherKeys()
+    public void Smb3KeyDerivation_311Aes256_DerivesFrom16ByteSessionKey_NotFullKey()
     {
+        // [AUDIT-2026-06] KDK für ALLE Keys ist die 16-Byte-SessionKey — auch für AES-256-Cipher-Keys
+        // (nur die Output-Länge L wird 256, §3.1.4.2). Beweis: ein ANDERER "voller" GSS-Key darf die
+        // abgeleiteten Keys NICHT verändern. Früher wurde fälschlich der volle Key als KDK genutzt →
+        // dieser Test würde dann fehlschlagen. Siehe docs/SECURITY_AUDIT.md (Finding M3).
         byte[] sessionKey16 = RandomNumberGenerator.GetBytes(16);
-        byte[] fullKey = RandomNumberGenerator.GetBytes(32);
         byte[] preauth = RandomNumberGenerator.GetBytes(64);
+        byte[] fullKeyA = RandomNumberGenerator.GetBytes(32);
+        byte[] fullKeyB = RandomNumberGenerator.GetBytes(32);
 
-        Smb3SessionKeys keys = Smb3KeyDerivation.Derive(
-            SmbDialect.Smb311, SmbCipherId.Aes256Gcm, sessionKey16, fullKey, preauth);
+        Smb3SessionKeys a = Smb3KeyDerivation.Derive(SmbDialect.Smb311, SmbCipherId.Aes256Gcm, sessionKey16, fullKeyA, preauth);
+        Smb3SessionKeys b = Smb3KeyDerivation.Derive(SmbDialect.Smb311, SmbCipherId.Aes256Gcm, sessionKey16, fullKeyB, preauth);
 
-        Assert.Equal(16, keys.SigningKey.Length);  // Signing bleibt AES-128.
-        Assert.Equal(32, keys.EncryptionKey.Length);
-        Assert.Equal(32, keys.DecryptionKey.Length);
+        Assert.Equal(16, a.SigningKey.Length);    // Signing bleibt AES-128.
+        Assert.Equal(32, a.EncryptionKey.Length); // AES-256 → 32-Byte-Output ...
+        Assert.Equal(32, a.DecryptionKey.Length);
+        Assert.Equal(a.EncryptionKey, b.EncryptionKey); // ... aber unabhängig vom vollen GSS-Key.
+        Assert.Equal(a.DecryptionKey, b.DecryptionKey);
     }
 
     [Fact]

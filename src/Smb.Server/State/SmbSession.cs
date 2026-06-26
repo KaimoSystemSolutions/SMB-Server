@@ -34,7 +34,11 @@ public sealed class SmbSession
     public bool SigningRequired { get; set; }
     public bool EncryptData { get; set; }
 
-    /// <summary>Voller GSS-Session-Key (KDK für AES-256-Cipher-Keys, Context §8.3).</summary>
+    /// <summary>
+    /// Voller GSS-Session-Key. Hinweis (§3.1.4.2): KDK für ALLE abgeleiteten Schlüssel ist die auf
+    /// 16 Byte gekürzte <see cref="SessionKey"/> — auch für AES-256-Cipher-Keys. Dieses Feld wird
+    /// daher aktuell nicht als KDK verwendet (siehe [AUDIT-2026-06] in Smb3KeyDerivation).
+    /// </summary>
     public byte[] FullSessionKey { get; set; } = [];
 
     /// <summary>Erste 16 Byte des GSS-Session-Keys (KDK für Signing/App/AES-128).</summary>
@@ -51,6 +55,16 @@ public sealed class SmbSession
 
     public ConcurrentDictionary<ulong, SmbTreeConnect> TreeConnects { get; } = new();
     public ConcurrentDictionary<(ulong Persistent, ulong Volatile), SmbOpen> Opens { get; } = new();
+
+    private long _encryptionNonce;
+
+    /// <summary>
+    /// [AUDIT-2026-06] Liefert den nächsten monoton steigenden AEAD-Nonce-Zähler (beginnt bei 1).
+    /// MS-SMB2 §3.3.4.1.4 verlangt einen je <see cref="EncryptionKey"/> eindeutigen, NICHT zufälligen
+    /// Nonce-Wert (Nonce-Wiederverwendung bricht AES-GCM/CCM). Da der EncryptionKey pro Session gilt,
+    /// genügt ein Session-lokaler Zähler. Siehe docs/SECURITY_AUDIT.md (Finding M1).
+    /// </summary>
+    public ulong NextEncryptionNonce() => (ulong)Interlocked.Increment(ref _encryptionNonce);
 
     public DateTimeOffset CreationTime { get; } = DateTimeOffset.UtcNow;
 }

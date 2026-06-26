@@ -60,7 +60,19 @@ public sealed partial class Smb2Dispatcher
 
         CreateRequest request = CreateRequest.Parse(segment, Smb2Header.Size);
 
-        FileAccessIntent access = MapAccess(request.DesiredAccess);
+        // [AUDIT-2026-06] DesiredAccess gegen die von der Autorisierungs-Policy gewährte MaximalAccess
+        // durchsetzen (§3.3.5.9). Zuvor wurde DesiredAccess ungefiltert gewährt → eine Policy mit
+        // reduzierten Rechten (z.B. ReadOnly pro User/Gruppe) war für Datei-Operationen wirkungslos;
+        // nur das globale readOnly-Flag des FileStore begrenzte. MAXIMUM_ALLOWED gewährt genau die
+        // erlaubte Maske. Vergleich auf Intent-Ebene (Read/Write/Delete), um Generic-Bits korrekt zu
+        // behandeln. Siehe docs/SECURITY_AUDIT.md (Finding H3).
+        FileAccessIntent allowedIntent = MapAccess(tree.MaximalAccess);
+        bool maximumAllowed = (request.DesiredAccess & MaximumAllowed) != 0;
+        FileAccessIntent access = maximumAllowed ? allowedIntent : MapAccess(request.DesiredAccess);
+        if (!maximumAllowed && (access & ~allowedIntent) != 0)
+            return BuildError(header, NtStatus.AccessDenied);
+        uint grantedAccess = maximumAllowed ? tree.MaximalAccess : request.DesiredAccess;
+
         var disposition = (CreateDispositionIntent)(uint)request.Disposition;
         bool dirRequired = request.Options.HasFlag(CreateOptions.DirectoryFile);
         bool nonDirRequired = request.Options.HasFlag(CreateOptions.NonDirectoryFile);
@@ -82,7 +94,7 @@ public sealed partial class Smb2Dispatcher
             Session = session,
             TreeConnect = tree,
             LocalOpen = handle,
-            GrantedAccess = request.DesiredAccess,
+            GrantedAccess = grantedAccess,
             PathName = request.Name,
         };
         session.Opens[open.Key] = open;

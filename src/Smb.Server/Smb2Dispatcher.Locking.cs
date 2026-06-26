@@ -52,6 +52,14 @@ public sealed partial class Smb2Dispatcher
             return LockResultSegment(header, session, outcome);
         }
 
+        // [AUDIT-2026-06] Ausstehende async-Operationen je Verbindung deckeln (Ressourcen-Schutz):
+        // sonst kann ein Client unbegrenzt blockierende LOCKs offenhalten. Siehe SECURITY_AUDIT (H1).
+        if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
+        {
+            pending.Cancel(); // bricht den eben gestarteten Waiter ab
+            return BuildError(header, NtStatus.InsufficientResources);
+        }
+
         // Blockierend: Interim-Antwort jetzt, finale Antwort folgt out-of-band.
         connection.PendingRequests[header.MessageId] = pending;
         _ = SendFinalLockResponseAsync(connection, header, session, asyncId, task, pending);

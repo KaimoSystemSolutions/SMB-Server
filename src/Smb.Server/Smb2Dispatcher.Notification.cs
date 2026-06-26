@@ -30,6 +30,12 @@ public sealed partial class Smb2Dispatcher
         if (watchPath is null)
             return BuildError(header, NtStatus.NotSupported); // Backend ohne realen Pfad (z.B. virtuell)
 
+        // [AUDIT-2026-06] Ausstehende async-Operationen je Verbindung deckeln (Ressourcen-Schutz):
+        // jede CHANGE_NOTIFY-Subscription hält einen PendingRequest + ggf. einen Dateisystem-Watcher.
+        // Siehe docs/SECURITY_AUDIT.md (Finding H1).
+        if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
+            return BuildError(header, NtStatus.InsufficientResources);
+
         ulong asyncId = connection.AllocateAsyncId();
         var pending = new PendingAsyncRequest { MessageId = header.MessageId, AsyncId = asyncId, Owner = open };
         var once = new NotifyOnce();
