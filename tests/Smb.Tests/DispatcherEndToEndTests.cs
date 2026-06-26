@@ -125,11 +125,12 @@ public class DispatcherEndToEndTests
         var (dispatcher, _, conn) = NewServer();
         dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
 
-        // OPLOCK_BREAK ist noch nicht implementiert → STATUS_NOT_SUPPORTED.
-        byte[] obReq = TestHelpers.Concat(
-            TestHelpers.BuildHeader(SmbCommand.OplockBreak, 1, sessionId: 0),
-            new byte[24]);
-        byte[] resp = dispatcher.ProcessMessage(conn, obReq);
+        // Ein unbekannter/reservierter Command-Code (alle definierten SmbCommands sind inzwischen
+        // implementiert) trifft den Default-Arm des Dispatchers → STATUS_NOT_SUPPORTED.
+        byte[] req = TestHelpers.Concat(
+            TestHelpers.BuildHeader((SmbCommand)0x00FF, 1, sessionId: 0),
+            new byte[4]);
+        byte[] resp = dispatcher.ProcessMessage(conn, req);
         Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(resp).Status);
     }
 

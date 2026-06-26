@@ -129,6 +129,7 @@ public sealed partial class Smb2Dispatcher
                 SmbCommand.Lock => HandleLock(connection, header, segment),
                 SmbCommand.Cancel => HandleCancel(connection, header, segment),
                 SmbCommand.ChangeNotify => HandleChangeNotify(connection, header, segment),
+                SmbCommand.OplockBreak => HandleOplockBreak(connection, header, segment),
                 _ => BuildError(header, NtStatus.NotSupported),
             };
         }

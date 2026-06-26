@@ -23,6 +23,13 @@ public sealed class SmbOpen
     public string PathName { get; set; } = string.Empty;
     public bool DeleteOnClose { get; set; }
 
+    /// <summary>
+    /// Aktuell für dieses Open gewährtes Oplock-Level (Context §15). Wird beim CREATE gesetzt und
+    /// bei einem Break herabgestuft. Maßgeblich ist der <c>IOplockManager</c>; dieser Wert spiegelt
+    /// das zuletzt diesem Open gewährte Level (für Tests/Diagnose).
+    /// </summary>
+    public OplockLevel OplockLevel { get; set; } = OplockLevel.None;
+
     /// <summary>Wurde dieses (Verzeichnis-)Open bereits via QUERY_DIRECTORY aufgelistet? (Context §14)</summary>
     public bool DirectoryEnumStarted { get; set; }
 

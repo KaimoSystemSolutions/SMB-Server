@@ -4,6 +4,7 @@ using Smb.Protocol.Enums;
 using Smb.Server.Authorization;
 using Smb.Server.Locking;
 using Smb.Server.Notification;
+using Smb.Server.Oplocks;
 
 namespace Smb.Server;
 
@@ -92,6 +93,14 @@ public sealed class SmbServerOptions
     /// (→ <c>STATUS_NOT_SUPPORTED</c>), oder eine eigene Quelle (inotify, ZFS-Events …) einklinken.
     /// </summary>
     public IDirectoryWatcher DirectoryWatcher { get; set; } = new FileSystemDirectoryWatcher();
+
+    /// <summary>
+    /// Oplock-Verwaltung (SMB2 Oplocks, Context §15). Default <see cref="InMemoryOplockManager"/>
+    /// (prozesslokal). Auf <see cref="NullOplockManager"/> setzen, um Oplocks abzuschalten (CREATE
+    /// gewährt dann stets <c>OplockLevel.None</c>), oder eine eigene Implementierung einklinken, um
+    /// z.B. an einen Cluster-Koordinator zu delegieren.
+    /// </summary>
+    public IOplockManager OplockManager { get; set; } = new InMemoryOplockManager();
 
     /// <summary>Validiert die Konfiguration und wirft bei Fehlkonfiguration.</summary>
     public void Validate()

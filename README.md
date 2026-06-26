@@ -112,7 +112,7 @@ Build & Tests:
 dotnet test
 ```
 
-Die Suite (119 Tests) deckt u.a. ab:
+Die Suite (126 Tests) deckt u.a. ab:
 
 - **Offizielle Krypto-Vektoren:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5),
   NTOWFv2 (MS-NLMP §4.2-Beispiel).
@@ -127,6 +127,9 @@ Die Suite (119 Tests) deckt u.a. ab:
 - Per-Share-Encryption: Tree-Markierung + ShareFlags, Klartext-Request auf verschlüsseltem Tree
   abgelehnt (`RejectUnencryptedAccess`), Encrypted-Share-Connect ohne Cipher abgelehnt, und der
   Host liefert die TREE_CONNECT-Antwort eines verschlüsselten Shares als TRANSFORM-Frame zurück.
+- Oplocks: Grant des angeforderten Levels auf einem Solo-Open (Batch/Exclusive), Herabstufung auf
+  Level II + OPLOCK_BREAK-Notification bei einem zweiten Open derselben Datei, Acknowledgment-Quittung,
+  Freigabe beim CLOSE; Lease-Break-Acknowledgment (noch) → `STATUS_NOT_SUPPORTED`.
 
 ## Roadmap
 
@@ -140,7 +143,7 @@ Die Suite (119 Tests) deckt u.a. ab:
 | M6 Encryption & Härtung (Transform-Pfad) | ✅ Per-Share-Encryption verdrahtet (Tree-`EncryptData`, Antwort-Verschlüsselung inkl. TREE_CONNECT-Response) + Härtung: `RejectUnencryptedAccess` (Default an) lehnt Klartext-Zugriff auf verschlüsselte Trees ab; Encrypted-Share-Connect ohne 3.x-Cipher → `ACCESS_DENIED` |
 | Share-Enumeration (srvsvc NetrShareEnum über DCERPC/IPC$, IOCTL FSCTL_PIPE_TRANSCEIVE) | ✅ |
 | SMB1→SMB2 Negotiate-Upgrade (§6.1, für impacket u.a.) | ✅ |
-| M7 **CHANGE_NOTIFY ✅** (austauschbarer `IDirectoryWatcher`, Default `FileSystemWatcher`); Oplocks/Leases/Compound-Feinschliff offen | 🟡 |
+| M7 **CHANGE_NOTIFY ✅** (austauschbarer `IDirectoryWatcher`); **Oplocks ✅** (austauschbarer `IOplockManager`: Grant + OPLOCK_BREAK-Notification + Acknowledgment + Freigabe); **Leases** & Compound-Feinschliff offen | 🟡 |
 | Native Windows-Explorer-Interop (volle FSCC/IOCTL-Abdeckung, Secure Negotiate) | ⬜ |
 | M8 Kerberos, LDAP-Backend, Multichannel, Durable Handles, DFS, QUIC, RDMA | ⬜ |
 

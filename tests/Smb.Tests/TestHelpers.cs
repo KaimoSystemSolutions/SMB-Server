@@ -145,16 +145,17 @@ internal static class TestHelpers
         return message;
     }
 
-    /// <summary>Baut einen CREATE-Request (öffnet Datei/Verzeichnis).</summary>
+    /// <summary>Baut einen CREATE-Request (öffnet Datei/Verzeichnis). <paramref name="requestedOplockLevel"/>
+    /// belegt das RequestedOplockLevel-Byte (0=None, 1=LevelII, 8=Exclusive, 9=Batch).</summary>
     public static byte[] BuildCreateRequest(ulong messageId, ulong sessionId, uint treeId, string name,
         uint desiredAccess, uint disposition, uint options, byte[]? signingKey = null,
-        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac, byte requestedOplockLevel = 0)
     {
         byte[] nameBytes = System.Text.Encoding.Unicode.GetBytes(name);
         var body = new GrowableWriter(64 + nameBytes.Length);
         body.WriteUInt16(57);              // StructureSize
         body.WriteByte(0);                 // SecurityFlags
-        body.WriteByte(0);                 // RequestedOplockLevel
+        body.WriteByte(requestedOplockLevel); // RequestedOplockLevel
         body.WriteUInt32(2);               // ImpersonationLevel = Impersonation
         body.WriteUInt64(0);               // SmbCreateFlags
         body.WriteUInt64(0);               // Reserved
@@ -352,6 +353,23 @@ internal static class TestHelpers
         body.WriteUInt32(0);               // Reserved
 
         byte[] header = BuildHeader(SmbCommand.ChangeNotify, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    /// <summary>Baut ein OPLOCK_BREAK Acknowledgment (Client→Server, §2.2.24.1).</summary>
+    public static byte[] BuildOplockBreakAck(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, byte oplockLevel,
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(24);
+        body.WriteUInt16(24);              // StructureSize
+        body.WriteByte(oplockLevel);
+        body.WriteByte(0);                 // Reserved
+        body.WriteUInt32(0);               // Reserved2
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+
+        byte[] header = BuildHeader(SmbCommand.OplockBreak, messageId, sessionId, treeId);
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
     }
 

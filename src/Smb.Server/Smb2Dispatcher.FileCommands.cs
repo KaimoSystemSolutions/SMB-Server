@@ -3,6 +3,7 @@ using Smb.FileSystem.Versioning;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Messages.Fscc;
+using Smb.Server.Oplocks;
 using Smb.Server.Rpc;
 using Smb.Server.State;
 
@@ -87,10 +88,16 @@ public sealed partial class Smb2Dispatcher
         session.Opens[open.Key] = open;
         Interlocked.Increment(ref tree.OpenCount);
 
+        // Oplock anfordern (Context §15): Der Manager bestimmt das gewährte Level und liefert die
+        // durch diesen Open fälligen Breaks an andere Halter, die out-of-band benachrichtigt werden.
+        OplockGrant grant = _server.Options.OplockManager.RequestOplock(open, request.RequestedOplockLevel);
+        open.OplockLevel = grant.GrantedLevel;
+        DispatchOplockBreaks(grant.Breaks);
+
         FileEntryInfo info = handle.GetInfo();
         var response = new CreateResponse
         {
-            OplockLevel = OplockLevel.None,
+            OplockLevel = grant.GrantedLevel,
             CreateAction = (CreateAction)(uint)outcome,
             CreationTime = info.CreationTime,
             LastAccessTime = info.LastAccessTime,
@@ -212,6 +219,7 @@ public sealed partial class Smb2Dispatcher
         FileEntryInfo? info = (flags & CloseMessage.FlagPostQueryAttributes) != 0 ? open.LocalOpen?.GetInfo() : null;
         session.Opens.TryRemove(open.Key, out _);
         ReleaseLocks(connection, open);
+        _server.Options.OplockManager.ReleaseOwner(open);
         open.LocalOpen?.Dispose();
 
         byte[] body = info is null
