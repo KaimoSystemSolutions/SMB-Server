@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using Smb.Crypto;
 using Smb.Protocol.Constants;
+using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Transport;
 using Smb.Server;
@@ -43,7 +44,7 @@ internal sealed class SmbConnectionHandler
             // Out-of-band-Sendekanal bereitstellen: asynchron fertiggestellte Antworten (z.B. ein
             // blockierender LOCK, der gewährt/abgebrochen wurde) gehen über denselben serialisierten
             // Writer. Verschlüsselung/Rahmung passieren zentral in SendFramedAsync.
-            connection.SendRawAsync = raw => SendFramedAsync(stream, connection, raw, ct);
+            connection.SendRawAsync = (raw, forceEncrypt) => SendFramedAsync(stream, connection, raw, forceEncrypt, ct);
 
             while (!ct.IsCancellationRequested)
             {
@@ -61,7 +62,7 @@ internal sealed class SmbConnectionHandler
                 if (response.Length == 0) continue;
 
                 // 4. Verschlüsseln (falls nötig), NBSS-rahmen, serialisiert zurückschreiben.
-                await SendFramedAsync(stream, connection, response, ct);
+                await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct);
             }
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or SocketException)
@@ -86,6 +87,7 @@ internal sealed class SmbConnectionHandler
     private byte[] ProcessFrame(SmbConnection connection, byte[] payload)
     {
         ReadOnlySpan<byte> message = payload;
+        bool transportEncrypted = false;
 
         // Transform-Frame? → entschlüsseln (Context §11, §19.1 Schritt 1).
         if (SmbProtocolIds.IsTransform(payload))
@@ -103,6 +105,8 @@ internal sealed class SmbConnectionHandler
                 return []; // Auth-Tag-Fehler → verwerfen.
             }
 
+            transportEncrypted = true;
+
             // Der Client hat Verschlüsselung aktiviert (z.B. smbprotocol mit dem Default
             // require_encryption=True). Eine erfolgreich entschlüsselte Nachricht ist durch
             // das AEAD bereits integritätsgeschützt — sie wird NICHT zusätzlich signiert
@@ -112,13 +116,13 @@ internal sealed class SmbConnectionHandler
             session.SigningRequired = false;
         }
 
-        return _dispatcher.ProcessMessage(connection, message);
+        return _dispatcher.ProcessMessage(connection, message, transportEncrypted);
     }
 
     /// <summary>Verschlüsselt die Antwort bei Bedarf, rahmt sie als NBSS und schreibt sie serialisiert.</summary>
-    private async Task SendFramedAsync(NetworkStream stream, SmbConnection connection, byte[] rawResponse, CancellationToken ct)
+    private async Task SendFramedAsync(NetworkStream stream, SmbConnection connection, byte[] rawResponse, bool forceEncrypt, CancellationToken ct)
     {
-        byte[] outBytes = MaybeEncrypt(connection, rawResponse);
+        byte[] outBytes = MaybeEncrypt(connection, rawResponse, forceEncrypt);
         byte[] framed = NbssFrame.Wrap(outBytes);
 
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -133,24 +137,47 @@ internal sealed class SmbConnectionHandler
         }
     }
 
-    /// <summary>Verschlüsselt die Antwort, wenn die adressierte Session Verschlüsselung verlangt.</summary>
-    private byte[] MaybeEncrypt(SmbConnection connection, byte[] response)
+    /// <summary>
+    /// Verschlüsselt die Antwort, wenn die adressierte Session global Verschlüsselung verlangt
+    /// ODER die Antwort zu einem verschlüsselungspflichtigen Tree gehört (per-Share-Encryption,
+    /// §3.3.4.1.4 — schließt die TREE_CONNECT-Antwort eines verschlüsselten Shares ein).
+    /// </summary>
+    private byte[] MaybeEncrypt(SmbConnection connection, byte[] response, bool forceEncrypt = false)
     {
         ulong sessionId = ReadResponseSessionId(response);
-        if (sessionId != 0
-            && _server.SessionGlobalList.TryGetValue(sessionId, out SmbSession? outSession)
-            && outSession.EncryptData)
-        {
-            byte[] nonce = NewNonce(connection.CipherId);
-            return Smb2Transform.Encrypt(connection.CipherId, outSession.EncryptionKey, sessionId, nonce, response);
-        }
-        return response;
+        if (sessionId == 0 || !_server.SessionGlobalList.TryGetValue(sessionId, out SmbSession? outSession))
+            return response;
+
+        bool encrypt = forceEncrypt
+            || outSession.EncryptData
+            || (TryReadResponseTreeId(response, out uint treeId)
+                && outSession.TreeConnects.TryGetValue(treeId, out SmbTreeConnect? tree)
+                && tree.EncryptData);
+        if (!encrypt) return response;
+
+        byte[] nonce = NewNonce(connection.CipherId);
+        return Smb2Transform.Encrypt(connection.CipherId, outSession.EncryptionKey, sessionId, nonce, response);
     }
 
     private static ulong ReadResponseSessionId(ReadOnlySpan<byte> response)
         => response.Length >= Smb2Header.Size
             ? BinaryPrimitives.ReadUInt64LittleEndian(response.Slice(40, 8))
             : 0;
+
+    /// <summary>
+    /// Liest die TreeId aus einem SYNC-Antwort-Header (Offset 36). ASYNC-Antworten
+    /// (Flag SMB2_FLAGS_ASYNC_COMMAND) führen an dieser Stelle die AsyncId — dort gibt es
+    /// keine TreeId, daher false (Session-globale Verschlüsselung greift dann weiterhin).
+    /// </summary>
+    private static bool TryReadResponseTreeId(ReadOnlySpan<byte> response, out uint treeId)
+    {
+        treeId = 0;
+        if (response.Length < Smb2Header.Size) return false;
+        var flags = (Smb2HeaderFlags)BinaryPrimitives.ReadUInt32LittleEndian(response.Slice(16, 4));
+        if (flags.HasFlag(Smb2HeaderFlags.AsyncCommand)) return false;
+        treeId = BinaryPrimitives.ReadUInt32LittleEndian(response.Slice(36, 4));
+        return true;
+    }
 
     private static byte[] NewNonce(Smb.Protocol.Enums.SmbCipherId cipher)
         => System.Security.Cryptography.RandomNumberGenerator.GetBytes(Smb2Transform.NonceLength(cipher));

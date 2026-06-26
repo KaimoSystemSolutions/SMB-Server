@@ -32,6 +32,14 @@ public sealed class SmbServerOptions
     /// <summary>Verschlüsselung global verlangen (zusätzlich per-Share möglich, Context §11).</summary>
     public bool RequireEncryption { get; set; }
 
+    /// <summary>
+    /// Unverschlüsselte Requests auf eine verschlüsselungspflichtige Session bzw. einen
+    /// verschlüsselungspflichtigen Tree mit <c>STATUS_ACCESS_DENIED</c> ablehnen
+    /// (MS-SMB2 <c>RejectUnencryptedAccess</c>, §3.3.5.2.11). Sicherer Default (an, wie Windows
+    /// seit Server 2022/24H2). Nur abschalten, wenn Clients ohne Encryption zwingend zugreifen müssen.
+    /// </summary>
+    public bool RejectUnencryptedAccess { get; set; } = true;
+
     /// <summary>Gast-Zugriff ablehnen (Context §8.4, §20).</summary>
     public bool RejectGuestAccess { get; set; } = true;
 

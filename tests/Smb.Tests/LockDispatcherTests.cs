@@ -68,7 +68,7 @@ public class LockDispatcherTests : IDisposable
         (ulong p, ulong v) = OpenFile(d, conn, sid, tid, 4);
 
         var sent = new ConcurrentQueue<byte[]>();
-        conn.SendRawAsync = b => { sent.Enqueue(b); return Task.CompletedTask; };
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
         // LOCK ohne FAIL_IMMEDIATELY → der Manager blockiert → Interim-Antwort STATUS_PENDING.
         byte[] interim = d.ProcessMessage(conn, TestHelpers.BuildLockRequest(6, sid, tid, p, v,
@@ -87,6 +87,30 @@ public class LockDispatcherTests : IDisposable
     }
 
     [Fact]
+    public async Task BlockingLock_OnEncryptedTree_ForcesEncryptedFinalResponse()
+    {
+        // ASYNC-Antworten tragen keine TreeId — die Per-Share-Verschlüsselungspflicht muss daher
+        // explizit über den Sendekanal erzwungen werden (sonst ginge die finale Antwort im Klartext).
+        // Erzwingung der Eingangsverschlüsselung hier aus, um den Fluss im Test unverschlüsselt
+        // treiben zu können; geprüft wird allein, dass die ASYNC-Antwort verschlüsselt rausgeht.
+        var gated = new GatedLockManager();
+        var (d, conn, sid, tid) = Setup(gated, rejectUnencrypted: false);
+        conn.Sessions[sid].TreeConnects[tid].EncryptData = true; // Tree verlangt Verschlüsselung
+        (ulong p, ulong v) = OpenFile(d, conn, sid, tid, 4);
+
+        var sent = new ConcurrentQueue<byte[]>();
+        bool? forcedEncrypt = null;
+        conn.SendRawAsync = (b, enc) => { forcedEncrypt = enc; sent.Enqueue(b); return Task.CompletedTask; };
+
+        d.ProcessMessage(conn, TestHelpers.BuildLockRequest(6, sid, tid, p, v,
+            [(0, 10, (uint)LockFlags.ExclusiveLock)]));
+        gated.Complete(LockOutcome.Granted);
+        await WaitForSend(sent);
+
+        Assert.True(forcedEncrypt, "Die finale LOCK-Antwort auf einem verschlüsselten Tree muss verschlüsselt gesendet werden.");
+    }
+
+    [Fact]
     public async Task Cancel_AbortsPendingLock_WithStatusCancelled()
     {
         var gated = new GatedLockManager();
@@ -94,7 +118,7 @@ public class LockDispatcherTests : IDisposable
         (ulong p, ulong v) = OpenFile(d, conn, sid, tid, 4);
 
         var sent = new ConcurrentQueue<byte[]>();
-        conn.SendRawAsync = b => { sent.Enqueue(b); return Task.CompletedTask; };
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
         byte[] interim = d.ProcessMessage(conn, TestHelpers.BuildLockRequest(6, sid, tid, p, v,
             [(0, 10, (uint)LockFlags.ExclusiveLock)]));
@@ -110,7 +134,8 @@ public class LockDispatcherTests : IDisposable
 
     // --- Setup ---
 
-    private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(ILockManager? lockManager = null)
+    private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(
+        ILockManager? lockManager = null, bool rejectUnencrypted = true)
     {
         var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
         var options = new SmbServerOptions
@@ -118,6 +143,7 @@ public class LockDispatcherTests : IDisposable
             ServerGuid = new byte[16],
             SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
             RequireMessageSigning = false,
+            RejectUnencryptedAccess = rejectUnencrypted,
         };
         if (lockManager is not null) options.LockManager = lockManager;
         options.Shares.Add(Share.CreateIpc());

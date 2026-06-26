@@ -38,7 +38,7 @@ public sealed partial class Smb2Dispatcher
         {
             if (!once.TryFire()) return;
             connection.PendingRequests.TryRemove(pending.MessageId, out _);
-            _ = SendAsyncFinalAsync(connection, header, session, asyncId, status, body);
+            _ = SendAsyncFinalAsync(connection, header, session, asyncId, status, body, ResponseNeedsEncryption(session, open));
         }
 
         IDisposable? subscription;
@@ -75,7 +75,7 @@ public sealed partial class Smb2Dispatcher
 
     /// <summary>Sendet eine finale Antwort einer asynchron ausstehenden Operation out-of-band (ASYNC-Header).</summary>
     private async Task SendAsyncFinalAsync(
-        SmbConnection connection, Smb2Header request, SmbSession session, ulong asyncId, NtStatus status, byte[] body)
+        SmbConnection connection, Smb2Header request, SmbSession session, ulong asyncId, NtStatus status, byte[] body, bool encrypt)
     {
         Smb2Header h = request.CreateResponse(status);
         h.Flags |= Smb2HeaderFlags.AsyncCommand;
@@ -89,9 +89,9 @@ public sealed partial class Smb2Dispatcher
             : ResponseSegment.Unsigned(h, body);
 
         byte[] bytes = AssembleResponse([seg]);
-        Func<byte[], Task>? sender = connection.SendRawAsync;
+        Func<byte[], bool, Task>? sender = connection.SendRawAsync;
         if (sender is null) return;
-        try { await sender(bytes).ConfigureAwait(false); }
+        try { await sender(bytes, encrypt).ConfigureAwait(false); }
         catch { /* Connection bereits weg */ }
     }
 

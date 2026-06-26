@@ -5,7 +5,7 @@ Microsoft Open Specifications (MS-SMB2, MS-FSCC, MS-NLMP, MS-ERREF, MS-SPNG, MS-
 Grundlage und Faktencheck: [`SMB2-3_Server_Context.md`](../SMB2-3_Server_Context.md).
 
 > **Reifegrad.** Diese Lib ist ein **korrektes, voll getestetes Fundament** (Meilensteine
-> M1–M5 weitgehend fertig; siehe [Roadmap](#roadmap)). Der wire-/krypto-kritische Kern ist
+> M1–M6 weitgehend fertig; siehe [Roadmap](#roadmap)). Der wire-/krypto-kritische Kern ist
 > gegen offizielle Testvektoren verifiziert. Datei-I/O (CREATE/READ/WRITE/QUERY_*/SET_INFO/
 > CLOSE) läuft über ein `IFileStore`-Backend (`LocalFileStore`); Byte-Range-**LOCK** ist inkl.
 > blockierender Locks (`STATUS_PENDING` + Interim-Antwort, `CANCEL`) implementiert und über
@@ -99,6 +99,9 @@ ISpnegoNegotiator  ──>  IGssMechanism (NTLM heute, Kerberos später)
 - Cipher-Präferenz **AES-128-GCM** > AES-256-GCM > AES-128-CCM > AES-256-CCM.
 - Signing-Präferenz **AES-GMAC** > AES-CMAC > HMAC-SHA256.
 - **Guest/Anonymous standardmäßig abgelehnt.**
+- **Per-Share-Verschlüsselung** erzwingbar (`Share.EncryptData`): Antworten werden verschlüsselt,
+  und unverschlüsselte Zugriffe auf einen verschlüsselten Tree werden mit `RejectUnencryptedAccess`
+  (Default an) abgelehnt; ein verschlüsselter Share auf einer Verbindung ohne 3.x-Cipher → `ACCESS_DENIED`.
 - Krypto ausschließlich über die .NET-BCL (`System.Security.Cryptography`).
 
 ## Verifikation
@@ -109,7 +112,7 @@ Build & Tests:
 dotnet test
 ```
 
-Die Suite (106 Tests) deckt u.a. ab:
+Die Suite (119 Tests) deckt u.a. ab:
 
 - **Offizielle Krypto-Vektoren:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5),
   NTOWFv2 (MS-NLMP §4.2-Beispiel).
@@ -121,6 +124,9 @@ Die Suite (106 Tests) deckt u.a. ab:
 - Server end-to-end: NEGOTIATE → SESSION_SETUP → TREE_CONNECT → ECHO; Dialektwahl;
   Cipher-/Signing-Aushandlung; Signaturpflicht (signiert akzeptiert, unsigniert abgelehnt);
   Guest-Ablehnung; TCP-Integration über echtes NBSS.
+- Per-Share-Encryption: Tree-Markierung + ShareFlags, Klartext-Request auf verschlüsseltem Tree
+  abgelehnt (`RejectUnencryptedAccess`), Encrypted-Share-Connect ohne Cipher abgelehnt, und der
+  Host liefert die TREE_CONNECT-Antwort eines verschlüsselten Shares als TRANSFORM-Frame zurück.
 
 ## Roadmap
 
@@ -131,7 +137,7 @@ Die Suite (106 Tests) deckt u.a. ab:
 | M3 Auth (SPNEGO + **echtes NTLMv2-Login**, Key-Derivation, Signing) | ✅ (MIC-Verifikation noch offen) |
 | M4 Tree & Dateizugriff (CREATE/READ/QUERY_DIRECTORY/QUERY_INFO/CLOSE) | ✅ über `LocalFileStore` |
 | M5 Schreiben (WRITE, SET_INFO/Rename/Delete ✅; **Byte-Range-LOCK ✅** inkl. blockierend + CANCEL, austauschbarer `ILockManager`) | ✅ |
-| M6 Encryption & Härtung (Transform-Pfad) | 🟡 Krypto fertig; Per-Share-Verdrahtung offen |
+| M6 Encryption & Härtung (Transform-Pfad) | ✅ Per-Share-Encryption verdrahtet (Tree-`EncryptData`, Antwort-Verschlüsselung inkl. TREE_CONNECT-Response) + Härtung: `RejectUnencryptedAccess` (Default an) lehnt Klartext-Zugriff auf verschlüsselte Trees ab; Encrypted-Share-Connect ohne 3.x-Cipher → `ACCESS_DENIED` |
 | Share-Enumeration (srvsvc NetrShareEnum über DCERPC/IPC$, IOCTL FSCTL_PIPE_TRANSCEIVE) | ✅ |
 | SMB1→SMB2 Negotiate-Upgrade (§6.1, für impacket u.a.) | ✅ |
 | M7 **CHANGE_NOTIFY ✅** (austauschbarer `IDirectoryWatcher`, Default `FileSystemWatcher`); Oplocks/Leases/Compound-Feinschliff offen | 🟡 |

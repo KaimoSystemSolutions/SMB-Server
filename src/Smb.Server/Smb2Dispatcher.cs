@@ -38,9 +38,10 @@ public sealed partial class Smb2Dispatcher
 
     /// <summary>
     /// Verarbeitet eine eingehende Nachricht (eine oder mehrere via NextCommand verkettete
-    /// SMB2-Nachrichten). Liefert die zusammengesetzte Antwort.
+    /// SMB2-Nachrichten). Liefert die zusammengesetzte Antwort. <paramref name="transportEncrypted"/>
+    /// gibt an, ob die Nachricht über einen TRANSFORM-Frame (verschlüsselt) ankam (§11).
     /// </summary>
-    public byte[] ProcessMessage(SmbConnection connection, ReadOnlySpan<byte> message)
+    public byte[] ProcessMessage(SmbConnection connection, ReadOnlySpan<byte> message, bool transportEncrypted = false)
     {
         // SMB1 Multi-Protocol-Negotiate (§6.1): Altclients (z.B. impacket) schicken zuerst ein
         // SMB1 SMB_COM_NEGOTIATE (ProtocolId FF 53 4D 42). Darauf mit einer SMB2-NEGOTIATE-Response
@@ -87,7 +88,7 @@ public sealed partial class Smb2Dispatcher
             }
 
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} tid={header.TreeId} len={segment.Length} charge={header.CreditCharge}");
-            ResponseSegment? response = DispatchOne(connection, header, segment);
+            ResponseSegment? response = DispatchOne(connection, header, segment, transportEncrypted);
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(keine Antwort)")}");
             if (response is { } seg) segments.Add(seg);
 
@@ -98,10 +99,16 @@ public sealed partial class Smb2Dispatcher
         return AssembleResponse(segments);
     }
 
-    private ResponseSegment? DispatchOne(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment? DispatchOne(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool transportEncrypted)
     {
         try
         {
+            // Verschlüsselungspflicht prüfen, bevor der Command überhaupt verarbeitet wird
+            // (§3.3.5.2.11): Ist die Session global oder der adressierte Tree verschlüsselungs-
+            // pflichtig und kam der Request unverschlüsselt an → ablehnen.
+            if (!transportEncrypted && RequiresEncryptedTransport(connection, header))
+                return BuildError(header, NtStatus.AccessDenied);
+
             return header.Command switch
             {
                 SmbCommand.Negotiate => HandleNegotiate(connection, header, segment),
@@ -140,6 +147,29 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, MapException(ex));
         }
     }
+
+    /// <summary>
+    /// Bestimmt, ob ein Request verschlüsselt ankommen MUSS (RejectUnencryptedAccess, §3.3.5.2.11):
+    /// wenn die adressierte Session global verschlüsselt ist oder der adressierte Tree EncryptData
+    /// verlangt. NEGOTIATE/SESSION_SETUP sind ausgenommen — deren Token-Austausch läuft im Klartext.
+    /// Existiert die Session (noch) nicht, greift die reguläre Session-Prüfung im Handler.
+    /// </summary>
+    private bool RequiresEncryptedTransport(SmbConnection connection, Smb2Header header)
+    {
+        if (!_server.Options.RejectUnencryptedAccess) return false;
+        if (header.Command is SmbCommand.Negotiate or SmbCommand.SessionSetup) return false;
+        if (!connection.Sessions.TryGetValue(header.SessionId, out SmbSession? session)) return false;
+        if (session.EncryptData) return true;
+        return session.TreeConnects.TryGetValue(header.TreeId, out SmbTreeConnect? tree) && tree.EncryptData;
+    }
+
+    /// <summary>
+    /// Muss eine (ASYNC-)Antwort verschlüsselt werden? Bei ASYNC-Headern fehlt die TreeId, daher
+    /// kann der Host die Per-Share-Pflicht nicht aus den Bytes ableiten — wir bestimmen sie hier aus
+    /// Session (global) bzw. dem Tree des zugehörigen Open und geben sie an den Sendekanal weiter.
+    /// </summary>
+    private static bool ResponseNeedsEncryption(SmbSession session, SmbOpen? open)
+        => session.EncryptData || (open?.TreeConnect.EncryptData ?? false);
 
     /// <summary>Bildet eine unerwartete .NET-Ausnahme auf einen passenden NTSTATUS ab.</summary>
     private static NtStatus MapException(Exception ex) => ex switch
@@ -394,6 +424,13 @@ public sealed partial class Smb2Dispatcher
         if (!decision.Allowed)
             return BuildError(header, decision.DenyStatus);
 
+        // Verschlüsselungspflicht des Shares (SMB2_SHAREFLAG_ENCRYPT_DATA, §3.3.5.7): Verlangt der
+        // Share Verschlüsselung, die Connection kann sie aber nicht (Dialekt < 3.0 oder kein Cipher
+        // ausgehandelt) → Zugriff verweigern, statt unverschlüsselt zu liefern.
+        bool encryptTree = share.EncryptData;
+        if (encryptTree && !(connection.Dialect.IsSmb3OrLater() && connection.SupportsEncryption))
+            return BuildError(header, NtStatus.AccessDenied);
+
         ulong treeId = connection.AllocateTreeId();
         var tree = new SmbTreeConnect
         {
@@ -401,11 +438,12 @@ public sealed partial class Smb2Dispatcher
             Session = session,
             Share = share,
             MaximalAccess = (uint)decision.MaximalAccess,
+            EncryptData = encryptTree,
         };
         session.TreeConnects[treeId] = tree;
 
         var shareFlags = ShareFlags.ManualCaching;
-        if (share.EncryptData) shareFlags |= ShareFlags.EncryptData;
+        if (tree.EncryptData) shareFlags |= ShareFlags.EncryptData;
 
         var response = new TreeConnectResponse
         {

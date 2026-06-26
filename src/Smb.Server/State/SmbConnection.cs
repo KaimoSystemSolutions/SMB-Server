@@ -86,8 +86,10 @@ public sealed class SmbConnection
     /// Vom Host gesetzter, serialisierter Sendekanal für eine bereits fertige (Header+Body, ggf.
     /// signierte) SMB2-Antwort. Verschlüsselung und NBSS-Rahmung übernimmt der Host. Erlaubt es,
     /// die <i>finale</i> Antwort einer asynchron ausstehenden Operation out-of-band zu senden.
+    /// Das <c>bool</c>-Argument erzwingt die Verschlüsselung — nötig bei ASYNC-Antworten, deren
+    /// Header keine TreeId trägt und bei denen der Host die Per-Share-Pflicht sonst nicht erkennt.
     /// </summary>
-    public Func<byte[], Task>? SendRawAsync { get; set; }
+    public Func<byte[], bool, Task>? SendRawAsync { get; set; }
 
     /// <summary>Ausstehende asynchrone Operationen (MessageId → Eintrag), für CANCEL/Teardown.</summary>
     public ConcurrentDictionary<ulong, PendingAsyncRequest> PendingRequests { get; } = new();

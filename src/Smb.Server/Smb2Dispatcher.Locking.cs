@@ -120,9 +120,9 @@ public sealed partial class Smb2Dispatcher
 
         byte[] bytes = AssembleResponse([seg]);
 
-        Func<byte[], Task>? sender = connection.SendRawAsync;
+        Func<byte[], bool, Task>? sender = connection.SendRawAsync;
         if (sender is null) return;
-        try { await sender(bytes).ConfigureAwait(false); }
+        try { await sender(bytes, ResponseNeedsEncryption(session, pending.Owner)).ConfigureAwait(false); }
         catch { /* Connection bereits weg — nichts zu tun */ }
     }
 

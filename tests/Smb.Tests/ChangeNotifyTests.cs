@@ -73,7 +73,7 @@ public class ChangeNotifyTests : IDisposable
         (ulong p, ulong v) = OpenPath(d, conn, sid, tid, "watched", directory: true);
 
         var sent = new System.Collections.Concurrent.ConcurrentQueue<byte[]>();
-        conn.SendRawAsync = b => { sent.Enqueue(b); return Task.CompletedTask; };
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
         byte[] interim = d.ProcessMessage(conn, TestHelpers.BuildChangeNotifyRequest(6, sid, tid, p, v, FilterFileName));
         Assert.Equal(NtStatus.Pending, Smb2Header.Read(interim).Status);
@@ -92,7 +92,7 @@ public class ChangeNotifyTests : IDisposable
         (ulong p, ulong v) = OpenPath(d, conn, sid, tid, "watched", directory: true);
 
         var sent = new System.Collections.Concurrent.ConcurrentQueue<byte[]>();
-        conn.SendRawAsync = b => { sent.Enqueue(b); return Task.CompletedTask; };
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
         byte[] interim = d.ProcessMessage(conn, TestHelpers.BuildChangeNotifyRequest(6, sid, tid, p, v, FilterFileName));
         Assert.Equal(NtStatus.Pending, Smb2Header.Read(interim).Status);
