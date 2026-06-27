@@ -1,9 +1,9 @@
 namespace Smb.Auth.Oids;
 
-/// <summary>Mechanismus-OIDs für SPNEGO <c>mechTypes</c> (Context §9.2, MS-SPNG / RFC 4178).</summary>
+/// <summary>Mechanism OIDs for SPNEGO <c>mechTypes</c> (Context §9.2, MS-SPNG / RFC 4178).</summary>
 public static class GssOids
 {
-    /// <summary>SPNEGO selbst (1.3.6.1.5.5.2).</summary>
+    /// <summary>SPNEGO itself (1.3.6.1.5.5.2).</summary>
     public const string Spnego = "1.3.6.1.5.5.2";
 
     /// <summary>Kerberos V5 (GSS) — 1.2.840.113554.1.2.2.</summary>

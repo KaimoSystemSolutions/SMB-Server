@@ -1,6 +1,6 @@
 namespace Smb.Protocol.Enums;
 
-/// <summary>SMB2-Command-Codes (Context §5, MS-SMB2 §2.2.1).</summary>
+/// <summary>SMB2 command codes (Context §5, MS-SMB2 §2.2.1).</summary>
 public enum SmbCommand : ushort
 {
     Negotiate = 0x0000,

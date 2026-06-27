@@ -5,7 +5,7 @@ namespace Smb.Protocol.Messages;
 
 /// <summary>
 /// SMB2 NEGOTIATE Response (Context §6.3, MS-SMB2 §2.2.4). <c>StructureSize=65</c>
-/// (fester Teil 64 Byte; das "+1" steht für den variablen Buffer, Context §4/§23).
+/// (fixed part 64 bytes; the "+1" stands for the variable buffer, Context §4/§23).
 /// </summary>
 public sealed class NegotiateResponse
 {
@@ -19,20 +19,20 @@ public sealed class NegotiateResponse
     public uint MaxReadSize { get; init; }
     public uint MaxWriteSize { get; init; }
 
-    /// <summary>FILETIME (100-ns seit 1601-01-01 UTC).</summary>
+    /// <summary>FILETIME (100-ns since 1601-01-01 UTC).</summary>
     public long SystemTime { get; init; }
     public long ServerStartTime { get; init; }
 
-    /// <summary>SPNEGO NegTokenInit2 (Context §9); darf leer sein (raw NTLM ohne SPNEGO).</summary>
+    /// <summary>SPNEGO NegTokenInit2 (Context §9); may be empty (raw NTLM without SPNEGO).</summary>
     public byte[] SecurityBuffer { get; init; } = [];
 
-    /// <summary>Negotiate-Contexts (nur 3.1.1).</summary>
+    /// <summary>Negotiate contexts (3.1.1 only).</summary>
     public IReadOnlyList<NegotiateContext> NegotiateContexts { get; init; } = [];
 
     /// <summary>
-    /// Serialisiert den Response-Body (ohne SMB2-Header). <paramref name="headerSize"/>
-    /// ist der Offset des Bodys in der Gesamtnachricht (i.d.R. 64), nötig weil
-    /// SecurityBufferOffset und NegotiateContextOffset absolut (ab Nachrichtenbeginn) sind.
+    /// Serializes the response body (without the SMB2 header). <paramref name="headerSize"/>
+    /// is the offset of the body within the whole message (usually 64), needed because
+    /// SecurityBufferOffset and NegotiateContextOffset are absolute (from the start of the message).
     /// </summary>
     public byte[] ToBody(int headerSize = Smb2Header.Size)
     {
@@ -41,10 +41,10 @@ public sealed class NegotiateResponse
         w.WriteUInt16(StructureSize);
         w.WriteUInt16((ushort)SecurityMode);
         w.WriteUInt16((ushort)DialectRevision);
-        w.WriteUInt16((ushort)NegotiateContexts.Count); // NegotiateContextCount (0 bei <3.1.1)
+        w.WriteUInt16((ushort)NegotiateContexts.Count); // NegotiateContextCount (0 for <3.1.1)
 
         if (ServerGuid.Length != 16)
-            throw new SmbWireFormatException("ServerGuid muss 16 Byte sein.");
+            throw new SmbWireFormatException("ServerGuid must be 16 bytes.");
         w.WriteBytes(ServerGuid);
 
         w.WriteUInt32((uint)Capabilities);
@@ -55,12 +55,12 @@ public sealed class NegotiateResponse
         w.WriteUInt64((ulong)ServerStartTime);
 
         int secOffsetPos = w.Position;
-        w.WriteUInt16(0); // SecurityBufferOffset – patch
+        w.WriteUInt16(0); // SecurityBufferOffset – patched below
         w.WriteUInt16((ushort)SecurityBuffer.Length);
         int negCtxOffsetPos = w.Position;
-        w.WriteUInt32(0); // NegotiateContextOffset – patch
+        w.WriteUInt32(0); // NegotiateContextOffset – patched below
 
-        // Variabler Teil: SecurityBuffer (direkt nach dem 64-Byte-Festteil).
+        // Variable part: SecurityBuffer (directly after the 64-byte fixed part).
         int securityBufferStart = w.Position;
         if (SecurityBuffer.Length > 0)
         {
@@ -72,9 +72,9 @@ public sealed class NegotiateResponse
             w.PatchUInt16(secOffsetPos, 0);
         }
 
-        // Negotiate-Contexts: jeder Context beginnt auf einer 8-Byte-Grenze relativ zum
-        // Nachrichtenbeginn (= headerSize + Writer-Position). Das Padding zwischen Contexts
-        // zählt nicht zur jeweiligen DataLength.
+        // Negotiate contexts: each context starts on an 8-byte boundary relative to the start of
+        // the message (= headerSize + writer position). The padding between contexts does not count
+        // toward each context's DataLength.
         if (NegotiateContexts.Count > 0)
         {
             PadToAbsolute8(w, headerSize);
@@ -94,7 +94,7 @@ public sealed class NegotiateResponse
         return w.ToArray();
     }
 
-    /// <summary>Padding bis die absolute Position (headerSize + Writer-Position) durch 8 teilbar ist.</summary>
+    /// <summary>Pads until the absolute position (headerSize + writer position) is divisible by 8.</summary>
     private static void PadToAbsolute8(GrowableWriter w, int headerSize)
     {
         int abs = headerSize + w.Position;

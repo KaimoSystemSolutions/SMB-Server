@@ -4,9 +4,9 @@ using Smb.Protocol.Wire;
 namespace Smb.Protocol.Messages;
 
 /// <summary>
-/// SMB2 CHANGE_NOTIFY Request/Response (Context §16, MS-SMB2 §2.2.35/§2.2.36) inklusive der
-/// FILE_NOTIFY_INFORMATION-Struktur (MS-FSCC §2.7.1). Überwacht ein Verzeichnis-Handle auf
-/// Änderungen; die Antwort folgt i.d.R. asynchron (STATUS_PENDING + finale Antwort).
+/// SMB2 CHANGE_NOTIFY Request/Response (Context §16, MS-SMB2 §2.2.35/§2.2.36) including the
+/// FILE_NOTIFY_INFORMATION structure (MS-FSCC §2.7.1). Watches a directory handle for changes;
+/// the response is usually delivered asynchronously (STATUS_PENDING + final response).
 /// </summary>
 public static class ChangeNotifyMessage
 {
@@ -37,10 +37,10 @@ public static class ChangeNotifyMessage
     }
 
     /// <summary>
-    /// Baut die CHANGE_NOTIFY-Response aus den Änderungen (Action + verzeichnis-relativer Name).
-    /// Überschreitet die FILE_NOTIFY_INFORMATION-Liste <paramref name="maxBufferLength"/>, wird
-    /// <c>overflow</c> gesetzt (der Aufrufer antwortet dann mit <c>STATUS_NOTIFY_ENUM_DIR</c> und
-    /// leerem Puffer — der Client enumeriert selbst neu, MS-SMB2 §3.3.5.19).
+    /// Builds the CHANGE_NOTIFY response from the changes (Action + directory-relative name).
+    /// If the FILE_NOTIFY_INFORMATION list exceeds <paramref name="maxBufferLength"/>, <c>overflow</c>
+    /// is set (the caller then replies with <c>STATUS_NOTIFY_ENUM_DIR</c> and an empty buffer — the
+    /// client re-enumerates itself, MS-SMB2 §3.3.5.19).
     /// </summary>
     public static (byte[] body, bool overflow) BuildResponseBody(
         IReadOnlyList<(uint Action, string Name)> changes, uint maxBufferLength)
@@ -52,14 +52,14 @@ public static class ChangeNotifyMessage
             byte[] name = Encoding.Unicode.GetBytes(changes[i].Name);
 
             int nextOffPos = buf.Position;
-            buf.WriteUInt32(0);                    // NextEntryOffset (ggf. unten gepatcht)
+            buf.WriteUInt32(0);                    // NextEntryOffset (patched below if needed)
             buf.WriteUInt32(changes[i].Action);
-            buf.WriteUInt32((uint)name.Length);    // FileNameLength in Bytes
+            buf.WriteUInt32((uint)name.Length);    // FileNameLength in bytes
             buf.WriteBytes(name);
 
             if (i < changes.Count - 1)
             {
-                int pad = (4 - (buf.Position % 4)) % 4; // Entries 4-Byte-aligned
+                int pad = (4 - (buf.Position % 4)) % 4; // entries are 4-byte aligned
                 if (pad > 0) buf.WriteZeros(pad);
                 buf.PatchUInt32(nextOffPos, (uint)(buf.Position - entryStart));
             }
@@ -77,13 +77,13 @@ public static class ChangeNotifyMessage
         return (body.ToArray(), false);
     }
 
-    /// <summary>Response ohne Inhalt (OutputBufferLength 0) — für STATUS_NOTIFY_ENUM_DIR.</summary>
+    /// <summary>Response without content (OutputBufferLength 0) — for STATUS_NOTIFY_ENUM_DIR.</summary>
     public static byte[] BuildEmptyResponseBody()
     {
         var body = new byte[8];
         var w = new SpanWriter(body);
         w.WriteUInt16(ResponseStructureSize);
-        w.WriteUInt16(0); // OutputBufferOffset (irrelevant bei Länge 0)
+        w.WriteUInt16(0); // OutputBufferOffset (irrelevant when length is 0)
         w.WriteUInt32(0); // OutputBufferLength
         return body;
     }

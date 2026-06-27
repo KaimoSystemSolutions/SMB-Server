@@ -26,7 +26,7 @@ public static class ReadMessage
         return new Request(length, offset, persistent, vol, minimumCount);
     }
 
-    /// <summary>Baut die READ-Response. DataOffset = Header(64) + fester Body (16) = 80.</summary>
+    /// <summary>Builds the READ response. DataOffset = header(64) + fixed body(16) = 80.</summary>
     public static byte[] BuildResponseBody(ReadOnlySpan<byte> data)
     {
         const byte dataOffset = Smb2Header.Size + 16; // 80
@@ -66,8 +66,11 @@ public static class WriteMessage
         byte[] data = [];
         if (length > 0)
         {
-            if (dataOffset + length > message.Length)
-                throw new SmbWireFormatException("WRITE Daten reichen über die Nachricht hinaus.");
+            // Use 64-bit arithmetic: dataOffset (ushort) + length (uint) can overflow a 32-bit int
+            // for a hostile length, wrapping past this check (the later Slice would still throw, but
+            // bound it cleanly here).
+            if ((long)dataOffset + length > message.Length)
+                throw new SmbWireFormatException("WRITE data extends past the message.");
             data = message.Slice(dataOffset, (int)length).ToArray();
         }
         return new Request(offset, persistent, vol, data);

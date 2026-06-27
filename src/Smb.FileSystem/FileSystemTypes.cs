@@ -2,7 +2,7 @@ using Smb.Protocol.Enums;
 
 namespace Smb.FileSystem;
 
-/// <summary>Share-Typ (Context §12, MS-SMB2 §2.2.10).</summary>
+/// <summary>Share type (Context §12, MS-SMB2 §2.2.10).</summary>
 public enum ShareType : byte
 {
     Disk = 0x01,
@@ -10,7 +10,7 @@ public enum ShareType : byte
     Print = 0x03,
 }
 
-/// <summary>NTFS-Dateiattribute (Context §16, MS-FSCC §2.6).</summary>
+/// <summary>NTFS file attributes (Context §16, MS-FSCC §2.6).</summary>
 [Flags]
 public enum SmbFileAttributes : uint
 {
@@ -30,7 +30,7 @@ public enum SmbFileAttributes : uint
     Encrypted = 0x00004000,
 }
 
-/// <summary>Metadaten eines Datei-/Verzeichniseintrags (für CREATE/QUERY_INFO/QUERY_DIRECTORY).</summary>
+/// <summary>Metadata of a file/directory entry (for CREATE/QUERY_INFO/QUERY_DIRECTORY).</summary>
 public sealed class FileEntryInfo
 {
     public required string Name { get; init; }
@@ -38,7 +38,7 @@ public sealed class FileEntryInfo
     public long EndOfFile { get; init; }
     public long AllocationSize { get; init; }
 
-    /// <summary>FILETIME-Werte (100-ns seit 1601-01-01 UTC, Context §17).</summary>
+    /// <summary>FILETIME values (100-ns since 1601-01-01 UTC, Context §17).</summary>
     public long CreationTime { get; init; }
     public long LastAccessTime { get; init; }
     public long LastWriteTime { get; init; }
@@ -47,7 +47,7 @@ public sealed class FileEntryInfo
     public bool IsDirectory => Attributes.HasFlag(SmbFileAttributes.Directory);
 }
 
-/// <summary>Ergebnis einer Backend-Operation: NTSTATUS + optionale Nutzlast.</summary>
+/// <summary>Result of a backend operation: NTSTATUS + optional payload.</summary>
 public readonly struct FileStoreResult<T>
 {
     public NtStatus Status { get; }

@@ -3,22 +3,22 @@ using Smb.Protocol.Enums;
 namespace Smb.Auth;
 
 /// <summary>
-/// Ergebnis eines Auth-Schritts (Context §9.1). <see cref="Status"/> steuert den
-/// SESSION_SETUP-Ablauf: <c>MoreProcessingRequired</c> = weiterer Roundtrip,
-/// <c>Success</c> = fertig (mit <see cref="SessionKey"/> und <see cref="Identity"/>),
-/// <c>LogonFailure</c>/<c>AccessDenied</c> = abgelehnt.
+/// Result of an auth step (Context §9.1). <see cref="Status"/> drives the SESSION_SETUP flow:
+/// <c>MoreProcessingRequired</c> = another round-trip, <c>Success</c> = done (with
+/// <see cref="SessionKey"/> and <see cref="Identity"/>), <c>LogonFailure</c>/<c>AccessDenied</c>
+/// = rejected.
 /// </summary>
 public sealed class GssResult
 {
     public required NtStatus Status { get; init; }
 
-    /// <summary>An den Client zurückzugebender Token (im SESSION_SETUP-Security-Buffer).</summary>
+    /// <summary>Token to return to the client (in the SESSION_SETUP security buffer).</summary>
     public byte[]? OutToken { get; init; }
 
-    /// <summary>GSS-Session-Key (≥16 Byte) — Quelle der SMB-Keys (Context §8.3). Nur bei Success.</summary>
+    /// <summary>GSS session key (≥16 bytes) — source of the SMB keys (Context §8.3). Only on success.</summary>
     public byte[]? SessionKey { get; init; }
 
-    /// <summary>Authentifizierte Identität. Nur bei Success.</summary>
+    /// <summary>Authenticated identity. Only on success.</summary>
     public SecurityIdentity? Identity { get; init; }
 
     public bool IsSuccess => Status == NtStatus.Success;

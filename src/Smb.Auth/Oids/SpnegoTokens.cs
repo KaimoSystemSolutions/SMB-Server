@@ -2,35 +2,35 @@ using System.Formats.Asn1;
 
 namespace Smb.Auth.Oids;
 
-/// <summary>Geparster Inhalt eines eingehenden SPNEGO-Tokens (NegTokenInit oder NegTokenResp).</summary>
+/// <summary>Parsed content of an incoming SPNEGO token (NegTokenInit or NegTokenResp).</summary>
 public sealed class SpnegoParseResult
 {
-    /// <summary>Angebotene Mechanismus-OIDs (nur bei NegTokenInit gefüllt).</summary>
+    /// <summary>Offered mechanism OIDs (only populated for NegTokenInit).</summary>
     public IReadOnlyList<string> MechTypes { get; init; } = [];
 
-    /// <summary>Das eingebettete Mech-Token (z.B. NTLMSSP-Blob), falls vorhanden.</summary>
+    /// <summary>The embedded mech token (e.g. NTLMSSP blob), if present.</summary>
     public byte[]? MechToken { get; init; }
 
-    /// <summary>negState bei NegTokenResp (0=accept-completed, 1=accept-incomplete, 2=reject, 3=request-mic).</summary>
+    /// <summary>negState for NegTokenResp (0=accept-completed, 1=accept-incomplete, 2=reject, 3=request-mic).</summary>
     public int? NegState { get; init; }
 
-    /// <summary>True, wenn das Token ein NegTokenResp (Folge-Token) war; sonst NegTokenInit.</summary>
+    /// <summary>True if the token was a NegTokenResp (follow-up token); otherwise NegTokenInit.</summary>
     public bool IsResponseToken { get; init; }
 }
 
 /// <summary>
-/// Kodierung/Dekodierung von SPNEGO-Tokens (RFC 4178, MS-SPNG) per ASN.1-DER. Genutzt vom
-/// Negotiator (Context §9). Deckt den für SMB nötigen Satz ab: server-seitiges NegTokenInit2
-/// (NEGOTIATE-Response) und Parsen der Client-Tokens (NegTokenInit / NegTokenResp).
+/// Encoding/decoding of SPNEGO tokens (RFC 4178, MS-SPNG) via ASN.1 DER. Used by the negotiator
+/// (Context §9). Covers the set needed for SMB: server-side NegTokenInit2 (NEGOTIATE response) and
+/// parsing of the client tokens (NegTokenInit / NegTokenResp).
 /// </summary>
 public static class SpnegoTokens
 {
-    // SPNEGO negState "accept-incomplete" (mehr Schritte nötig).
+    // SPNEGO negState "accept-incomplete" (more steps needed).
     public const int NegStateAcceptCompleted = 0;
     public const int NegStateAcceptIncomplete = 1;
     public const int NegStateReject = 2;
 
-    // Default-Hint, den auch Windows verwendet.
+    // Default hint, the same one Windows uses.
     private const string DefaultHintName = "not_defined_in_RFC4178@please_ignore";
 
     private static readonly Asn1Tag ContextTag0 = new(TagClass.ContextSpecific, 0);
@@ -40,7 +40,7 @@ public static class SpnegoTokens
     private static readonly Asn1Tag ApplicationTag0 = new(TagClass.Application, 0, isConstructed: true);
 
     /// <summary>
-    /// Baut das server-initiale NegTokenInit2 (Context §9.2). Struktur:
+    /// Builds the server-initial NegTokenInit2 (Context §9.2). Structure:
     /// <c>[APPLICATION 0] { SPNEGO-OID, [0] NegTokenInit2 { mechTypes [0], negHints [3] } }</c>.
     /// </summary>
     public static byte[] CreateNegTokenInit2(IReadOnlyList<string> mechTypes, string? hintName = DefaultHintName)
@@ -69,9 +69,9 @@ public static class SpnegoTokens
                     using (writer.PushSequence())
                     using (writer.PushSequence(ContextTag0))
                     {
-                        // GeneralString (Universal 27) — die BCL-AsnWriter-API kann diesen
-                        // String-Typ nicht direkt schreiben; daher die TLV von Hand kodieren
-                        // und als fertigen Wert einsetzen.
+                        // GeneralString (Universal 27) — the BCL AsnWriter API cannot write this
+                        // string type directly; therefore encode the TLV by hand and insert it as a
+                        // ready-made value.
                         writer.WriteEncodedValue(EncodeGeneralString(hintName));
                     }
                 }
@@ -82,8 +82,8 @@ public static class SpnegoTokens
     }
 
     /// <summary>
-    /// Baut ein NegTokenResp (Server→Client-Folge-Token), z.B. mit <c>responseToken</c>
-    /// (= NTLM CHALLENGE_MESSAGE) und negState <c>accept-incomplete</c>.
+    /// Builds a NegTokenResp (server→client follow-up token), e.g. with <c>responseToken</c>
+    /// (= NTLM CHALLENGE_MESSAGE) and negState <c>accept-incomplete</c>.
     /// </summary>
     public static byte[] CreateNegTokenResp(int negState, string? supportedMech = null,
         byte[]? responseToken = null, byte[]? mechListMic = null)
@@ -114,20 +114,20 @@ public static class SpnegoTokens
 
     private enum NegStateValue { }
 
-    /// <summary>Kodiert eine ASCII-Zeichenkette als DER-GeneralString-TLV (Tag 0x1B).</summary>
+    /// <summary>Encodes an ASCII string as a DER GeneralString TLV (tag 0x1B).</summary>
     private static byte[] EncodeGeneralString(string value)
     {
         byte[] content = System.Text.Encoding.ASCII.GetBytes(value);
         if (content.Length < 0x80)
         {
             var tlv = new byte[2 + content.Length];
-            tlv[0] = 0x1B;                  // [UNIVERSAL 27] GeneralString, primitiv
-            tlv[1] = (byte)content.Length;  // kurze Längenform
+            tlv[0] = 0x1B;                  // [UNIVERSAL 27] GeneralString, primitive
+            tlv[1] = (byte)content.Length;  // short length form
             content.CopyTo(tlv, 2);
             return tlv;
         }
 
-        // Lange Längenform (für lange Hints — in der Praxis nicht nötig).
+        // Long length form (for long hints — not needed in practice).
         var lenBytes = new List<byte>();
         int len = content.Length;
         while (len > 0) { lenBytes.Insert(0, (byte)(len & 0xFF)); len >>= 8; }
@@ -140,8 +140,8 @@ public static class SpnegoTokens
     }
 
     /// <summary>
-    /// Parst ein eingehendes SPNEGO-Token: NegTokenInit (GSSAPI-App-Tag) oder NegTokenResp.
-    /// Liefert die Mech-OIDs und/oder das eingebettete Mech-Token.
+    /// Parses an incoming SPNEGO token: NegTokenInit (GSSAPI app tag) or NegTokenResp.
+    /// Returns the mech OIDs and/or the embedded mech token.
     /// </summary>
     public static SpnegoParseResult Parse(ReadOnlySpan<byte> token)
     {
@@ -154,7 +154,7 @@ public static class SpnegoTokens
         if (tag.TagClass == TagClass.ContextSpecific && tag.TagValue == 1)
             return ParseNegTokenResp(reader);
 
-        throw new FormatException($"Unerwartetes SPNEGO-Top-Level-Tag {tag.TagClass}/{tag.TagValue}.");
+        throw new FormatException($"Unexpected SPNEGO top-level tag {tag.TagClass}/{tag.TagValue}.");
     }
 
     private static SpnegoParseResult ParseNegTokenInit(AsnReader reader)
@@ -162,7 +162,7 @@ public static class SpnegoTokens
         AsnReader app = reader.ReadSequence(ApplicationTag0);
         string oid = app.ReadObjectIdentifier();
         if (oid != GssOids.Spnego)
-            throw new FormatException($"Erwartete SPNEGO-OID, fand {oid}.");
+            throw new FormatException($"Expected SPNEGO OID, found {oid}.");
 
         AsnReader inner = app.ReadSequence(ContextTag0);
         AsnReader negInit = inner.ReadSequence();

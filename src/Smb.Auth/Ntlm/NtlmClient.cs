@@ -6,9 +6,9 @@ using Smb.Protocol.Wire;
 namespace Smb.Auth.Ntlm;
 
 /// <summary>
-/// Client-seitige NTLMv2-Berechnung (MS-NLMP §3.1.5). Baut NEGOTIATE/AUTHENTICATE und
-/// verarbeitet die CHALLENGE. Wird vom Beispiel-Client und von Integrationstests genutzt,
-/// um sich mit echten Credentials anzumelden. Sendet rohe NTLMSSP-Tokens (ohne SPNEGO-Wrapper).
+/// Client-side NTLMv2 computation (MS-NLMP §3.1.5). Builds NEGOTIATE/AUTHENTICATE and processes
+/// the CHALLENGE. Used by the sample client and by integration tests to log in with real
+/// credentials. Sends raw NTLMSSP tokens (without an SPNEGO wrapper).
 /// </summary>
 public sealed class NtlmClient
 {
@@ -16,7 +16,7 @@ public sealed class NtlmClient
     private readonly string _user;
     private readonly string _password;
 
-    /// <summary>Nach <see cref="BuildAuthenticate"/> verfügbar: der GSS-Session-Key (für SMB-Signing/Keys).</summary>
+    /// <summary>Available after <see cref="BuildAuthenticate"/>: the GSS session key (for SMB signing/keys).</summary>
     public byte[] ExportedSessionKey { get; private set; } = [];
 
     public NtlmClient(string domain, string user, string password)
@@ -26,7 +26,7 @@ public sealed class NtlmClient
         _password = password;
     }
 
-    /// <summary>Baut das NEGOTIATE_MESSAGE (Type 1, rohes NTLMSSP).</summary>
+    /// <summary>Builds the NEGOTIATE_MESSAGE (Type 1, raw NTLMSSP).</summary>
     public byte[] BuildNegotiate()
     {
         var flags = NtlmNegotiateFlags.NegotiateUnicode | NtlmNegotiateFlags.NegotiateNtlm
@@ -38,14 +38,14 @@ public sealed class NtlmClient
         w.WriteBytes(NtlmConstants.Signature);
         w.WriteUInt32(NtlmConstants.MessageTypeNegotiate);
         w.WriteUInt32((uint)flags);
-        w.WriteUInt64(0); // DomainNameFields (leer)
-        w.WriteUInt64(0); // WorkstationFields (leer)
+        w.WriteUInt64(0); // DomainNameFields (empty)
+        w.WriteUInt64(0); // WorkstationFields (empty)
         return w.ToArray();
     }
 
     /// <summary>
-    /// Verarbeitet die CHALLENGE und baut das AUTHENTICATE_MESSAGE (Type 3) mit NTLMv2-Response.
-    /// Setzt nebenbei <see cref="ExportedSessionKey"/>.
+    /// Processes the CHALLENGE and builds the AUTHENTICATE_MESSAGE (Type 3) with an NTLMv2 response.
+    /// Sets <see cref="ExportedSessionKey"/> as a side effect.
     /// </summary>
     public byte[] BuildAuthenticate(ReadOnlySpan<byte> challengeToken)
     {
@@ -77,7 +77,7 @@ public sealed class NtlmClient
         ntProof.CopyTo(ntResponse, 0);
         tempBytes.CopyTo(ntResponse, ntProof.Length);
 
-        // Schlüssel: KeyExchangeKey = SessionBaseKey; ExportedSessionKey = zufällig, RC4-verschlüsselt.
+        // Keys: KeyExchangeKey = SessionBaseKey; ExportedSessionKey = random, RC4-encrypted.
         byte[] sessionBaseKey = NtlmCryptography.SessionBaseKey(ntowfV2, ntProof);
         ExportedSessionKey = RandomNumberGenerator.GetBytes(16);
         byte[] encryptedSessionKey = Rc4.Transform(sessionBaseKey, ExportedSessionKey);
@@ -90,7 +90,7 @@ public sealed class NtlmClient
         byte[] domain = Encoding.Unicode.GetBytes(_domain);
         byte[] user = Encoding.Unicode.GetBytes(_user);
         byte[] workstation = Encoding.Unicode.GetBytes("CLIENT");
-        byte[] lmResponse = new byte[24]; // NTLMv2: LM-Response wird genullt
+        byte[] lmResponse = new byte[24]; // NTLMv2: the LM response is zeroed
 
         var flags = NtlmNegotiateFlags.NegotiateUnicode | NtlmNegotiateFlags.NegotiateNtlm
                   | NtlmNegotiateFlags.NegotiateExtendedSessionSecurity | NtlmNegotiateFlags.NegotiateKeyExchange
@@ -98,7 +98,7 @@ public sealed class NtlmClient
                   | NtlmNegotiateFlags.NegotiateTargetInfo | NtlmNegotiateFlags.Negotiate128
                   | NtlmNegotiateFlags.Negotiate56;
 
-        const int payloadStart = 88; // nach MIC(16) bei Offset 72
+        const int payloadStart = 88; // after MIC(16) at offset 72
         int off = payloadStart;
         int lmOff = off; off += lmResponse.Length;
         int ntOff = off; off += ntResponse.Length;
@@ -118,7 +118,7 @@ public sealed class NtlmClient
         WriteField(w, encryptedSessionKey.Length, keyOff);
         w.WriteUInt32((uint)flags);
         w.WriteUInt64(0);            // Version
-        w.WriteBytes(new byte[16]);  // MIC = 0 (MIC-Prüfung wird serverseitig übersprungen)
+        w.WriteBytes(new byte[16]);  // MIC = 0 (MIC verification is skipped on the server)
 
         w.WriteBytes(lmResponse);
         w.WriteBytes(ntResponse);
@@ -138,7 +138,7 @@ public sealed class NtlmClient
 
     private static (byte[] serverChallenge, byte[] targetInfo) ParseChallenge(ReadOnlySpan<byte> data)
     {
-        if (!NtlmConstants.IsNtlmSsp(data)) throw new FormatException("Kein NTLMSSP-Token.");
+        if (!NtlmConstants.IsNtlmSsp(data)) throw new FormatException("Not an NTLMSSP token.");
         var r = new SpanReader(data);
         r.Skip(8);                 // Signature
         r.ReadUInt32();            // MessageType

@@ -2,7 +2,7 @@ using Smb.Protocol.Wire;
 
 namespace Smb.Protocol.Messages;
 
-/// <summary>Flags eines SMB2_LOCK-Elements (MS-SMB2 §2.2.26.1).</summary>
+/// <summary>Flags of an SMB2_LOCK element (MS-SMB2 §2.2.26.1).</summary>
 [Flags]
 public enum LockFlags : uint
 {
@@ -13,7 +13,7 @@ public enum LockFlags : uint
     FailImmediately = 0x00000010,
 }
 
-/// <summary>Ein einzelnes Byte-Range-Lock-Element des LOCK-Requests (MS-SMB2 §2.2.26.1).</summary>
+/// <summary>A single byte-range lock element of the LOCK request (MS-SMB2 §2.2.26.1).</summary>
 public readonly record struct LockEntry(ulong Offset, ulong Length, uint Flags)
 {
     public bool IsUnlock => (Flags & (uint)LockFlags.Unlock) != 0;
@@ -43,12 +43,12 @@ public static class LockMessage
             throw new SmbWireFormatException($"LOCK Request StructureSize {ss} ≠ {RequestStructureSize}.");
 
         ushort lockCount = r.ReadUInt16();
-        uint lockSequence = r.ReadUInt32();         // LockSequenceNumber(4 Bit) ‖ LockSequenceIndex(28 Bit)
+        uint lockSequence = r.ReadUInt32();         // LockSequenceNumber(4 bits) ‖ LockSequenceIndex(28 bits)
         ulong persistent = r.ReadUInt64();
         ulong vol = r.ReadUInt64();
 
         if (lockCount == 0)
-            throw new SmbWireFormatException("LOCK Request mit LockCount 0.");
+            throw new SmbWireFormatException("LOCK request with LockCount 0.");
 
         var locks = new LockEntry[lockCount];
         for (int i = 0; i < lockCount; i++)
@@ -63,7 +63,7 @@ public static class LockMessage
         return new Request(persistent, vol, lockSequence, locks);
     }
 
-    /// <summary>Baut die LOCK-Response (fester 4-Byte-Body).</summary>
+    /// <summary>Builds the LOCK response (fixed 4-byte body).</summary>
     public static byte[] BuildResponseBody()
     {
         var body = new byte[4];

@@ -5,25 +5,25 @@ using Smb.Protocol.Enums;
 namespace Smb.Crypto;
 
 /// <summary>
-/// SMB2/3-Nachrichtensignierung (Context §10, MS-SMB2 §3.1.4.1). Algorithmus je nach Dialekt:
+/// SMB2/3 message signing (Context §10, MS-SMB2 §3.1.4.1). Algorithm depends on the dialect:
 /// <list type="bullet">
-///   <item>2.0.2 / 2.1: HMAC-SHA256 (erste 16 Byte), Key = voller GSS-Session-Key.</item>
-///   <item>3.0 / 3.0.2: AES-128-CMAC, Key = abgeleiteter SigningKey.</item>
-///   <item>3.1.1: AES-CMAC, AES-GMAC oder HMAC-SHA256 je nach ausgehandeltem Algorithmus.</item>
+///   <item>2.0.2 / 2.1: HMAC-SHA256 (first 16 bytes), key = full GSS session key.</item>
+///   <item>3.0 / 3.0.2: AES-128-CMAC, key = derived SigningKey.</item>
+///   <item>3.1.1: AES-CMAC, AES-GMAC or HMAC-SHA256 depending on the negotiated algorithm.</item>
 /// </list>
-/// Das 16-Byte-Signaturfeld (Header-Offset 48) wird vor der Berechnung auf 0 gesetzt und
-/// danach mit dem Ergebnis überschrieben.
+/// The 16-byte signature field (header offset 48) is zeroed before the computation and then
+/// overwritten with the result.
 /// </summary>
 public static class Smb2Signer
 {
-    /// <summary>Offset des Signaturfelds im SMB2-Header.</summary>
+    /// <summary>Offset of the signature field in the SMB2 header.</summary>
     public const int SignatureOffset = 48;
 
-    /// <summary>Länge des Signaturfelds.</summary>
+    /// <summary>Length of the signature field.</summary>
     public const int SignatureLength = 16;
 
     /// <summary>
-    /// Bestimmt den effektiven Signing-Algorithmus aus Dialekt und (3.1.1) ausgehandeltem Algorithmus.
+    /// Determines the effective signing algorithm from the dialect and (3.1.1) the negotiated algorithm.
     /// </summary>
     public static SmbSigningAlgorithmId ResolveAlgorithm(SmbDialect dialect, SmbSigningAlgorithmId negotiated)
         => dialect switch
@@ -31,12 +31,12 @@ public static class Smb2Signer
             SmbDialect.Smb202 or SmbDialect.Smb210 => SmbSigningAlgorithmId.HmacSha256,
             SmbDialect.Smb300 or SmbDialect.Smb302 => SmbSigningAlgorithmId.AesCmac,
             SmbDialect.Smb311 => negotiated,
-            _ => throw new ArgumentOutOfRangeException(nameof(dialect), dialect, "Kein Signing für diesen Dialekt."),
+            _ => throw new ArgumentOutOfRangeException(nameof(dialect), dialect, "No signing for this dialect."),
         };
 
     /// <summary>
-    /// Berechnet die 16-Byte-Signatur über die <b>gesamte</b> Nachricht. Das Signaturfeld
-    /// in <paramref name="message"/> muss zuvor genullt sein (siehe <see cref="SignInPlace"/>).
+    /// Computes the 16-byte signature over the <b>entire</b> message. The signature field in
+    /// <paramref name="message"/> must be zeroed beforehand (see <see cref="SignInPlace"/>).
     /// </summary>
     public static byte[] ComputeSignature(
         SmbSigningAlgorithmId algorithm,
@@ -56,8 +56,8 @@ public static class Smb2Signer
     }
 
     /// <summary>
-    /// Signiert die Nachricht in-place: nullt das Signaturfeld, berechnet die Signatur und
-    /// schreibt sie zurück. Setzt KEINE Flags — der Aufrufer setzt <c>SMB2_FLAGS_SIGNED</c>.
+    /// Signs the message in place: zeroes the signature field, computes the signature and writes it
+    /// back. Sets NO flags — the caller sets <c>SMB2_FLAGS_SIGNED</c>.
     /// </summary>
     public static void SignInPlace(
         SmbSigningAlgorithmId algorithm,
@@ -73,8 +73,8 @@ public static class Smb2Signer
     }
 
     /// <summary>
-    /// Prüft die Signatur einer eingehenden Nachricht konstanzeit-vergleichend. Lässt
-    /// <paramref name="message"/> unverändert (Signaturfeld wird auf einer Kopie genullt).
+    /// Verifies the signature of an incoming message with a constant-time comparison. Leaves
+    /// <paramref name="message"/> unchanged (the signature field is zeroed on a copy).
     /// </summary>
     public static bool Verify(
         SmbSigningAlgorithmId algorithm,
@@ -86,7 +86,7 @@ public static class Smb2Signer
     {
         if (message.Length < SignatureOffset + SignatureLength) return false;
 
-        // Mitgesendete Signatur extrahieren, danach Feld für die Neuberechnung nullen (auf Kopie).
+        // Extract the signature that was sent, then zero the field for recomputation (on a copy).
         Span<byte> received = stackalloc byte[SignatureLength];
         message.Slice(SignatureOffset, SignatureLength).CopyTo(received);
 
@@ -106,9 +106,9 @@ public static class Smb2Signer
     }
 
     /// <summary>
-    /// AES-GMAC (RFC 4543) = AES-GCM-Tag über leeren Klartext mit der Nachricht als AAD.
-    /// 12-Byte-Nonce = MessageId(8, LE) ‖ Flags-DWORD(4, LE), mit LSB=1 (Server) und
-    /// Bit 1 = 1 für CANCEL (Context §10).
+    /// AES-GMAC (RFC 4543) = AES-GCM tag over empty plaintext with the message as AAD.
+    /// 12-byte nonce = MessageId(8, LE) ‖ flags DWORD(4, LE), with LSB=1 (server) and
+    /// bit 1 = 1 for CANCEL (Context §10).
     /// </summary>
     private static byte[] AesGmac(
         ReadOnlySpan<byte> key,

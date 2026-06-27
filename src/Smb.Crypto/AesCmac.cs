@@ -3,17 +3,16 @@ using System.Security.Cryptography;
 namespace Smb.Crypto;
 
 /// <summary>
-/// AES-CMAC nach RFC 4493 (Context §10: Signing für SMB 3.0/3.0.2 und 3.1.1-AES-CMAC).
-/// Die .NET-BCL bietet in net8.0 kein eigenständiges AES-CMAC, daher hier auf Basis von
-/// AES-ECB-Einzelblock-Verschlüsselung implementiert. Verifizierbar gegen die
-/// RFC-4493-Testvektoren (siehe Tests).
+/// AES-CMAC per RFC 4493 (Context §10: signing for SMB 3.0/3.0.2 and 3.1.1 AES-CMAC).
+/// The .NET BCL has no standalone AES-CMAC in net8.0, so it is implemented here on top of
+/// single-block AES-ECB encryption. Verifiable against the RFC 4493 test vectors (see tests).
 /// </summary>
 public static class AesCmac
 {
     private const int BlockSize = 16;
-    private const byte Rb = 0x87; // Konstante für den 128-Bit-Block (RFC 4493 §2.3).
+    private const byte Rb = 0x87; // constant for the 128-bit block (RFC 4493 §2.3).
 
-    /// <summary>Berechnet das 16-Byte-AES-CMAC über <paramref name="message"/> mit <paramref name="key"/>.</summary>
+    /// <summary>Computes the 16-byte AES-CMAC over <paramref name="message"/> with <paramref name="key"/>.</summary>
     public static byte[] Compute(ReadOnlySpan<byte> key, ReadOnlySpan<byte> message)
     {
         var mac = new byte[BlockSize];
@@ -21,18 +20,18 @@ public static class AesCmac
         return mac;
     }
 
-    /// <summary>Berechnet AES-CMAC in den bereitgestellten 16-Byte-Puffer.</summary>
+    /// <summary>Computes AES-CMAC into the provided 16-byte buffer.</summary>
     public static void Compute(ReadOnlySpan<byte> key, ReadOnlySpan<byte> message, Span<byte> destination)
     {
         if (destination.Length < BlockSize)
-            throw new ArgumentException("Ziel benötigt mindestens 16 Byte.", nameof(destination));
+            throw new ArgumentException("Destination requires at least 16 bytes.", nameof(destination));
 
         using var aes = Aes.Create();
         aes.Mode = CipherMode.ECB;
         aes.Padding = PaddingMode.None;
         aes.Key = key.ToArray();
 
-        // Subkeys K1/K2 ableiten (RFC 4493 §2.3).
+        // Derive subkeys K1/K2 (RFC 4493 §2.3).
         Span<byte> l = stackalloc byte[BlockSize];
         Span<byte> zero = stackalloc byte[BlockSize];
         zero.Clear();
@@ -84,7 +83,7 @@ public static class AesCmac
         for (int i = 0; i < BlockSize; i++) dst[i] = (byte)(a[i] ^ b[i]);
     }
 
-    /// <summary>Linksshift um 1 Bit; bei gesetztem MSB zusätzlich XOR mit Rb (RFC 4493 §2.3).</summary>
+    /// <summary>Left-shift by 1 bit; if the MSB was set, additionally XOR with Rb (RFC 4493 §2.3).</summary>
     private static void LeftShiftWithRb(ReadOnlySpan<byte> input, Span<byte> output)
     {
         byte overflow = (byte)((input[0] & 0x80) != 0 ? 1 : 0);

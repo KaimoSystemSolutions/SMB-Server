@@ -1,6 +1,6 @@
 namespace Smb.Auth.Ntlm;
 
-/// <summary>NTLMSSP-Signatur und Message-Typen (MS-NLMP §2.2).</summary>
+/// <summary>NTLMSSP signature and message types (MS-NLMP §2.2).</summary>
 public static class NtlmConstants
 {
     /// <summary>"NTLMSSP\0".</summary>
@@ -10,12 +10,12 @@ public static class NtlmConstants
     public const uint MessageTypeChallenge = 2;
     public const uint MessageTypeAuthenticate = 3;
 
-    /// <summary>Prüft, ob ein Token mit der NTLMSSP-Signatur beginnt (raw NTLM ohne SPNEGO).</summary>
+    /// <summary>Checks whether a token starts with the NTLMSSP signature (raw NTLM without SPNEGO).</summary>
     public static bool IsNtlmSsp(ReadOnlySpan<byte> token)
         => token.Length >= 8 && token[..8].SequenceEqual(Signature);
 }
 
-/// <summary>NTLM NegotiateFlags (MS-NLMP §2.2.2.5), nur die hier relevanten.</summary>
+/// <summary>NTLM NegotiateFlags (MS-NLMP §2.2.2.5), only the relevant ones.</summary>
 [Flags]
 public enum NtlmNegotiateFlags : uint
 {

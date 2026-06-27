@@ -45,7 +45,11 @@ public static class Dcerpc
 
         if (type == DcerpcPduType.Request)
         {
-            // Request-Body: alloc_hint(4) + p_cont_id(2) + opnum(2) + stub.
+            // Request-Body: alloc_hint(4) + p_cont_id(2) + opnum(2) + stub. The opnum sits at
+            // offset 22..23, so the PDU must be at least 24 bytes; guard before slicing so a
+            // truncated request yields a clean wire error instead of an ArgumentOutOfRangeException.
+            if (pdu.Length < 24)
+                throw new SmbWireFormatException("DCERPC request PDU too short for opnum.");
             ushort opnum = BinaryPrimitives.ReadUInt16LittleEndian(pdu.Slice(22, 2));
             byte[] stub = pdu.Length > 24 ? pdu[24..].ToArray() : [];
             return new DcerpcRequest(type, callId, opnum, stub);

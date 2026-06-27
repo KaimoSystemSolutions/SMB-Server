@@ -4,9 +4,9 @@ using Smb.Crypto;
 namespace Smb.Auth;
 
 /// <summary>
-/// Einfache lokale Benutzer-/Hash-Datenbank hinter <see cref="IIdentityBackend"/>
-/// (Context §9.3: "lokale User-/Hash-DB" für Standalone-Betrieb). Später durch ein
-/// LDAP/AD-Backend ersetzbar, ohne die SMB- oder Auth-Schicht zu ändern.
+/// Simple local user/hash database behind <see cref="IIdentityBackend"/>
+/// (Context §9.3: "local user/hash DB" for standalone operation). Can later be replaced with an
+/// LDAP/AD backend without changing the SMB or auth layer.
 /// </summary>
 public sealed class InMemoryIdentityBackend : IIdentityBackend
 {
@@ -14,12 +14,12 @@ public sealed class InMemoryIdentityBackend : IIdentityBackend
 
     private sealed record UserEntry(string Domain, string User, byte[] NtHash, SecurityIdentity Identity);
 
-    /// <summary>Fügt einen Benutzer mit Klartext-Passwort hinzu (NT-Hash wird berechnet).</summary>
+    /// <summary>Adds a user with a clear-text password (the NT hash is computed).</summary>
     public InMemoryIdentityBackend AddUser(string domain, string user, string password,
         string? userSid = null, IReadOnlyList<string>? groupSids = null)
         => AddUserWithHash(domain, user, NtlmCryptography.NtHash(password), userSid, groupSids);
 
-    /// <summary>Fügt einen Benutzer mit bereits berechnetem NT-Hash hinzu.</summary>
+    /// <summary>Adds a user with an already-computed NT hash.</summary>
     public InMemoryIdentityBackend AddUserWithHash(string domain, string user, byte[] ntHash,
         string? userSid = null, IReadOnlyList<string>? groupSids = null)
     {
@@ -48,14 +48,13 @@ public sealed class InMemoryIdentityBackend : IIdentityBackend
     public SecurityIdentity Resolve(string domain, string user)
         => TryFind(domain, user, out UserEntry? entry)
             ? entry.Identity
-            : throw new KeyNotFoundException($"Unbekannter Benutzer {domain}\\{user}.");
+            : throw new KeyNotFoundException($"Unknown user {domain}\\{user}.");
 
     /// <summary>
-    /// Sucht einen Benutzer: zuerst exakt nach <c>Domain\User</c>, dann (Fallback) nur nach dem
-    /// Benutzernamen. Standalone-Server behandeln die Domain nicht als Sicherheitsgrenze, daher
-    /// dürfen Clients sie leer lassen oder eine beliebige (z.B. die Workgroup) senden. Die
-    /// kryptografische NTProofStr-Prüfung bleibt davon unberührt (sie nutzt die vom Client
-    /// gesendete Domain konsistent).
+    /// Looks up a user: first exactly by <c>Domain\User</c>, then (fallback) by the user name only.
+    /// Standalone servers do not treat the domain as a security boundary, so clients may leave it
+    /// empty or send any value (e.g. the workgroup). The cryptographic NTProofStr check is
+    /// unaffected by this (it uses the domain sent by the client consistently).
     /// </summary>
     private bool TryFind(string domain, string user, out UserEntry entry)
     {

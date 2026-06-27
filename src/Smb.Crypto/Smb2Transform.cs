@@ -6,14 +6,14 @@ using Smb.Protocol.Messages;
 namespace Smb.Crypto;
 
 /// <summary>
-/// Verschlüsselung/Entschlüsselung kompletter SMB2-Nachrichten via TRANSFORM_HEADER
-/// (Context §11, MS-SMB2 §3.1.4.3). AEAD = AES-CCM/GCM (128/256). Der Server verschlüsselt
-/// ausgehend mit dem EncryptionKey (S→C) und entschlüsselt eingehend mit dem DecryptionKey
-/// (C→S). Verschlüsselte Nachrichten werden <b>nicht</b> zusätzlich signiert (Context §23).
+/// Encryption/decryption of complete SMB2 messages via TRANSFORM_HEADER
+/// (Context §11, MS-SMB2 §3.1.4.3). AEAD = AES-CCM/GCM (128/256). The server encrypts outgoing
+/// data with the EncryptionKey (S→C) and decrypts incoming data with the DecryptionKey (C→S).
+/// Encrypted messages are <b>not</b> additionally signed (Context §23).
 /// </summary>
 public static class Smb2Transform
 {
-    /// <summary>Nonce-Länge je Cipher: GCM 12, CCM 11 Byte (Rest des 16-Byte-Felds bleibt 0).</summary>
+    /// <summary>Nonce length per cipher: GCM 12, CCM 11 bytes (the rest of the 16-byte field stays 0).</summary>
     public static int NonceLength(SmbCipherId cipher) => cipher switch
     {
         SmbCipherId.Aes128Gcm or SmbCipherId.Aes256Gcm => 12,
@@ -22,9 +22,9 @@ public static class Smb2Transform
     };
 
     /// <summary>
-    /// Verschlüsselt <paramref name="plaintext"/> (eine komplette SMB2-Nachricht) in einen
-    /// Transform-Frame. <paramref name="nonce"/> muss je Session/Schlüssel eindeutig sein
-    /// (GCM/CCM-Sicherheit hängt daran!) und die korrekte Länge für den Cipher haben.
+    /// Encrypts <paramref name="plaintext"/> (a complete SMB2 message) into a transform frame.
+    /// <paramref name="nonce"/> must be unique per session/key (GCM/CCM security depends on it!) and
+    /// have the correct length for the cipher.
     /// </summary>
     public static byte[] Encrypt(
         SmbCipherId cipher,
@@ -35,7 +35,7 @@ public static class Smb2Transform
     {
         int expectedNonce = NonceLength(cipher);
         if (nonce.Length != expectedNonce)
-            throw new ArgumentException($"Nonce für {cipher} muss {expectedNonce} Byte sein.", nameof(nonce));
+            throw new ArgumentException($"Nonce for {cipher} must be {expectedNonce} bytes.", nameof(nonce));
 
         var frame = new byte[TransformHeader.Size + plaintext.Length];
 
@@ -45,7 +45,7 @@ public static class Smb2Transform
             Flags = TransformHeader.FlagEncrypted,
             SessionId = sessionId,
         };
-        nonce.CopyTo(header.Nonce); // restliche Bytes bleiben 0
+        nonce.CopyTo(header.Nonce); // remaining bytes stay 0
         header.Write(frame);
 
         Span<byte> aad = frame.AsSpan(TransformHeader.AadOffset, TransformHeader.AadLength);
@@ -57,18 +57,18 @@ public static class Smb2Transform
     }
 
     /// <summary>
-    /// Entschlüsselt einen Transform-Frame und liefert die enthaltene Klartext-SMB2-Nachricht.
+    /// Decrypts a transform frame and returns the embedded plaintext SMB2 message.
     /// </summary>
-    /// <exception cref="CryptographicException">Wenn das Auth-Tag nicht stimmt.</exception>
+    /// <exception cref="CryptographicException">If the auth tag does not match.</exception>
     public static byte[] Decrypt(
         SmbCipherId cipher,
         ReadOnlySpan<byte> decryptionKey,
         ReadOnlySpan<byte> frame)
     {
         if (frame.Length < TransformHeader.Size)
-            throw new ArgumentException("Frame zu kurz für TRANSFORM_HEADER.", nameof(frame));
+            throw new ArgumentException("Frame too short for TRANSFORM_HEADER.", nameof(frame));
         if (!SmbProtocolIds.IsTransform(frame))
-            throw new ArgumentException("Kein Transform-Frame (ProtocolId ≠ FD 53 4D 42).", nameof(frame));
+            throw new ArgumentException("Not a transform frame (ProtocolId ≠ FD 53 4D 42).", nameof(frame));
 
         var header = TransformHeader.Read(frame);
         int nonceLen = NonceLength(cipher);
@@ -82,11 +82,11 @@ public static class Smb2Transform
         DecryptAead(cipher, decryptionKey, nonce, ciphertext, tag, plaintext, aad);
 
         if (header.OriginalMessageSize != plaintext.Length)
-            throw new CryptographicException("OriginalMessageSize stimmt nicht mit der Klartextlänge überein.");
+            throw new CryptographicException("OriginalMessageSize does not match the plaintext length.");
         return plaintext;
     }
 
-    private const int SignatureFieldOffset = 4; // nach ProtocolId(4)
+    private const int SignatureFieldOffset = 4; // after ProtocolId(4)
 
     private static void EncryptAead(
         SmbCipherId cipher,

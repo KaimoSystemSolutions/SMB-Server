@@ -15,7 +15,7 @@ public sealed class CreateRequest
     public CreateDisposition Disposition { get; init; }
     public CreateOptions Options { get; init; }
 
-    /// <summary>Share-relativer Name (UTF-16LE, ohne führenden Backslash). Leer = Share-Root.</summary>
+    /// <summary>Share-relative name (UTF-16LE, no leading backslash). Empty = share root.</summary>
     public string Name { get; init; } = string.Empty;
 
     public static CreateRequest Parse(ReadOnlySpan<byte> message, int bodyOffset)
@@ -44,7 +44,7 @@ public sealed class CreateRequest
         if (nameLength > 0)
         {
             if (nameOffset + nameLength > message.Length)
-                throw new SmbWireFormatException("CREATE Name reicht über die Nachricht hinaus.");
+                throw new SmbWireFormatException("CREATE name extends past the message.");
             name = System.Text.Encoding.Unicode.GetString(message.Slice(nameOffset, nameLength));
         }
 
@@ -143,5 +143,5 @@ public static class CloseMessage
     }
 }
 
-/// <summary>Vier FILETIME-Werte (Context §17).</summary>
+/// <summary>Four FILETIME values (Context §17).</summary>
 public readonly record struct FileTimes(long Creation, long LastAccess, long LastWrite, long Change);

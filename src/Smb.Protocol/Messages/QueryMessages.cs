@@ -38,7 +38,7 @@ public static class QueryDirectoryMessage
         return new Request(infoClass, flags, persistent, vol, pattern, outputBufferLength);
     }
 
-    /// <summary>Baut die Response. OutputBufferOffset = Header(64) + fester Body(8) = 72.</summary>
+    /// <summary>Builds the response. OutputBufferOffset = header(64) + fixed body(8) = 72.</summary>
     public static byte[] BuildResponseBody(ReadOnlySpan<byte> buffer)
     {
         const ushort outputBufferOffset = Smb2Header.Size + 8; // 72
@@ -81,7 +81,7 @@ public static class QueryInfoMessage
         return new Request(infoType, fileInfoClass, outputBufferLength, additionalInformation, persistent, vol);
     }
 
-    /// <summary>Baut die Response. OutputBufferOffset = Header(64) + fester Body(8) = 72.</summary>
+    /// <summary>Builds the response. OutputBufferOffset = header(64) + fixed body(8) = 72.</summary>
     public static byte[] BuildResponseBody(ReadOnlySpan<byte> buffer)
     {
         const ushort outputBufferOffset = Smb2Header.Size + 8; // 72

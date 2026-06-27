@@ -1,9 +1,9 @@
 namespace Smb.Crypto;
 
 /// <summary>
-/// RC4-Stromchiffre. Wird ausschließlich für den NTLM-Key-Exchange benötigt
+/// RC4 stream cipher. Needed exclusively for the NTLM key exchange
 /// (<c>ExportedSessionKey = RC4(KeyExchangeKey, EncryptedRandomSessionKey)</c>, MS-NLMP §3.4.5.2,
-/// Context §9.3). In der .NET-BCL nicht enthalten; nur für diesen NTLM-internen Zweck nutzen.
+/// Context §9.3). Not included in the .NET BCL; use only for this NTLM-internal purpose.
 /// </summary>
 public static class Rc4
 {

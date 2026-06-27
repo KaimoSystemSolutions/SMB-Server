@@ -5,7 +5,7 @@ using Smb.Protocol.Enums;
 
 namespace Smb.Auth.Ntlm;
 
-/// <summary>Konfiguration des NTLM-Servers (Namen für TargetInfo).</summary>
+/// <summary>NTLM server configuration (names for TargetInfo).</summary>
 public sealed class NtlmServerOptions
 {
     public string NetbiosDomainName { get; set; } = "WORKGROUP";
@@ -15,10 +15,10 @@ public sealed class NtlmServerOptions
 }
 
 /// <summary>
-/// Server-seitiger NTLMv2-Mechanismus (Context §9.3, MS-NLMP §3.3.2). Zweistufig:
-/// NEGOTIATE → CHALLENGE → AUTHENTICATE. Verifiziert den NTProofStr gegen den über
-/// <see cref="IIdentityBackend"/> bereitgestellten NT-Hash und leitet den
-/// ExportedSessionKey (GSS-Session-Key) ab. Nur NTLMv2 (Context §20).
+/// Server-side NTLMv2 mechanism (Context §9.3, MS-NLMP §3.3.2). Two-stage:
+/// NEGOTIATE → CHALLENGE → AUTHENTICATE. Verifies the NTProofStr against the NT hash provided via
+/// <see cref="IIdentityBackend"/> and derives the ExportedSessionKey (GSS session key).
+/// NTLMv2 only (Context §20).
 /// </summary>
 public sealed class NtlmServerMechanism : IGssMechanism
 {
@@ -50,7 +50,7 @@ public sealed class NtlmServerMechanism : IGssMechanism
 
     private GssResult HandleNegotiate(ReadOnlySpan<byte> inToken)
     {
-        // (NEGOTIATE_MESSAGE wird nur für die Flags gelesen; Inhalt sonst nicht nötig.)
+        // (The NEGOTIATE_MESSAGE is only read for its flags; its content is otherwise not needed.)
         _serverChallenge = RandomNumberGenerator.GetBytes(8);
 
         byte[] targetInfo = NtlmAvPairs.Encode(
@@ -92,14 +92,14 @@ public sealed class NtlmServerMechanism : IGssMechanism
         if (!_backend.TryGetNtHash(auth.DomainName, auth.UserName, out byte[] ntHash))
             return GssResult.Failed(NtStatus.LogonFailure);
 
-        // NTProofStr unabhängig nachrechnen und konstanzeit vergleichen (Context §9.3).
+        // Recompute the NTProofStr independently and compare in constant time (Context §9.3).
         byte[] ntowfV2 = NtlmCryptography.NtowfV2(ntHash, auth.UserName, auth.DomainName);
         byte[] expectedProof = NtlmCryptography.NtProofString(ntowfV2, _serverChallenge, auth.ClientChallengeBlob);
 
         if (!CryptographicOperations.FixedTimeEquals(expectedProof, auth.NtProofString))
             return GssResult.Failed(NtStatus.LogonFailure);
 
-        // Schlüssel ableiten.
+        // Derive keys.
         byte[] sessionBaseKey = NtlmCryptography.SessionBaseKey(ntowfV2, expectedProof);
         bool keyExch = auth.Flags.HasFlag(NtlmNegotiateFlags.NegotiateKeyExchange);
         byte[] exportedSessionKey = NtlmCryptography.ExportedSessionKey(

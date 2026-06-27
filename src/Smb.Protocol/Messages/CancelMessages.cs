@@ -3,16 +3,16 @@ using Smb.Protocol.Wire;
 namespace Smb.Protocol.Messages;
 
 /// <summary>
-/// SMB2 CANCEL Request (Context §19, MS-SMB2 §2.2.30). CANCEL trägt <b>keine</b> eigene
-/// Response: Der Server bricht die referenzierte ausstehende (asynchrone) Operation ab, die
-/// dann ihrerseits ihre finale Antwort mit <c>STATUS_CANCELLED</c> sendet (§3.3.5.16).
-/// Die Zuordnung erfolgt über MessageId (sync) bzw. AsyncId (async) im Header.
+/// SMB2 CANCEL Request (Context §19, MS-SMB2 §2.2.30). CANCEL carries <b>no</b> response of its
+/// own: the server aborts the referenced outstanding (asynchronous) operation, which in turn sends
+/// its final response with <c>STATUS_CANCELLED</c> (§3.3.5.16). The match is made via MessageId
+/// (sync) or AsyncId (async) in the header.
 /// </summary>
 public static class CancelMessage
 {
     public const ushort RequestStructureSize = 4;
 
-    /// <summary>Validiert die feste Struktur (kein verwertbarer Inhalt außerhalb des Headers).</summary>
+    /// <summary>Validates the fixed structure (no usable content outside the header).</summary>
     public static void ParseRequest(ReadOnlySpan<byte> message, int bodyOffset)
     {
         var r = new SpanReader(message[bodyOffset..]);

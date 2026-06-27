@@ -4,9 +4,9 @@ using System.Text;
 namespace Smb.Protocol.Wire;
 
 /// <summary>
-/// Heap-basierter, automatisch wachsender Little-Endian-Writer für Nachrichten variabler
-/// Länge (Negotiate-Response mit Contexts, QUERY_DIRECTORY-Listen …). Bequemer als
-/// <see cref="SpanWriter"/>, wenn die Endgröße vorab nicht bekannt ist.
+/// Heap-based, auto-growing little-endian writer for variable-length messages (negotiate
+/// response with contexts, QUERY_DIRECTORY listings, …). More convenient than
+/// <see cref="SpanWriter"/> when the final size is not known up front.
 /// </summary>
 public sealed class GrowableWriter
 {
@@ -71,18 +71,18 @@ public sealed class GrowableWriter
         _position += count;
     }
 
-    /// <summary>Padding bis zur nächsten <paramref name="alignment"/>-Grenze (relativ zu <paramref name="origin"/>).</summary>
+    /// <summary>Pads to the next <paramref name="alignment"/> boundary (relative to <paramref name="origin"/>).</summary>
     public void AlignTo(int alignment, int origin = 0)
     {
         int rem = (_position - origin) % alignment;
         if (rem != 0) WriteZeros(alignment - rem);
     }
 
-    /// <summary>Überschreibt 2 Bytes an bereits geschriebener Position (Offset-Patching).</summary>
+    /// <summary>Overwrites 2 bytes at an already-written position (offset patching).</summary>
     public void PatchUInt16(int offset, ushort value)
         => BinaryPrimitives.WriteUInt16LittleEndian(_buffer.AsSpan(offset, 2), value);
 
-    /// <summary>Überschreibt 4 Bytes an bereits geschriebener Position (Offset-Patching).</summary>
+    /// <summary>Overwrites 4 bytes at an already-written position (offset patching).</summary>
     public void PatchUInt32(int offset, uint value)
         => BinaryPrimitives.WriteUInt32LittleEndian(_buffer.AsSpan(offset, 4), value);
 

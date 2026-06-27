@@ -1,8 +1,8 @@
 namespace Smb.Protocol.Enums;
 
 /// <summary>
-/// NTSTATUS-Codes, die ein SMB2-Server am häufigsten benötigt (Context §18, MS-ERREF §2.3).
-/// Severity steckt in Bits 30–31 (0=Success, 1=Info, 2=Warning, 3=Error), Context §17.
+/// NTSTATUS codes an SMB2 server most commonly needs (Context §18, MS-ERREF §2.3).
+/// Severity is in bits 30–31 (0=Success, 1=Info, 2=Warning, 3=Error), Context §17.
 /// </summary>
 public enum NtStatus : uint
 {
@@ -42,12 +42,12 @@ public enum NtStatus : uint
     InvalidDeviceRequest = 0xC0000010,
 }
 
-/// <summary>NTSTATUS-Auswertung anhand des Severity-Felds (Context §17).</summary>
+/// <summary>NTSTATUS evaluation via the severity field (Context §17).</summary>
 public static class NtStatusExtensions
 {
-    /// <summary>True, wenn Severity = Success (Bits 30–31 == 0).</summary>
+    /// <summary>True if severity = Success (bits 30–31 == 0).</summary>
     public static bool IsSuccess(this NtStatus status) => ((uint)status >> 30) == 0;
 
-    /// <summary>True, wenn Severity = Error (Bits 30–31 == 3).</summary>
+    /// <summary>True if severity = Error (bits 30–31 == 3).</summary>
     public static bool IsError(this NtStatus status) => ((uint)status >> 30) == 3;
 }

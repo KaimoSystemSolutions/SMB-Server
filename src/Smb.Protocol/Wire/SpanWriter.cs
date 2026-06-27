@@ -4,9 +4,9 @@ using System.Text;
 namespace Smb.Protocol.Wire;
 
 /// <summary>
-/// Vorwärts-schreibender Cursor über einen <see cref="Span{T}"/>. Little-Endian (SMB2).
-/// Wächst nicht selbst — der Aufrufer stellt einen ausreichend großen Zielpuffer.
-/// Für dynamisches Wachstum siehe <see cref="GrowableWriter"/>.
+/// Forward-writing cursor over a <see cref="Span{T}"/>. Little-endian (SMB2). Does not grow
+/// on its own — the caller provides a sufficiently large destination buffer.
+/// For dynamic growth see <see cref="GrowableWriter"/>.
 /// </summary>
 public ref struct SpanWriter
 {
@@ -69,7 +69,7 @@ public ref struct SpanWriter
         _position += value.Length;
     }
 
-    /// <summary>Schreibt einen String als UTF-16LE und liefert die geschriebene Byte-Länge.</summary>
+    /// <summary>Writes a string as UTF-16LE and returns the number of bytes written.</summary>
     public int WriteUtf16(string value)
     {
         int byteCount = Encoding.Unicode.GetByteCount(value);
@@ -79,7 +79,7 @@ public ref struct SpanWriter
         return byteCount;
     }
 
-    /// <summary>Füllt bis zur nächsten <paramref name="alignment"/>-Byte-Grenze mit Nullen auf.</summary>
+    /// <summary>Pads with zeros up to the next <paramref name="alignment"/>-byte boundary.</summary>
     public void AlignTo(int alignment)
     {
         int rem = _position % alignment;
@@ -90,7 +90,7 @@ public ref struct SpanWriter
         _position += pad;
     }
 
-    /// <summary>Schreibt <paramref name="count"/> Nullbytes.</summary>
+    /// <summary>Writes <paramref name="count"/> zero bytes.</summary>
     public void WriteZeros(int count)
     {
         EnsureAvailable(count);
@@ -98,7 +98,7 @@ public ref struct SpanWriter
         _position += count;
     }
 
-    /// <summary>Direktzugriff auf einen bereits geschriebenen Bereich (z.B. nachträgliches Patchen von Offsets).</summary>
+    /// <summary>Direct access to an already-written region (e.g. to patch offsets afterwards).</summary>
     public readonly Span<byte> SliceWritten(int offset, int count)
     {
         if ((uint)offset > (uint)_position || (uint)count > (uint)(_position - offset))
@@ -110,6 +110,6 @@ public ref struct SpanWriter
     {
         if (count < 0 || count > Remaining)
             throw new SmbWireFormatException(
-                $"Schreiben über Pufferende hinaus: benötigt {count}, verfügbar {Remaining}.");
+                $"Write past end of buffer: needs {count}, available {Remaining}.");
     }
 }

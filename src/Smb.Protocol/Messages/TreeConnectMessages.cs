@@ -7,10 +7,10 @@ public sealed class TreeConnectRequest
 {
     public const ushort ExpectedStructureSize = 9;
 
-    /// <summary>UNC-Pfad <c>\\server\share</c> (UTF-16LE).</summary>
+    /// <summary>UNC path <c>\\server\share</c> (UTF-16LE).</summary>
     public string Path { get; init; } = string.Empty;
 
-    /// <summary>Extrahiert den Share-Namen aus dem UNC-Pfad (letztes Segment).</summary>
+    /// <summary>Extracts the share name from the UNC path (last segment).</summary>
     public string ShareName
     {
         get
@@ -27,7 +27,7 @@ public sealed class TreeConnectRequest
         if (ss != ExpectedStructureSize)
             throw new SmbWireFormatException($"TREE_CONNECT Request StructureSize {ss} ≠ {ExpectedStructureSize}.");
 
-        r.Skip(2); // Flags/Reserved (3.1.1 Tree-Connect Extension – Phase ≥2)
+        r.Skip(2); // Flags/Reserved (3.1.1 tree-connect extension – phase ≥2)
         ushort pathOffset = r.ReadUInt16();
         ushort pathLength = r.ReadUInt16();
 
@@ -35,7 +35,7 @@ public sealed class TreeConnectRequest
         if (pathLength > 0)
         {
             if (pathOffset + pathLength > message.Length)
-                throw new SmbWireFormatException("TREE_CONNECT Pfad reicht über die Nachricht hinaus.");
+                throw new SmbWireFormatException("TREE_CONNECT path extends past the message.");
             path = System.Text.Encoding.Unicode.GetString(message.Slice(pathOffset, pathLength));
         }
 
@@ -43,7 +43,7 @@ public sealed class TreeConnectRequest
     }
 }
 
-/// <summary>ShareFlags (MS-SMB2 §2.2.10) — Phase 1 minimal.</summary>
+/// <summary>ShareFlags (MS-SMB2 §2.2.10) — minimal for phase 1.</summary>
 [Flags]
 public enum ShareFlags : uint
 {
@@ -66,7 +66,7 @@ public sealed class TreeConnectResponse
     public ShareFlags ShareFlags { get; init; }
     public uint Capabilities { get; init; }
 
-    /// <summary>Effektive Rechte des Users auf dem Share (Access-Mask, Context §12, §13.1).</summary>
+    /// <summary>Effective rights of the user on the share (access mask, Context §12, §13.1).</summary>
     public uint MaximalAccess { get; init; }
 
     public byte[] ToBody()

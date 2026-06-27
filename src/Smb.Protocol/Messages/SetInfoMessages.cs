@@ -32,7 +32,7 @@ public static class SetInfoMessage
         if (bufferLength > 0)
         {
             if (bufferOffset + bufferLength > message.Length)
-                throw new SmbWireFormatException("SET_INFO Buffer reicht über die Nachricht hinaus.");
+                throw new SmbWireFormatException("SET_INFO buffer extends past the message.");
             buffer = message.Slice(bufferOffset, (int)bufferLength).ToArray();
         }
 
@@ -46,7 +46,7 @@ public static class SetInfoMessage
         return body;
     }
 
-    /// <summary>Liest FileRenameInformation (§2.2.39 / MS-FSCC §2.4.x): ReplaceIfExists + Zielpfad.</summary>
+    /// <summary>Reads FileRenameInformation (§2.2.39 / MS-FSCC §2.4.x): ReplaceIfExists + target path.</summary>
     public static (bool replaceIfExists, string newPath) ParseRename(ReadOnlySpan<byte> buffer)
     {
         var r = new SpanReader(buffer);

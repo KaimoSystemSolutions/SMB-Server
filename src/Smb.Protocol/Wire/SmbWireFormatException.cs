@@ -1,9 +1,9 @@
 namespace Smb.Protocol.Wire;
 
 /// <summary>
-/// Wird geworfen, wenn eine Nachricht nicht dem erwarteten Wire-Format entspricht
-/// (zu kurz, falsche <c>StructureSize</c>, ungültige Offsets …). Der Server übersetzt
-/// dies generell in <c>STATUS_INVALID_PARAMETER</c> (Context §18, §19.1 Schritt 6).
+/// Thrown when a message does not match the expected wire format (too short, wrong
+/// <c>StructureSize</c>, invalid offsets, …). The server generally translates this into
+/// <c>STATUS_INVALID_PARAMETER</c> (Context §18, §19.1 step 6).
 /// </summary>
 public sealed class SmbWireFormatException : Exception
 {

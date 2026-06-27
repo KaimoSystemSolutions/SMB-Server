@@ -4,7 +4,7 @@ using Smb.Protocol.Wire;
 
 namespace Smb.Protocol.Messages.Fscc;
 
-/// <summary>Eingabedaten für FSCC-Strukturen (vom Backend befüllt, Context §16).</summary>
+/// <summary>Input data for FSCC structures (populated by the backend, Context §16).</summary>
 public sealed class FsccFileStat
 {
     public required string Name { get; init; }
@@ -21,19 +21,18 @@ public sealed class FsccFileStat
 }
 
 /// <summary>
-/// Serialisierung der MS-FSCC-Strukturen für QUERY_DIRECTORY und QUERY_INFO (Context §16).
-/// Implementiert den für Browsen/Lesen nötigen Satz an Klassen.
+/// Serialization of the MS-FSCC structures for QUERY_DIRECTORY and QUERY_INFO (Context §16).
+/// Implements the set of classes needed for browsing/reading.
 /// </summary>
 public static class FsccStructures
 {
     // ---------------------------------------------------------------------
-    //  QUERY_DIRECTORY: Verzeichnis-Listing
+    //  QUERY_DIRECTORY: directory listing
     // ---------------------------------------------------------------------
 
     /// <summary>
-    /// Serialisiert eine Liste von Einträgen in der angegebenen Directory-Info-Klasse.
-    /// Einträge sind 8-Byte-aligned und über <c>NextEntryOffset</c> verkettet; der letzte
-    /// hat <c>NextEntryOffset=0</c> (Context §14).
+    /// Serializes a list of entries in the given directory-info class. Entries are 8-byte aligned
+    /// and chained via <c>NextEntryOffset</c>; the last one has <c>NextEntryOffset=0</c> (Context §14).
     /// </summary>
     public static byte[] BuildDirectoryListing(IReadOnlyList<FsccFileStat> entries, FileInformationClass infoClass)
     {
@@ -43,7 +42,7 @@ public static class FsccStructures
             int entryStart = w.Position;
             WriteDirectoryEntry(w, entries[i], infoClass);
 
-            // Auf 8-Byte ausrichten (außer beim letzten Eintrag).
+            // Align to 8 bytes (except for the last entry).
             bool last = i == entries.Count - 1;
             if (!last)
             {
@@ -64,7 +63,7 @@ public static class FsccStructures
     {
         byte[] name = Encoding.Unicode.GetBytes(e.Name);
 
-        w.WriteUInt32(0);              // NextEntryOffset (wird gepatcht)
+        w.WriteUInt32(0);              // NextEntryOffset (patched later)
         w.WriteUInt32(0);              // FileIndex
 
         switch (infoClass)
@@ -249,7 +248,7 @@ public static class FsccStructures
     {
         var b = new byte[24];
         var w = new SpanWriter(b);
-        w.WriteInt64(1 << 20);  // TotalAllocationUnits (Dummy)
+        w.WriteInt64(1 << 20);  // TotalAllocationUnits (placeholder)
         w.WriteInt64(1 << 19);  // AvailableAllocationUnits
         w.WriteUInt32(8);       // SectorsPerAllocationUnit
         w.WriteUInt32(512);     // BytesPerSector

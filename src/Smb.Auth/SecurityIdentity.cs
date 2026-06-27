@@ -1,24 +1,24 @@
 namespace Smb.Auth;
 
 /// <summary>
-/// Authentifizierte Identität nach erfolgreichem Auth-Flow (Context §9.1). Quelle für
-/// Access-Checks (SID/Gruppen) und Anzeige (Domain\User).
+/// Authenticated identity after a successful auth flow (Context §9.1). Source for access checks
+/// (SID/groups) and display (Domain\User).
 /// </summary>
 public sealed class SecurityIdentity
 {
     public required string DomainName { get; init; }
     public required string UserName { get; init; }
 
-    /// <summary>String-Form der primären User-SID (z.B. S-1-5-21-…). Optional in Phase 1.</summary>
+    /// <summary>String form of the primary user SID (e.g. S-1-5-21-…). Optional in phase 1.</summary>
     public string? UserSid { get; init; }
 
-    /// <summary>Gruppen-SIDs (für ACL-Auswertung). Optional in Phase 1.</summary>
+    /// <summary>Group SIDs (for ACL evaluation). Optional in phase 1.</summary>
     public IReadOnlyList<string> GroupSids { get; init; } = [];
 
-    /// <summary>True für die anonyme (NULL-)Session (Context §8.4).</summary>
+    /// <summary>True for the anonymous (NULL) session (Context §8.4).</summary>
     public bool IsAnonymous { get; init; }
 
-    /// <summary>True für Gast-Zugriff (Context §8.4) — per Default abzulehnen.</summary>
+    /// <summary>True for guest access (Context §8.4) — rejected by default.</summary>
     public bool IsGuest { get; init; }
 
     public override string ToString() =>

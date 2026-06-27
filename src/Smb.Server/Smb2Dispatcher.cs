@@ -331,6 +331,15 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.UserSessionDeleted);
         }
 
+        // A SESSION_SETUP targeting an already-established (Valid) session is a re-authentication
+        // attempt. Re-auth is not supported yet (the per-session GSS mechanism is already complete),
+        // so reject it WITHOUT touching the live session. Previously the finished mechanism was
+        // re-run, returned a failure, and CleanupFailedSession then tore down the still-valid
+        // session — so a stray or duplicated SESSION_SETUP could drop an active session (and, with
+        // an always-succeeding mechanism, silently re-derive and change its keys mid-stream).
+        if (header.SessionId != 0 && session.State == SessionState.Valid)
+            return BuildError(header, NtStatus.AccessDenied);
+
         // Preauth-Hash: Request einbeziehen (vor evtl. Key-Derivation), Context §8.2.
         session.PreauthHash?.Append(segment);
 
@@ -367,6 +376,19 @@ public sealed partial class Smb2Dispatcher
         }
 
         DeriveSessionKeys(connection, session, auth.SessionKey!);
+
+        // [REVIEW-2026-06] Enforce global RequireEncryption at the session level: if the server
+        // demands encryption but this connection can't provide it (dialect < 3.0 or no cipher
+        // negotiated), refuse instead of serving the session in cleartext. Without this, such a
+        // session proceeded unencrypted and RejectUnencryptedAccess never caught it (it keys off
+        // session.EncryptData, which stays false here). Mirrors the per-share check in TREE_CONNECT.
+        if (_server.Options.RequireEncryption
+            && !(connection.Dialect.IsSmb3OrLater() && connection.SupportsEncryption))
+        {
+            CleanupFailedSession(connection, session);
+            return BuildError(header, NtStatus.AccessDenied);
+        }
+
         session.State = SessionState.Valid;
 
         var sessionFlags = SessionResponseFlags.None;

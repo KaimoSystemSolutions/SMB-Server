@@ -3,10 +3,10 @@ using Smb.Protocol.Wire;
 
 namespace Smb.Auth.Ntlm;
 
-/// <summary>Ein AV-Pair (TargetInfo-Eintrag, MS-NLMP §2.2.2.1).</summary>
+/// <summary>An AV pair (TargetInfo entry, MS-NLMP §2.2.2.1).</summary>
 public readonly record struct NtlmAvPair(NtlmAvId Id, byte[] Value);
 
-/// <summary>Kodierung/Dekodierung der TargetInfo-AV-Pair-Liste (endet mit MsvAvEOL).</summary>
+/// <summary>Encoding/decoding of the TargetInfo AV-pair list (ends with MsvAvEOL).</summary>
 public static class NtlmAvPairs
 {
     public static byte[] Encode(IEnumerable<NtlmAvPair> pairs)
@@ -32,7 +32,7 @@ public static class NtlmAvPairs
             var id = (NtlmAvId)r.ReadUInt16();
             int len = r.ReadUInt16();
             if (id == NtlmAvId.EOL) break;
-            if (len > r.Remaining) break; // defensiv gegen fehlformatierte TargetInfo
+            if (len > r.Remaining) break; // defensive against malformed TargetInfo
             list.Add(new NtlmAvPair(id, r.ReadByteArray(len)));
         }
         return list;
@@ -42,17 +42,17 @@ public static class NtlmAvPairs
 /// <summary>NTLM CHALLENGE_MESSAGE (Type 2, MS-NLMP §2.2.1.2) — Server→Client.</summary>
 public sealed class NtlmChallengeMessage
 {
-    public required byte[] ServerChallenge { get; init; } // 8 Byte
+    public required byte[] ServerChallenge { get; init; } // 8 bytes
     public required string TargetName { get; init; }
     public required NtlmNegotiateFlags Flags { get; init; }
-    public required byte[] TargetInfo { get; init; }      // kodierte AV-Pair-Liste
+    public required byte[] TargetInfo { get; init; }      // encoded AV-pair list
 
     public byte[] ToArray()
     {
         byte[] targetNameBytes = Encoding.Unicode.GetBytes(TargetName);
 
-        // Fester Teil: Signature(8)+Type(4)+TargetNameFields(8)+Flags(4)+ServerChallenge(8)
-        //              +Reserved(8)+TargetInfoFields(8)+Version(8) = 56 Byte.
+        // Fixed part: Signature(8)+Type(4)+TargetNameFields(8)+Flags(4)+ServerChallenge(8)
+        //             +Reserved(8)+TargetInfoFields(8)+Version(8) = 56 bytes.
         const int fixedLen = 56;
         int targetNameOffset = fixedLen;
         int targetInfoOffset = targetNameOffset + targetNameBytes.Length;
@@ -75,7 +75,7 @@ public sealed class NtlmChallengeMessage
         w.WriteUInt16((ushort)TargetInfo.Length);
         w.WriteUInt32((uint)targetInfoOffset);
 
-        w.WriteUInt64(0);                // Version (8) – wir setzen 0
+        w.WriteUInt64(0);                // Version (8) – we set 0
 
         w.WriteBytes(targetNameBytes);
         w.WriteBytes(TargetInfo);
@@ -83,18 +83,18 @@ public sealed class NtlmChallengeMessage
     }
 }
 
-/// <summary>NTLM NEGOTIATE_MESSAGE (Type 1) — nur die Flags werden gebraucht.</summary>
+/// <summary>NTLM NEGOTIATE_MESSAGE (Type 1) — only the flags are needed.</summary>
 public sealed class NtlmNegotiateMessage
 {
     public NtlmNegotiateFlags Flags { get; init; }
 
     public static NtlmNegotiateMessage Parse(ReadOnlySpan<byte> data)
     {
-        if (!NtlmConstants.IsNtlmSsp(data)) throw new FormatException("Kein NTLMSSP-Token.");
+        if (!NtlmConstants.IsNtlmSsp(data)) throw new FormatException("Not an NTLMSSP token.");
         var r = new SpanReader(data);
         r.Skip(8); // Signature
         uint type = r.ReadUInt32();
-        if (type != NtlmConstants.MessageTypeNegotiate) throw new FormatException("Kein NEGOTIATE_MESSAGE.");
+        if (type != NtlmConstants.MessageTypeNegotiate) throw new FormatException("Not a NEGOTIATE_MESSAGE.");
         var flags = (NtlmNegotiateFlags)r.ReadUInt32();
         return new NtlmNegotiateMessage { Flags = flags };
     }
@@ -112,19 +112,19 @@ public sealed class NtlmAuthenticateMessage
     public NtlmNegotiateFlags Flags { get; init; }
     public byte[] Mic { get; init; } = new byte[16];
 
-    /// <summary>NTProofStr (erste 16 Byte der NtChallengeResponse).</summary>
+    /// <summary>NTProofStr (first 16 bytes of the NtChallengeResponse).</summary>
     public ReadOnlySpan<byte> NtProofString => NtChallengeResponse.AsSpan(0, 16);
 
-    /// <summary>Der "temp"-Teil (NTLMv2_CLIENT_CHALLENGE) hinter dem NTProofStr.</summary>
+    /// <summary>The "temp" part (NTLMv2_CLIENT_CHALLENGE) after the NTProofStr.</summary>
     public ReadOnlySpan<byte> ClientChallengeBlob => NtChallengeResponse.AsSpan(16);
 
     public static NtlmAuthenticateMessage Parse(ReadOnlySpan<byte> data)
     {
-        if (!NtlmConstants.IsNtlmSsp(data)) throw new FormatException("Kein NTLMSSP-Token.");
+        if (!NtlmConstants.IsNtlmSsp(data)) throw new FormatException("Not an NTLMSSP token.");
         var r = new SpanReader(data);
         r.Skip(8);
         uint type = r.ReadUInt32();
-        if (type != NtlmConstants.MessageTypeAuthenticate) throw new FormatException("Kein AUTHENTICATE_MESSAGE.");
+        if (type != NtlmConstants.MessageTypeAuthenticate) throw new FormatException("Not an AUTHENTICATE_MESSAGE.");
 
         (int lmLen, int lmOff) = ReadField(ref r);
         (int ntLen, int ntOff) = ReadField(ref r);
@@ -134,12 +134,12 @@ public sealed class NtlmAuthenticateMessage
         (int keyLen, int keyOff) = ReadField(ref r);
         var flags = (NtlmNegotiateFlags)r.ReadUInt32();
 
-        // Version (8) folgt, danach optional MIC (16). Wir lesen das MIC anhand seiner festen
-        // Position (Offset 64..79), sofern die Payload nicht früher beginnt.
+        // Version (8) follows, then optionally the MIC (16). We read the MIC at its fixed
+        // position (offset 64..79), provided the payload does not start earlier.
         byte[] mic = new byte[16];
         int firstPayload = Min(lmOff, ntOff, domOff, userOff, wsOff, keyOff);
         if (firstPayload >= 88 && data.Length >= 88)
-            mic = data.Slice(72, 16).ToArray(); // nach Signature(8)+Type(4)+6×Fields(48)+Flags(4)+Version(8)=72
+            mic = data.Slice(72, 16).ToArray(); // after Signature(8)+Type(4)+6×Fields(48)+Flags(4)+Version(8)=72
 
         return new NtlmAuthenticateMessage
         {

@@ -1,18 +1,18 @@
 namespace Smb.FileSystem.Versioning;
 
 /// <summary>
-/// Ein <see cref="IFileStore"/>, der frühere Datei-Versionen als Snapshots vorhält und sie
-/// für <c>FSCTL_SRV_ENUMERATE_SNAPSHOTS</c> (MS-SMB2 §2.2.32.2) sowie <c>@GMT-…</c>-Pfade
-/// bereitstellt. Die Zeitpunkte sind UTC und werden vom Server in <c>@GMT-…</c>-Token formatiert.
+/// An <see cref="IFileStore"/> that retains previous file versions as snapshots and exposes them
+/// for <c>FSCTL_SRV_ENUMERATE_SNAPSHOTS</c> (MS-SMB2 §2.2.32.2) and <c>@GMT-…</c> paths. The
+/// times are UTC and are formatted by the server into <c>@GMT-…</c> tokens.
 /// </summary>
 public interface ISnapshotStore
 {
     /// <summary>
-    /// Snapshot-Zeitpunkte (UTC, aufsteigend) für einen share-relativen Pfad. Ein leerer Pfad
-    /// (bzw. die Share-Wurzel) liefert die Vereinigung aller Snapshots (<see cref="GetAllSnapshots"/>).
+    /// Snapshot times (UTC, ascending) for a share-relative path. An empty path (or the share
+    /// root) returns the union of all snapshots (<see cref="GetAllSnapshots"/>).
     /// </summary>
     IReadOnlyList<DateTime> GetSnapshots(string path);
 
-    /// <summary>Alle bekannten Snapshot-Zeitpunkte über alle Dateien (UTC, aufsteigend, dedupliziert).</summary>
+    /// <summary>All known snapshot times across all files (UTC, ascending, deduplicated).</summary>
     IReadOnlyList<DateTime> GetAllSnapshots();
 }

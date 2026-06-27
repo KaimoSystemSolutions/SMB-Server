@@ -11,7 +11,7 @@ public enum CreateDisposition : uint
     OverwriteIf = 5,
 }
 
-/// <summary>CreateOptions (Auswahl, Context §13, MS-SMB2 §2.2.13).</summary>
+/// <summary>CreateOptions (subset, Context §13, MS-SMB2 §2.2.13).</summary>
 [Flags]
 public enum CreateOptions : uint
 {
@@ -26,7 +26,7 @@ public enum CreateOptions : uint
     OpenForBackupIntent = 0x00004000,
 }
 
-/// <summary>CreateAction in der CREATE-Response (Context §13.3).</summary>
+/// <summary>CreateAction in the CREATE response (Context §13.3).</summary>
 public enum CreateAction : uint
 {
     Superseded = 0,
@@ -35,7 +35,7 @@ public enum CreateAction : uint
     Overwritten = 3,
 }
 
-/// <summary>Oplock-Level (Context §13, §15).</summary>
+/// <summary>Oplock level (Context §13, §15).</summary>
 public enum OplockLevel : byte
 {
     None = 0x00,
@@ -54,7 +54,7 @@ public enum InfoType : byte
     Quota = 0x04,
 }
 
-/// <summary>FileInformationClass-Nummern (Context §16, MS-FSCC §2.4).</summary>
+/// <summary>FileInformationClass numbers (Context §16, MS-FSCC §2.4).</summary>
 public enum FileInformationClass : byte
 {
     FileDirectoryInformation = 1,
@@ -80,7 +80,7 @@ public enum FileInformationClass : byte
     FileIdFullDirectoryInformation = 38,
 }
 
-/// <summary>FileSystemInformationClass-Nummern (Context §16, MS-FSCC §2.5).</summary>
+/// <summary>FileSystemInformationClass numbers (Context §16, MS-FSCC §2.5).</summary>
 public enum FsInformationClass : byte
 {
     FileFsVolumeInformation = 1,

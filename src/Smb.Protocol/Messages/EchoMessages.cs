@@ -7,7 +7,7 @@ public static class EchoMessage
 {
     public const ushort StructureSize = 4;
 
-    /// <summary>Validiert einen ECHO-Request-Body (StructureSize muss 4 sein).</summary>
+    /// <summary>Validates an ECHO request body (StructureSize must be 4).</summary>
     public static void ValidateRequest(ReadOnlySpan<byte> body)
     {
         var r = new SpanReader(body);
@@ -16,7 +16,7 @@ public static class EchoMessage
             throw new SmbWireFormatException($"ECHO Request StructureSize {ss} ≠ {StructureSize}.");
     }
 
-    /// <summary>Erzeugt den 4-Byte-ECHO-Response-Body.</summary>
+    /// <summary>Builds the 4-byte ECHO response body.</summary>
     public static byte[] BuildResponseBody()
     {
         var body = new byte[4];

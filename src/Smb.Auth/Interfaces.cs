@@ -1,26 +1,25 @@
 namespace Smb.Auth;
 
 /// <summary>
-/// Ein einzelner GSS-Auth-Mechanismus (NTLM, Kerberos, …), Context §9.1. Verarbeitet
-/// eingehende Mech-Tokens und liefert ggf. Antwort-Tokens, bis <see cref="GssResult.Status"/>
-/// Success oder einen Fehler meldet. Eine Instanz bedient genau einen Auth-Vorgang
-/// (eine Session) und hält dessen Zustand.
+/// A single GSS auth mechanism (NTLM, Kerberos, …), Context §9.1. Processes incoming mech tokens
+/// and returns response tokens as needed, until <see cref="GssResult.Status"/> reports Success or
+/// an error. One instance serves exactly one auth operation (one session) and holds its state.
 /// </summary>
 public interface IGssMechanism
 {
-    /// <summary>OID des Mechanismus (z.B. NTLM 1.3.6.1.4.1.311.2.2.10), Context §9.2.</summary>
+    /// <summary>OID of the mechanism (e.g. NTLM 1.3.6.1.4.1.311.2.2.10), Context §9.2.</summary>
     string MechOid { get; }
 
-    /// <summary>True, sobald der Mechanismus abgeschlossen ist (Erfolg oder endgültiger Fehler).</summary>
+    /// <summary>True once the mechanism is complete (success or final failure).</summary>
     bool IsComplete { get; }
 
-    /// <summary>Verarbeitet ein eingehendes Mech-Token und liefert das nächste Ergebnis.</summary>
+    /// <summary>Processes an incoming mech token and returns the next result.</summary>
     GssResult Accept(ReadOnlySpan<byte> inToken);
 }
 
 /// <summary>
-/// Fabrik für mechanismus-spezifische Auth-Vorgänge. Pro Session wird genau eine
-/// <see cref="IGssMechanism"/>-Instanz erzeugt.
+/// Factory for mechanism-specific auth operations. Exactly one
+/// <see cref="IGssMechanism"/> instance is created per session.
 /// </summary>
 public interface IGssMechanismFactory
 {
@@ -29,34 +28,34 @@ public interface IGssMechanismFactory
 }
 
 /// <summary>
-/// SPNEGO-Wrapper (Context §9.1): wählt den Mechanismus, kapselt NegTokenInit2/NegTokenResp.
-/// Der SESSION_SETUP-Code spricht ausschließlich mit dieser Schnittstelle.
+/// SPNEGO wrapper (Context §9.1): selects the mechanism, encapsulates NegTokenInit2/NegTokenResp.
+/// The SESSION_SETUP code talks exclusively to this interface.
 /// </summary>
 public interface ISpnegoNegotiator
 {
-    /// <summary>Erzeugt das initiale Server-Token (NegTokenInit2) für die NEGOTIATE-Response.</summary>
+    /// <summary>Creates the initial server token (NegTokenInit2) for the NEGOTIATE response.</summary>
     byte[] CreateInitialServerToken();
 
-    /// <summary>Erzeugt einen neuen, zustandsbehafteten SPNEGO-Kontext für eine Session.</summary>
+    /// <summary>Creates a new, stateful SPNEGO context for a session.</summary>
     ISpnegoServerContext CreateServerContext();
 }
 
-/// <summary>Zustandsbehafteter SPNEGO-Server-Kontext für genau eine Session.</summary>
+/// <summary>Stateful SPNEGO server context for exactly one session.</summary>
 public interface ISpnegoServerContext
 {
-    /// <summary>Verarbeitet ein eingehendes SPNEGO-Token (aus dem SESSION_SETUP-Security-Buffer).</summary>
+    /// <summary>Processes an incoming SPNEGO token (from the SESSION_SETUP security buffer).</summary>
     GssResult Accept(ReadOnlySpan<byte> spnegoToken);
 }
 
 /// <summary>
-/// Backend zur Verifikation/Identitätsauflösung (Context §9.1). <b>Hier</b> docken später
-/// LDAP/AD an — NTLM und Kerberos teilen sich dieselbe Identitätsquelle.
+/// Backend for verification/identity resolution (Context §9.1). LDAP/AD plug in <b>here</b> later —
+/// NTLM and Kerberos share the same identity source.
 /// </summary>
 public interface IIdentityBackend
 {
-    /// <summary>Liefert den NT-Hash (MD4 des UTF-16LE-Passworts) für lokale NTLM-Verifikation.</summary>
+    /// <summary>Returns the NT hash (MD4 of the UTF-16LE password) for local NTLM verification.</summary>
     bool TryGetNtHash(string domain, string user, out byte[] ntHash);
 
-    /// <summary>Löst Domain\User zu einer vollständigen Identität (SID + Gruppen) auf.</summary>
+    /// <summary>Resolves Domain\User to a full identity (SID + groups).</summary>
     SecurityIdentity Resolve(string domain, string user);
 }

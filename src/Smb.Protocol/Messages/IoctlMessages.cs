@@ -8,13 +8,13 @@ public static class IoctlMessage
     public const ushort RequestStructureSize = 57;
     public const ushort ResponseStructureSize = 49;
 
-    /// <summary>FSCTL_PIPE_TRANSCEIVE — kombiniertes Write+Read auf einer Named Pipe (DCERPC).</summary>
+    /// <summary>FSCTL_PIPE_TRANSCEIVE — combined write+read on a named pipe (DCERPC).</summary>
     public const uint FsctlPipeTransceive = 0x0011C017;
 
-    /// <summary>FSCTL_VALIDATE_NEGOTIATE_INFO — Secure Negotiate (3.0/3.0.2, Context §14).</summary>
+    /// <summary>FSCTL_VALIDATE_NEGOTIATE_INFO — secure negotiate (3.0/3.0.2, Context §14).</summary>
     public const uint FsctlValidateNegotiateInfo = 0x00140204;
 
-    /// <summary>FSCTL_SRV_ENUMERATE_SNAPSHOTS — „Vorherige Versionen" auflisten (MS-SMB2 §2.2.31.2/§2.2.32.2).</summary>
+    /// <summary>FSCTL_SRV_ENUMERATE_SNAPSHOTS — list "previous versions" (MS-SMB2 §2.2.31.2/§2.2.32.2).</summary>
     public const uint FsctlSrvEnumerateSnapshots = 0x00144064;
 
     public const uint FlagIsFsctl = 0x00000001;
@@ -45,14 +45,14 @@ public static class IoctlMessage
         if (inputCount > 0)
         {
             if (inputOffset + inputCount > message.Length)
-                throw new SmbWireFormatException("IOCTL Input reicht über die Nachricht hinaus.");
+                throw new SmbWireFormatException("IOCTL input extends past the message.");
             input = message.Slice((int)inputOffset, (int)inputCount).ToArray();
         }
 
         return new Request(ctlCode, persistent, vol, flags, input, maxOutputResponse);
     }
 
-    /// <summary>Baut die Response. OutputOffset = Header(64) + fester Body(48) = 112.</summary>
+    /// <summary>Builds the response. OutputOffset = header(64) + fixed body(48) = 112.</summary>
     public static byte[] BuildResponseBody(uint ctlCode, ulong persistentId, ulong volatileId, ReadOnlySpan<byte> output)
     {
         const uint outputOffset = Smb2Header.Size + 48; // 112
@@ -74,21 +74,21 @@ public static class IoctlMessage
     }
 
     /// <summary>
-    /// Baut die <c>SRV_SNAPSHOT_ARRAY</c>-Nutzlast (MS-SMB2 §2.2.32.2) für
-    /// FSCTL_SRV_ENUMERATE_SNAPSHOTS aus bereits formatierten <c>@GMT-…</c>-Token.
-    /// Passt das Array nicht in <paramref name="maxOutputResponse"/>, werden nur die Zähler
-    /// samt benötigter Größe gemeldet (Returned=0), damit der Client mit größerem Puffer erneut fragt.
+    /// Builds the <c>SRV_SNAPSHOT_ARRAY</c> payload (MS-SMB2 §2.2.32.2) for
+    /// FSCTL_SRV_ENUMERATE_SNAPSHOTS from already-formatted <c>@GMT-…</c> tokens.
+    /// If the array does not fit in <paramref name="maxOutputResponse"/>, only the counters and the
+    /// required size are reported (Returned=0) so the client retries with a larger buffer.
     /// </summary>
     public static byte[] BuildEnumerateSnapshotsResponse(IReadOnlyList<string> gmtTokens, uint maxOutputResponse)
     {
-        // Array: je Token ein null-terminierter UTF-16LE-String, plus abschließende Doppel-Null.
+        // Array: one null-terminated UTF-16LE string per token, plus a trailing double null.
         var array = new List<byte>();
         foreach (string token in gmtTokens)
         {
             array.AddRange(System.Text.Encoding.Unicode.GetBytes(token));
             array.Add(0); array.Add(0);
         }
-        array.Add(0); array.Add(0); // SnapshotArray-Abschluss
+        array.Add(0); array.Add(0); // SnapshotArray terminator
 
         uint numberOfSnapshots = (uint)gmtTokens.Count;
         uint arraySize = (uint)array.Count;
@@ -101,7 +101,7 @@ public static class IoctlMessage
         var w = new SpanWriter(body);
         w.WriteUInt32(numberOfSnapshots);
         w.WriteUInt32(returned);
-        w.WriteUInt32(arraySize);   // benötigte Array-Größe (auch wenn der Puffer zu klein war)
+        w.WriteUInt32(arraySize);   // required array size (even if the buffer was too small)
         w.WriteBytes(arrayBytes);
         return body;
     }

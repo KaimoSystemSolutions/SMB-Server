@@ -4,26 +4,26 @@ using Smb.Protocol.Wire;
 namespace Smb.Protocol.Messages;
 
 /// <summary>
-/// Negotiate-Contexts (nur SMB 3.1.1, Context §6.4, MS-SMB2 §2.2.3.1/§2.2.4.1).
-/// Jeder Context: ContextType(2) ‖ DataLength(2) ‖ Reserved(4) ‖ Data; zwischen Contexts
-/// auf 8-Byte-Grenze ausgerichtet (das Padding zählt nicht zur DataLength).
+/// Negotiate contexts (SMB 3.1.1 only, Context §6.4, MS-SMB2 §2.2.3.1/§2.2.4.1).
+/// Each context: ContextType(2) ‖ DataLength(2) ‖ Reserved(4) ‖ Data; contexts are aligned to an
+/// 8-byte boundary between one another (the padding does not count toward DataLength).
 /// </summary>
 public abstract class NegotiateContext
 {
-    /// <summary>Header-Größe eines Contexts (ContextType+DataLength+Reserved) ohne Data.</summary>
+    /// <summary>Header size of a context (ContextType+DataLength+Reserved) without Data.</summary>
     public const int HeaderSize = 8;
 
     public abstract NegotiateContextType Type { get; }
 
-    /// <summary>Serialisiert nur den Data-Teil (ohne 8-Byte-Context-Header).</summary>
+    /// <summary>Serializes only the data part (without the 8-byte context header).</summary>
     protected abstract void WriteData(GrowableWriter w);
 
-    /// <summary>Schreibt Context-Header + Data in <paramref name="w"/> (ohne abschließendes Padding).</summary>
+    /// <summary>Writes the context header + data into <paramref name="w"/> (without trailing padding).</summary>
     public void Write(GrowableWriter w)
     {
         int typePos = w.Position;
         w.WriteUInt16((ushort)Type);
-        w.WriteUInt16(0);   // DataLength – wird gepatcht
+        w.WriteUInt16(0);   // DataLength – patched below
         w.WriteUInt32(0);   // Reserved
         int dataStart = w.Position;
         WriteData(w);
@@ -31,7 +31,7 @@ public abstract class NegotiateContext
         w.PatchUInt16(typePos + 2, (ushort)dataLen);
     }
 
-    /// <summary>Liest einen Context (Header + Data) und liefert die Gesamtlänge ohne Padding über <paramref name="consumed"/>.</summary>
+    /// <summary>Reads a context (header + data) and reports the total length without padding via <paramref name="consumed"/>.</summary>
     public static NegotiateContext Read(ReadOnlySpan<byte> buffer, out int consumed)
     {
         var r = new SpanReader(buffer);
@@ -53,7 +53,7 @@ public abstract class NegotiateContext
     }
 }
 
-/// <summary>PREAUTH_INTEGRITY_CAPABILITIES (0x0001) — Pflicht bei 3.1.1.</summary>
+/// <summary>PREAUTH_INTEGRITY_CAPABILITIES (0x0001) — mandatory for 3.1.1.</summary>
 public sealed class PreauthIntegrityContext : NegotiateContext
 {
     public override NegotiateContextType Type => NegotiateContextType.PreauthIntegrityCapabilities;
@@ -81,7 +81,7 @@ public sealed class PreauthIntegrityContext : NegotiateContext
     }
 }
 
-/// <summary>ENCRYPTION_CAPABILITIES (0x0002) — Cipher-Liste in Präferenzreihenfolge.</summary>
+/// <summary>ENCRYPTION_CAPABILITIES (0x0002) — cipher list in preference order.</summary>
 public sealed class EncryptionContext : NegotiateContext
 {
     public override NegotiateContextType Type => NegotiateContextType.EncryptionCapabilities;
@@ -104,7 +104,7 @@ public sealed class EncryptionContext : NegotiateContext
     }
 }
 
-/// <summary>SIGNING_CAPABILITIES (0x0008) — Signing-Algorithmen in Präferenzreihenfolge.</summary>
+/// <summary>SIGNING_CAPABILITIES (0x0008) — signing algorithms in preference order.</summary>
 public sealed class SigningContext : NegotiateContext
 {
     public override NegotiateContextType Type => NegotiateContextType.SigningCapabilities;
@@ -127,7 +127,7 @@ public sealed class SigningContext : NegotiateContext
     }
 }
 
-/// <summary>COMPRESSION_CAPABILITIES (0x0003) — Phase ≥2 (nur Parsen/Echo).</summary>
+/// <summary>COMPRESSION_CAPABILITIES (0x0003) — phase ≥2 (parse/echo only).</summary>
 public sealed class CompressionContext : NegotiateContext
 {
     public override NegotiateContextType Type => NegotiateContextType.CompressionCapabilities;
@@ -155,7 +155,7 @@ public sealed class CompressionContext : NegotiateContext
     }
 }
 
-/// <summary>NETNAME_NEGOTIATE_CONTEXT_ID (0x0005) — Zielservername (Info, UTF-16LE).</summary>
+/// <summary>NETNAME_NEGOTIATE_CONTEXT_ID (0x0005) — target server name (informational, UTF-16LE).</summary>
 public sealed class NetnameContext : NegotiateContext
 {
     public override NegotiateContextType Type => NegotiateContextType.NetnameNegotiateContextId;
@@ -168,7 +168,7 @@ public sealed class NetnameContext : NegotiateContext
         => new() { NetName = System.Text.Encoding.Unicode.GetString(data) };
 }
 
-/// <summary>Unbekannter/nicht behandelter Context — Data wird opak gehalten (Context §13.2: ignorierbar).</summary>
+/// <summary>Unknown/unhandled context — Data is kept opaque (Context §13.2: ignorable).</summary>
 public sealed class UnknownNegotiateContext : NegotiateContext
 {
     private readonly NegotiateContextType _type;

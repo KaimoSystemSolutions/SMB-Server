@@ -3,8 +3,8 @@ using Smb.Protocol.Enums;
 namespace Smb.FileSystem;
 
 /// <summary>
-/// Backend-Handle einer geöffneten Datei/eines Verzeichnisses (entspricht
-/// <c>Open.LocalOpen</c>, Context §19). Lebenszyklus an das SMB-<c>Open</c> gekoppelt.
+/// Backend handle of an open file/directory (corresponds to <c>Open.LocalOpen</c>, Context §19).
+/// Its lifecycle is tied to the SMB <c>Open</c>.
 /// </summary>
 public interface IFileHandle : IDisposable
 {
@@ -13,20 +13,20 @@ public interface IFileHandle : IDisposable
     FileEntryInfo GetInfo();
 
     /// <summary>
-    /// Realer Pfad im zugrunde liegenden Dateisystem — für CHANGE_NOTIFY-Watcher, OS-Locks u.ä.,
-    /// die einen echten Pfad brauchen. <c>null</c>, wenn das Backend keinen hat (virtuell/In-Memory).
+    /// Real path in the underlying file system — for CHANGE_NOTIFY watchers, OS locks, etc. that
+    /// need a real path. <c>null</c> if the backend has none (virtual/in-memory).
     /// </summary>
     string? PhysicalPath => null;
 }
 
 /// <summary>
-/// NTFS-semantisches Datei-Backend hinter einem Share (Context §2, §13). Liefert
-/// NT-Status-Codes; ein konkretes Backend (lokales FS, virtuell, …) mappt seine Semantik
-/// hierauf. Pfade sind share-relativ, mit '\\' getrennt, ohne führenden Backslash.
+/// NTFS-semantic file backend behind a share (Context §2, §13). Returns NT status codes; a concrete
+/// backend (local FS, virtual, …) maps its semantics onto this. Paths are share-relative,
+/// '\\'-separated, without a leading backslash.
 /// </summary>
 public interface IFileStore
 {
-    /// <summary>Öffnet/erstellt gemäß CreateDisposition. <paramref name="createAction"/> meldet, was geschah.</summary>
+    /// <summary>Opens/creates per CreateDisposition. <paramref name="createAction"/> reports what happened.</summary>
     FileStoreResult<IFileHandle> Create(
         string path,
         FileAccessIntent access,
@@ -35,29 +35,29 @@ public interface IFileStore
         bool nonDirectoryRequired,
         out CreateOutcome createAction);
 
-    /// <summary>Liest aus einem offenen Handle.</summary>
+    /// <summary>Reads from an open handle.</summary>
     FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer);
 
-    /// <summary>Schreibt in ein offenes Handle, liefert die Anzahl geschriebener Bytes.</summary>
+    /// <summary>Writes to an open handle, returns the number of bytes written.</summary>
     FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data);
 
-    /// <summary>Listet ein Verzeichnis (optional mit Wildcard-Suchmuster).</summary>
+    /// <summary>Lists a directory (optionally with a wildcard search pattern).</summary>
     FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern);
 
-    /// <summary>Setzt die Dateigröße (SET FileEndOfFileInformation).</summary>
+    /// <summary>Sets the file size (SET FileEndOfFileInformation).</summary>
     NtStatus SetEndOfFile(IFileHandle handle, long length);
 
-    /// <summary>Benennt um/verschiebt (SET FileRenameInformation).</summary>
+    /// <summary>Renames/moves (SET FileRenameInformation).</summary>
     NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists);
 
-    /// <summary>Markiert zum Löschen beim Schließen (SET FileDispositionInformation / DELETE_ON_CLOSE).</summary>
+    /// <summary>Marks for deletion on close (SET FileDispositionInformation / DELETE_ON_CLOSE).</summary>
     NtStatus SetDeleteOnClose(IFileHandle handle, bool delete);
 
-    /// <summary>Flusht Puffer auf das Backend.</summary>
+    /// <summary>Flushes buffers to the backend.</summary>
     NtStatus Flush(IFileHandle handle);
 }
 
-/// <summary>Vereinfachte Zugriffsabsicht (aus CREATE DesiredAccess abgeleitet, Context §13.1).</summary>
+/// <summary>Simplified access intent (derived from CREATE DesiredAccess, Context §13.1).</summary>
 [Flags]
 public enum FileAccessIntent
 {
@@ -68,7 +68,7 @@ public enum FileAccessIntent
     ReadWrite = Read | Write,
 }
 
-/// <summary>CreateDisposition-Absicht (Context §13).</summary>
+/// <summary>CreateDisposition intent (Context §13).</summary>
 public enum CreateDispositionIntent
 {
     Supersede = 0,
@@ -79,7 +79,7 @@ public enum CreateDispositionIntent
     OverwriteIf = 5,
 }
 
-/// <summary>CreateAction der Response (Context §13.3).</summary>
+/// <summary>CreateAction of the response (Context §13.3).</summary>
 public enum CreateOutcome
 {
     Superseded = 0,

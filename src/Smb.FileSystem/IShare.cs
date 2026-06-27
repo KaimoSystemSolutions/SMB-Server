@@ -1,27 +1,27 @@
 namespace Smb.FileSystem;
 
 /// <summary>
-/// Ein bereitgestellter SMB-Share (Context §3.3.1.6 / §12). Bündelt Name, Typ, Backend
-/// und Sicherheits-/Verschlüsselungs-Policy.
+/// A published SMB share (Context §3.3.1.6 / §12). Bundles name, type, backend and
+/// security/encryption policy.
 /// </summary>
 public interface IShare
 {
-    /// <summary>Share-Name ohne Pfad (z.B. "Data", "IPC$").</summary>
+    /// <summary>Share name without a path (e.g. "Data", "IPC$").</summary>
     string Name { get; }
 
     ShareType Type { get; }
 
-    /// <summary>Backend-Dateisystem (für PIPE/IPC$ ggf. null bzw. Named-Pipe-Backend).</summary>
+    /// <summary>Backend file system (for PIPE/IPC$ possibly null, or a named-pipe backend).</summary>
     IFileStore? FileStore { get; }
 
-    /// <summary>Erzwingt Verschlüsselung für diesen Share (Context §11, §20).</summary>
+    /// <summary>Forces encryption for this share (Context §11, §20).</summary>
     bool EncryptData { get; }
 
-    /// <summary>Optionaler Kommentar/Remark (TREE_CONNECT-Info).</summary>
+    /// <summary>Optional comment/remark (TREE_CONNECT info).</summary>
     string Remark { get; }
 }
 
-/// <summary>Standard-Share-Implementierung über einen <see cref="IFileStore"/>.</summary>
+/// <summary>Default share implementation over an <see cref="IFileStore"/>.</summary>
 public sealed class Share : IShare
 {
     public required string Name { get; init; }
@@ -30,7 +30,7 @@ public sealed class Share : IShare
     public bool EncryptData { get; init; }
     public string Remark { get; init; } = string.Empty;
 
-    /// <summary>Erzeugt den Pflicht-Share <c>IPC$</c> (PIPE), den viele Clients zuerst verbinden (Context §12, §23).</summary>
+    /// <summary>Creates the mandatory <c>IPC$</c> share (PIPE) that many clients connect first (Context §12, §23).</summary>
     public static Share CreateIpc() => new()
     {
         Name = "IPC$",
@@ -39,7 +39,7 @@ public sealed class Share : IShare
     };
 }
 
-/// <summary>Registrierung der bereitgestellten Shares eines Servers (Context §19, <c>ShareList</c>).</summary>
+/// <summary>Registry of a server's published shares (Context §19, <c>ShareList</c>).</summary>
 public sealed class ShareCollection
 {
     private readonly Dictionary<string, IShare> _shares = new(StringComparer.OrdinalIgnoreCase);

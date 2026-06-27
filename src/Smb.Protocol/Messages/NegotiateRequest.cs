@@ -5,7 +5,7 @@ namespace Smb.Protocol.Messages;
 
 /// <summary>
 /// SMB2 NEGOTIATE Request (Context §6.2, MS-SMB2 §2.2.3). <c>StructureSize=36</c>.
-/// Der Body folgt direkt auf den 64-Byte-Header.
+/// The body follows directly after the 64-byte header.
 /// </summary>
 public sealed class NegotiateRequest
 {
@@ -15,19 +15,19 @@ public sealed class NegotiateRequest
     public Smb2Capabilities Capabilities { get; init; }
     public byte[] ClientGuid { get; init; } = new byte[16];
 
-    /// <summary>Vom Client angebotene Dialekte (in der Reihenfolge der Liste).</summary>
+    /// <summary>Dialects offered by the client (in list order).</summary>
     public IReadOnlyList<SmbDialect> Dialects { get; init; } = [];
 
-    /// <summary>Negotiate-Contexts (nur wenn 0x0311 angeboten wird), sonst leer.</summary>
+    /// <summary>Negotiate contexts (only when 0x0311 is offered), otherwise empty.</summary>
     public IReadOnlyList<NegotiateContext> NegotiateContexts { get; init; } = [];
 
-    /// <summary>True, wenn der Client SMB 3.1.1 anbietet.</summary>
+    /// <summary>True when the client offers SMB 3.1.1.</summary>
     public bool OffersSmb311 => Dialects.Contains(SmbDialect.Smb311);
 
     /// <summary>
-    /// Parst den Negotiate-Body. <paramref name="message"/> ist die Gesamtnachricht;
-    /// <paramref name="bodyOffset"/> der absolute Offset des Bodys innerhalb der Nachricht
-    /// (i.d.R. 64) — nötig, weil NegotiateContextOffset ab Nachrichtenbeginn zählt.
+    /// Parses the negotiate body. <paramref name="message"/> is the whole message;
+    /// <paramref name="bodyOffset"/> is the absolute offset of the body within the message
+    /// (usually 64) — needed because NegotiateContextOffset counts from the start of the message.
     /// </summary>
     public static NegotiateRequest Parse(ReadOnlySpan<byte> message, int bodyOffset)
     {
@@ -40,17 +40,17 @@ public sealed class NegotiateRequest
 
         int dialectCount = r.ReadUInt16();
         if (dialectCount is 0 or > 64)
-            throw new SmbWireFormatException($"NEGOTIATE DialectCount {dialectCount} ungültig.");
+            throw new SmbWireFormatException($"NEGOTIATE DialectCount {dialectCount} invalid.");
 
         var securityMode = (SmbSecurityMode)r.ReadUInt16();
         r.Skip(2); // Reserved
         var capabilities = (Smb2Capabilities)r.ReadUInt32();
         byte[] clientGuid = r.ReadByteArray(16);
 
-        // Offset 28..35: bei 3.1.1 NegotiateContextOffset(4)+Count(2)+Reserved2(2), sonst ClientStartTime(8).
+        // Offset 28..35: for 3.1.1 NegotiateContextOffset(4)+Count(2)+Reserved2(2), otherwise ClientStartTime(8).
         uint negotiateContextOffset = r.ReadUInt32();
         ushort negotiateContextCount = r.ReadUInt16();
-        r.Skip(2); // Reserved2 / Teil von ClientStartTime
+        r.Skip(2); // Reserved2 / part of ClientStartTime
 
         var dialects = new SmbDialect[dialectCount];
         for (int i = 0; i < dialectCount; i++)
@@ -79,12 +79,12 @@ public sealed class NegotiateRequest
         for (int i = 0; i < count; i++)
         {
             if (pos + NegotiateContext.HeaderSize > message.Length)
-                throw new SmbWireFormatException("Negotiate-Context reicht über Nachrichtenende hinaus.");
+                throw new SmbWireFormatException("Negotiate context extends past the end of the message.");
 
             NegotiateContext ctx = NegotiateContext.Read(message[pos..], out int consumed);
             sink.Add(ctx);
             pos += consumed;
-            // Zwischen Contexts auf 8-Byte ausrichten (außer nach dem letzten).
+            // Align contexts to 8 bytes between one another (except after the last one).
             if (i < count - 1) pos = Align8(pos);
         }
     }

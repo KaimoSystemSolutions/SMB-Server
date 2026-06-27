@@ -4,23 +4,23 @@ using Smb.Protocol.Enums;
 namespace Smb.FileSystem.Versioning;
 
 /// <summary>
-/// <see cref="IFileStore"/>-Decorator, der „Vorherige Versionen" (Windows Previous Versions /
-/// VSS-Snapshots) über einem beliebigen Backend-Store nachbildet:
+/// <see cref="IFileStore"/> decorator that emulates "previous versions" (Windows Previous Versions /
+/// VSS snapshots) on top of any backend store:
 /// <list type="bullet">
-/// <item>Vor jedem Überschreiben einer existierenden Datei wird ihr aktueller Inhalt als
-/// Version mit Zeitstempel <c>now</c> festgehalten.</item>
-/// <item>Ein führendes <c>@GMT-…</c>-Pfadsegment adressiert die Version, die zum Snapshot-
-/// Zeitpunkt aktuell war — read-only (Schreiben/Löschen → <see cref="NtStatus.AccessDenied"/>).</item>
-/// <item><see cref="ISnapshotStore"/> stellt die Zeitpunkte für
-/// <c>FSCTL_SRV_ENUMERATE_SNAPSHOTS</c> bereit.</item>
+/// <item>Before every overwrite of an existing file, its current content is captured as a version
+/// with timestamp <c>now</c>.</item>
+/// <item>A leading <c>@GMT-…</c> path segment addresses the version that was current at the snapshot
+/// time — read-only (write/delete → <see cref="NtStatus.AccessDenied"/>).</item>
+/// <item><see cref="ISnapshotStore"/> provides the times for
+/// <c>FSCTL_SRV_ENUMERATE_SNAPSHOTS</c>.</item>
 /// </list>
-/// Die Historie liegt im Speicher (pro Store-Instanz) und ist auf <c>maxVersionsPerFile</c>
-/// Einträge je Datei begrenzt. Sie eignet sich für Tests/Dev; ein persistenter Snapshot-
-/// Provider kann diese Klasse später ersetzen.
+/// The history is kept in memory (per store instance) and is limited to <c>maxVersionsPerFile</c>
+/// entries per file. It is suitable for tests/dev; a persistent snapshot provider can replace this
+/// class later.
 /// </summary>
 public sealed class VersioningFileStore : IFileStore, ISnapshotStore
 {
-    /// <summary>Obergrenze für das In-Memory-Festhalten einer Version (Schutz vor Riesen-Dateien).</summary>
+    /// <summary>Upper bound for capturing a version in memory (protection against huge files).</summary>
     private const long MaxCaptureBytes = 64L * 1024 * 1024;
 
     private readonly IFileStore _inner;
@@ -39,14 +39,14 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
     {
         createAction = CreateOutcome.Opened;
 
-        // 1) Snapshot-Zugriff: führendes @GMT-Segment → frühere Version read-only liefern.
+        // 1) Snapshot access: leading @GMT segment → serve the previous version read-only.
         if (GmtToken.TrySplitSnapshotPath(path, out DateTime snapAt, out string realPath))
         {
             bool wantsWrite = access.HasFlag(FileAccessIntent.Write) || access.HasFlag(FileAccessIntent.Delete)
                 || disposition is CreateDispositionIntent.Create or CreateDispositionIntent.Overwrite
                     or CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
             if (wantsWrite)
-                return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); // Snapshots sind read-only.
+                return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); // snapshots are read-only.
 
             if (!TryResolveSnapshot(realPath, snapAt, out byte[] content, out FileEntryInfo info))
                 return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
@@ -54,7 +54,7 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
             return FileStoreResult<IFileHandle>.Ok(new SnapshotFileHandle(realPath, content, info));
         }
 
-        // 2) Normaler Pfad: vor einem Überschreiben die aktuelle Version festhalten.
+        // 2) Normal path: capture the current version before an overwrite.
         bool overwrites = disposition is CreateDispositionIntent.Overwrite
             or CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
         if (overwrites)
@@ -87,7 +87,7 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
         if (handle is SnapshotFileHandle)
             return delete ? NtStatus.AccessDenied : NtStatus.Success;
 
-        // Vor dem Löschen die letzte Version festhalten (Datei existiert hier noch).
+        // Capture the last version before deletion (the file still exists here).
         if (delete && !handle.IsDirectory && !string.IsNullOrEmpty(handle.Path))
             CaptureCurrentVersion(handle.Path);
 
@@ -115,19 +115,19 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
         return [.. set];
     }
 
-    // --- Intern ---
+    // --- Internal ---
 
-    /// <summary>Liest den aktuellen Inhalt einer existierenden Datei und legt ihn als Version ab.</summary>
+    /// <summary>Reads the current content of an existing file and stores it as a version.</summary>
     private void CaptureCurrentVersion(string path)
     {
         if (!TryReadAll(path, out byte[] content, out FileEntryInfo info))
-            return; // Datei existiert (noch) nicht oder ist ein Verzeichnis → nichts zu sichern.
+            return; // file does not exist (yet) or is a directory → nothing to capture.
 
         FileHistory history = _history.GetOrAdd(Normalize(path), _ => new FileHistory());
         history.Add(new FileVersion(DateTime.UtcNow, content, info), _maxVersionsPerFile);
     }
 
-    /// <summary>Öffnet die Datei read-only über das Backend und liest sie vollständig in den Speicher.</summary>
+    /// <summary>Opens the file read-only via the backend and reads it fully into memory.</summary>
     private bool TryReadAll(string path, out byte[] content, out FileEntryInfo info)
     {
         content = [];
@@ -189,11 +189,11 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
 
     private static string Normalize(string path) => (path ?? string.Empty).Replace('/', '\\').Trim('\\');
 
-    // --- Datentypen ---
+    // --- Data types ---
 
     private sealed record FileVersion(DateTime TimeUtc, byte[] Content, FileEntryInfo Original)
     {
-        /// <summary>Metadaten der Snapshot-Sicht: Größe aus dem festgehaltenen Inhalt, read-only.</summary>
+        /// <summary>Metadata of the snapshot view: size from the captured content, read-only.</summary>
         public FileEntryInfo SnapshotInfo() => new()
         {
             Name = Original.Name,
@@ -207,7 +207,7 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
         };
     }
 
-    /// <summary>Versionshistorie einer Datei (aufsteigend nach Zeit, da bei Überschreiben angehängt).</summary>
+    /// <summary>Version history of a file (ascending by time, since entries are appended on overwrite).</summary>
     private sealed class FileHistory
     {
         private readonly object _gate = new();
@@ -224,15 +224,15 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
         }
 
         /// <summary>
-        /// Liefert die Version, die zum Zeitpunkt <paramref name="t"/> aktuell war: die erste
-        /// festgehaltene Version, deren (sekundengenauer) Zeitstempel ≥ <paramref name="t"/> ist.
+        /// Returns the version that was current at time <paramref name="t"/>: the first captured
+        /// version whose (second-precision) timestamp is ≥ <paramref name="t"/>.
         /// </summary>
         public FileVersion? ResolveAtOrAfter(DateTime t)
         {
             DateTime floor = FloorToSecond(t);
             lock (_gate)
             {
-                foreach (FileVersion v in _versions) // aufsteigend
+                foreach (FileVersion v in _versions) // ascending
                     if (FloorToSecond(v.TimeUtc) >= floor)
                         return v;
                 return null;
@@ -253,7 +253,7 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
     }
 }
 
-/// <summary>Read-only Backend-Handle, das den festgehaltenen Inhalt einer früheren Version bedient.</summary>
+/// <summary>Read-only backend handle that serves the captured content of a previous version.</summary>
 internal sealed class SnapshotFileHandle : IFileHandle
 {
     private readonly byte[] _content;

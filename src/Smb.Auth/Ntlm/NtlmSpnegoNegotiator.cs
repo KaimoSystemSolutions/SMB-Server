@@ -4,10 +4,10 @@ using Smb.Protocol.Enums;
 namespace Smb.Auth.Ntlm;
 
 /// <summary>
-/// Produktiver SPNEGO-Negotiator mit NTLMv2 als einzigem Mechanismus (Context §9). Akzeptiert
-/// sowohl SPNEGO-verpackte Tokens (NegTokenInit/NegTokenResp, wie Windows sie sendet) als auch
-/// rohe NTLMSSP-Tokens (einfache Clients). Spätere Mechanismen (Kerberos) werden additiv als
-/// weitere <see cref="IGssMechanism"/> ergänzt, ohne die SMB-Schicht zu ändern.
+/// Production SPNEGO negotiator with NTLMv2 as the only mechanism (Context §9). Accepts both
+/// SPNEGO-wrapped tokens (NegTokenInit/NegTokenResp, as Windows sends them) and raw NTLMSSP tokens
+/// (simple clients). Later mechanisms (Kerberos) are added additively as further
+/// <see cref="IGssMechanism"/> implementations, without changing the SMB layer.
 /// </summary>
 public sealed class NtlmSpnegoNegotiator : ISpnegoNegotiator
 {
@@ -36,7 +36,7 @@ public sealed class NtlmSpnegoNegotiator : ISpnegoNegotiator
 
         public GssResult Accept(ReadOnlySpan<byte> token)
         {
-            // Modus bestimmen: rohes NTLMSSP oder SPNEGO?
+            // Determine mode: raw NTLMSSP or SPNEGO?
             byte[] mechToken;
             if (!_modeKnown)
             {

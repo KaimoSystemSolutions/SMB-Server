@@ -85,7 +85,7 @@ public sealed class LocalFileStore : IFileStore
         try
         {
             using var fs = new FileStream(h.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            if (offset >= fs.Length) return FileStoreResult<int>.Fail(NtStatus.Success); // 0 Bytes / EOF
+            if (offset >= fs.Length) return FileStoreResult<int>.Ok(0); // EOF: 0 bytes read (handler maps to STATUS_END_OF_FILE)
             fs.Seek(offset, SeekOrigin.Begin);
             int read = fs.Read(buffer);
             return FileStoreResult<int>.Ok(read);

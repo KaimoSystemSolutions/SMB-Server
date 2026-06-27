@@ -3,12 +3,11 @@ using Smb.Auth.Oids;
 namespace Smb.Auth;
 
 /// <summary>
-/// <b>Nur für Entwicklung/Tests.</b> Ein SPNEGO-Negotiator, der jede Authentifizierung in
-/// einem Schritt anonym akzeptiert und einen deterministischen Session-Key liefert. Damit
-/// lässt sich der komplette SMB-Pfad (Negotiate → SessionSetup → Key-Derivation → Signing)
-/// ohne echtes NTLM/Kerberos durchspielen. In Produktion durch einen echten
-/// <see cref="ISpnegoNegotiator"/> (NTLM/Kerberos) ersetzen — Guest/Anonymous ist per
-/// Default abzulehnen (Context §8.4, §20).
+/// <b>For development/testing only.</b> An SPNEGO negotiator that accepts every authentication
+/// anonymously in a single step and returns a deterministic session key. This lets the complete
+/// SMB path (negotiate → session setup → key derivation → signing) be exercised without real
+/// NTLM/Kerberos. In production, replace it with a real <see cref="ISpnegoNegotiator"/>
+/// (NTLM/Kerberos) — guest/anonymous is rejected by default (Context §8.4, §20).
 /// </summary>
 public sealed class DevSpnegoNegotiator : ISpnegoNegotiator
 {

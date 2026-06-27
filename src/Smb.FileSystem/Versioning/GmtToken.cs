@@ -3,24 +3,24 @@ using System.Globalization;
 namespace Smb.FileSystem.Versioning;
 
 /// <summary>
-/// Hilfsfunktionen für die Windows-„Vorherige Versionen"-Snapshot-Token
-/// <c>@GMT-YYYY.MM.DD-HH.MM.SS</c> (MS-SMB2 §2.2.32.2, GMT-Token-Syntax). Ein solches Token
-/// kann als führendes Pfadsegment auftreten (z.B. <c>@GMT-2026.06.24-10.30.00\datei.txt</c>)
-/// und adressiert die Version einer Datei zu einem Snapshot-Zeitpunkt (UTC).
+/// Helpers for the Windows "Previous Versions" snapshot tokens
+/// <c>@GMT-YYYY.MM.DD-HH.MM.SS</c> (MS-SMB2 §2.2.32.2, GMT token syntax). Such a token can appear
+/// as a leading path segment (e.g. <c>@GMT-2026.06.24-10.30.00\file.txt</c>) and addresses the
+/// version of a file at a snapshot point in time (UTC).
 /// </summary>
 public static class GmtToken
 {
-    /// <summary>Strikte Parse-/Format-Maske; @ G M T sind escaped, da G/M Format-Spezifizierer wären.</summary>
+    /// <summary>Strict parse/format mask; @ G M T are escaped because G/M would be format specifiers.</summary>
     private const string Pattern = @"\@\G\M\T-yyyy.MM.dd-HH.mm.ss";
 
-    /// <summary>Formatiert einen UTC-Zeitpunkt als <c>@GMT-…</c>-Token (Sekundengenauigkeit).</summary>
+    /// <summary>Formats a UTC point in time as a <c>@GMT-…</c> token (second precision).</summary>
     public static string Format(DateTime utc)
     {
         DateTime u = utc.Kind == DateTimeKind.Utc ? utc : utc.ToUniversalTime();
         return u.ToString(Pattern, CultureInfo.InvariantCulture);
     }
 
-    /// <summary>Parst ein einzelnes <c>@GMT-…</c>-Token zu UTC. False bei abweichender Syntax.</summary>
+    /// <summary>Parses a single <c>@GMT-…</c> token to UTC. False on differing syntax.</summary>
     public static bool TryParse(string? token, out DateTime utc)
     {
         utc = default;
@@ -32,9 +32,9 @@ public static class GmtToken
     }
 
     /// <summary>
-    /// Zerlegt einen Pfad in (Snapshot-Zeit, Rest-Pfad), falls das erste Segment ein
-    /// <c>@GMT-…</c>-Token ist. <paramref name="remainder"/> ist dann der share-relative Pfad
-    /// ohne das Token (Backslash-getrennt). Liefert false, wenn kein Snapshot-Pfad vorliegt.
+    /// Splits a path into (snapshot time, remaining path) if the first segment is a
+    /// <c>@GMT-…</c> token. <paramref name="remainder"/> is then the share-relative path without
+    /// the token (backslash-separated). Returns false if there is no snapshot path.
     /// </summary>
     public static bool TrySplitSnapshotPath(string? path, out DateTime snapshotUtc, out string remainder)
     {

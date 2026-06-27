@@ -4,10 +4,10 @@ using System.Text;
 namespace Smb.Protocol.Wire;
 
 /// <summary>
-/// Allokationsarmer, vorwärts-lesender Cursor über einen <see cref="ReadOnlySpan{T}"/>.
-/// Alle Mehrbyte-Felder werden <b>Little-Endian</b> gelesen — das entspricht SMB2
-/// (Context §2, §23: "SMB2 = Little-Endian"). Das einzige Big-Endian-Feld im Protokoll
-/// ist das NBSS-Längenpräfix; dieses wird gesondert in <c>NbssFrame</c> behandelt.
+/// Allocation-light, forward-reading cursor over a <see cref="ReadOnlySpan{T}"/>.
+/// All multi-byte fields are read <b>little-endian</b> — matching SMB2
+/// (Context §2, §23: "SMB2 = little-endian"). The only big-endian field in the protocol
+/// is the NBSS length prefix; that is handled separately in <c>NbssFrame</c>.
 /// </summary>
 public ref struct SpanReader
 {
@@ -20,16 +20,16 @@ public ref struct SpanReader
         _position = 0;
     }
 
-    /// <summary>Aktuelle Leseposition (Offset ab Beginn des Puffers).</summary>
+    /// <summary>Current read position (offset from the start of the buffer).</summary>
     public readonly int Position => _position;
 
-    /// <summary>Anzahl noch nicht gelesener Bytes.</summary>
+    /// <summary>Number of bytes not yet read.</summary>
     public readonly int Remaining => _buffer.Length - _position;
 
-    /// <summary>Gesamtlänge des zugrunde liegenden Puffers.</summary>
+    /// <summary>Total length of the underlying buffer.</summary>
     public readonly int Length => _buffer.Length;
 
-    /// <summary>Setzt die Leseposition absolut (z.B. um einem Offset-Feld zu folgen).</summary>
+    /// <summary>Sets the read position absolutely (e.g. to follow an offset field).</summary>
     public void Seek(int position)
     {
         if ((uint)position > (uint)_buffer.Length)
@@ -37,7 +37,7 @@ public ref struct SpanReader
         _position = position;
     }
 
-    /// <summary>Überspringt <paramref name="count"/> Bytes.</summary>
+    /// <summary>Skips <paramref name="count"/> bytes.</summary>
     public void Skip(int count)
     {
         EnsureAvailable(count);
@@ -80,7 +80,7 @@ public ref struct SpanReader
 
     public long ReadInt64() => unchecked((long)ReadUInt64());
 
-    /// <summary>Liest <paramref name="count"/> Bytes als (nicht kopierten) Slice.</summary>
+    /// <summary>Reads <paramref name="count"/> bytes as a (non-copied) slice.</summary>
     public ReadOnlySpan<byte> ReadBytes(int count)
     {
         EnsureAvailable(count);
@@ -89,17 +89,17 @@ public ref struct SpanReader
         return slice;
     }
 
-    /// <summary>Kopiert <paramref name="count"/> Bytes in ein neues Array.</summary>
+    /// <summary>Copies <paramref name="count"/> bytes into a new array.</summary>
     public byte[] ReadByteArray(int count) => ReadBytes(count).ToArray();
 
-    /// <summary>Liest einen UTF-16LE-String fester Byte-Länge (SMB2-Namensfelder).</summary>
+    /// <summary>Reads a UTF-16LE string of fixed byte length (SMB2 name fields).</summary>
     public string ReadUtf16(int byteLength)
     {
         ReadOnlySpan<byte> slice = ReadBytes(byteLength);
         return Encoding.Unicode.GetString(slice);
     }
 
-    /// <summary>Liefert einen Slice an absoluter Position, ohne den Cursor zu bewegen.</summary>
+    /// <summary>Returns a slice at an absolute position without moving the cursor.</summary>
     public readonly ReadOnlySpan<byte> Slice(int offset, int count)
     {
         if ((uint)offset > (uint)_buffer.Length || (uint)count > (uint)(_buffer.Length - offset))
@@ -111,6 +111,6 @@ public ref struct SpanReader
     {
         if (count < 0 || count > Remaining)
             throw new SmbWireFormatException(
-                $"Lesen über Pufferende hinaus: benötigt {count}, verfügbar {Remaining} (Position {_position}/{_buffer.Length}).");
+                $"Read past end of buffer: needs {count}, available {Remaining} (position {_position}/{_buffer.Length}).");
     }
 }

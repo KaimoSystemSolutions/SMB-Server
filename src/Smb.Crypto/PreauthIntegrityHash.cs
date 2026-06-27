@@ -3,25 +3,25 @@ using System.Security.Cryptography;
 namespace Smb.Crypto;
 
 /// <summary>
-/// Laufender Preauth-Integrity-Hash für SMB 3.1.1 (Context §6.4, §8.2, MS-SMB2 §3.3.5.4).
-/// <c>H = 0</c> (64 Nullbytes); je Nachricht <c>H = SHA512(H ‖ message)</c>. Reihenfolge:
-/// NEGOTIATE-Req, NEGOTIATE-Resp, danach jede SESSION_SETUP-Req/-Resp bis zur finalen
-/// erfolgreichen Response (Context §8.2). Ein Reihenfolgefehler ⇒ "Signatur ungültig".
+/// Running preauth integrity hash for SMB 3.1.1 (Context §6.4, §8.2, MS-SMB2 §3.3.5.4).
+/// <c>H = 0</c> (64 zero bytes); per message <c>H = SHA512(H ‖ message)</c>. Order:
+/// NEGOTIATE req, NEGOTIATE resp, then each SESSION_SETUP req/resp up to the final successful
+/// response (Context §8.2). An ordering mistake ⇒ "invalid signature".
 /// </summary>
 public sealed class PreauthIntegrityHash
 {
     private byte[] _value = new byte[64];
 
-    /// <summary>Aktueller 64-Byte-Hashwert (Kopie).</summary>
+    /// <summary>Current 64-byte hash value (copy).</summary>
     public byte[] Value => (byte[])_value.Clone();
 
-    /// <summary>Aktueller Hashwert als Span (ohne Kopie) — für die Key-Derivation.</summary>
+    /// <summary>Current hash value as a span (no copy) — for key derivation.</summary>
     public ReadOnlySpan<byte> ValueSpan => _value;
 
-    /// <summary>Schreibt <c>H = SHA512(H ‖ message)</c> fort.</summary>
+    /// <summary>Advances <c>H = SHA512(H ‖ message)</c>.</summary>
     public void Append(ReadOnlySpan<byte> message)
     {
-        // [AUDIT-2026-06] zuvor: identischer toter Ternary-Zweig (combinedLen<=4096 ? new[] : new[]).
+        // [AUDIT-2026-06] previously: identical dead ternary branch (combinedLen<=4096 ? new[] : new[]).
         int combinedLen = _value.Length + message.Length;
         byte[] buffer = new byte[combinedLen];
         _value.CopyTo(buffer, 0);
@@ -29,6 +29,6 @@ public sealed class PreauthIntegrityHash
         _value = SHA512.HashData(buffer);
     }
 
-    /// <summary>Erzeugt eine unabhängige Kopie des aktuellen Zustands (z.B. Connection → Session, Context §8.2).</summary>
+    /// <summary>Creates an independent copy of the current state (e.g. connection → session, Context §8.2).</summary>
     public PreauthIntegrityHash Clone() => new() { _value = (byte[])_value.Clone() };
 }

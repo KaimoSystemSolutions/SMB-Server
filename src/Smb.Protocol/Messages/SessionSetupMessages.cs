@@ -3,15 +3,15 @@ using Smb.Protocol.Wire;
 
 namespace Smb.Protocol.Messages;
 
-/// <summary>SESSION_SETUP Request-Flags (Context §8.1).</summary>
+/// <summary>SESSION_SETUP request flags (Context §8.1).</summary>
 [Flags]
 public enum SessionSetupFlags : byte
 {
     None = 0x00,
-    Binding = 0x01, // 3.x: Session-Binding an weitere Connection.
+    Binding = 0x01, // 3.x: bind the session to an additional connection.
 }
 
-/// <summary>SESSION_SETUP Response SessionFlags (Context §8.1).</summary>
+/// <summary>SESSION_SETUP response SessionFlags (Context §8.1).</summary>
 [Flags]
 public enum SessionResponseFlags : ushort
 {
@@ -31,7 +31,7 @@ public sealed class SessionSetupRequest
     public Smb2Capabilities Capabilities { get; init; }
     public ulong PreviousSessionId { get; init; }
 
-    /// <summary>GSS/SPNEGO-Token aus dem Security-Buffer.</summary>
+    /// <summary>GSS/SPNEGO token from the security buffer.</summary>
     public byte[] SecurityBuffer { get; init; } = [];
 
     public static SessionSetupRequest Parse(ReadOnlySpan<byte> message, int bodyOffset)
@@ -53,7 +53,7 @@ public sealed class SessionSetupRequest
         if (secLength > 0)
         {
             if (secOffset + secLength > message.Length)
-                throw new SmbWireFormatException("SESSION_SETUP Security-Buffer reicht über die Nachricht hinaus.");
+                throw new SmbWireFormatException("SESSION_SETUP security buffer extends past the message.");
             token = message.Slice(secOffset, secLength).ToArray();
         }
 
@@ -76,14 +76,14 @@ public sealed class SessionSetupResponse
     public SessionResponseFlags SessionFlags { get; init; }
     public byte[] SecurityBuffer { get; init; } = [];
 
-    /// <summary>Baut den Body. <paramref name="headerSize"/> = Offset des Bodys (für SecurityBufferOffset).</summary>
+    /// <summary>Builds the body. <paramref name="headerSize"/> = offset of the body (for SecurityBufferOffset).</summary>
     public byte[] ToBody(int headerSize = Smb2Header.Size)
     {
         var w = new GrowableWriter(16 + SecurityBuffer.Length);
         w.WriteUInt16(StructureSize);
         w.WriteUInt16((ushort)SessionFlags);
         int secOffsetPos = w.Position;
-        w.WriteUInt16(0); // SecurityBufferOffset – patch
+        w.WriteUInt16(0); // SecurityBufferOffset – patched below
         w.WriteUInt16((ushort)SecurityBuffer.Length);
 
         int bufStart = w.Position;
