@@ -1,17 +1,38 @@
-# Smb.Server — SMB 2/3 Server-Library (C# / .NET 8)
+# Smb.Server
 
-Eine modulare, testgetriebene **SMB-2/3-Server**-Bibliothek, implementiert nach den offiziellen
-Microsoft Open Specifications (MS-SMB2, MS-FSCC, MS-NLMP, MS-ERREF, MS-SPNG, MS-DTYP).
-Grundlage und Faktencheck: [`SMB2-3_Server_Context.md`](../SMB2-3_Server_Context.md).
+**An SMB 2/3 server library for .NET 8 — written in pure C#.**
 
-> **Reifegrad.** Diese Lib ist ein **korrektes, voll getestetes Fundament** (Meilensteine
-> M1–M6 weitgehend fertig; siehe [Roadmap](#roadmap)). Der wire-/krypto-kritische Kern ist
-> gegen offizielle Testvektoren verifiziert. Datei-I/O (CREATE/READ/WRITE/QUERY_*/SET_INFO/
-> CLOSE) läuft über ein `IFileStore`-Backend (`LocalFileStore`); Byte-Range-**LOCK** ist inkl.
-> blockierender Locks (`STATUS_PENDING` + Interim-Antwort, `CANCEL`) implementiert und über
-> einen austauschbaren `ILockManager` verdrahtet.
+Embed a full SMB file server directly into your .NET application: Windows, macOS and Linux clients
+can connect via `\\your-server\share` without Samba or the Windows service. The library is
+implemented against the official Microsoft Open Specifications (MS-SMB2, MS-FSCC, MS-NLMP …) and is
+fully test-driven.
 
-## Schnellstart
+[![CI](https://github.com/KaimoSystemSolutions/SMB-Library/actions/workflows/ci.yml/badge.svg)](https://github.com/KaimoSystemSolutions/SMB-Library/actions/workflows/ci.yml)
+
+> **Maturity:** a correct, fully tested foundation (SMB 2/3 negotiate, real NTLMv2 login,
+> signing/encryption, file I/O over pluggable backends). Usable in production with your own auth
+> provider; some advanced features (Kerberos, leases, multichannel) are still open — see the
+> [Roadmap](#roadmap) at the bottom.
+
+## What it does
+
+- 📁 **File shares** with full NTFS semantics (read, write, rename, delete, locking).
+- 🔐 **Secure by default** — signing required, optional per-share encryption, guest/anonymous rejected.
+- 🔑 **Real login** via NTLMv2; the user source (local, LDAP/AD …) is freely pluggable.
+- 🧩 **Modular** — plug in your own file backend, auth, lock manager or directory watcher.
+- 🖥️ **Cross-platform** — tested on Windows and Linux (deployment target e.g. TrueNAS/ZFS).
+
+## Installation
+
+The library ships as several NuGet packages. To get started you only need the host package — it
+pulls in the rest (`Smb.Server`, `Smb.FileSystem`, `Smb.Auth`, `Smb.Protocol`, `Smb.Crypto`)
+automatically:
+
+```bash
+dotnet add package Smb.Host
+```
+
+## Quick start
 
 ```csharp
 using System.Net;
@@ -19,160 +40,177 @@ using Smb.FileSystem;
 using Smb.Host;
 
 await using var server = SmbServerBuilder.Create()
-    .WithEndpoint(IPAddress.Any, 445)        // Port frei wählbar (445 ggf. vom OS belegt)
+    .WithEndpoint(IPAddress.Any, 445)        // port is free to choose (445 may be taken by the OS)
     .WithServerName("MYSERVER")
-    .RequireSigning(true)                    // sicherer Default (Context §20)
-    .UseDevAuthentication()                  // NUR Test/Dev — siehe Hinweis unten
+    .RequireSigning(true)                    // secure default
+    .UseDevAuthentication()                  // DEV/TEST ONLY — see note below
     .AddShare(new Share { Name = "Data", Type = ShareType.Disk /*, FileStore = … */ })
     .WithLogger(Console.WriteLine)
     .Build();
 
 await server.StartAsync();
-Console.WriteLine($"Lauscht auf {server.Endpoint}");
+Console.WriteLine($"Listening on {server.Endpoint}");
 Console.ReadLine();
 await server.StopAsync();
 ```
 
-> ⚠️ `UseDevAuthentication()` akzeptiert **jede** Anmeldung anonym und ist ausschließlich für
-> Tests/Entwicklung gedacht. In Produktion einen echten Auth-Provider setzen:
-> `.UseAuthentication(meinNtlmOderKerberosNegotiator)`.
+> ⚠️ `UseDevAuthentication()` accepts **any** login anonymously and is meant for testing/development only.
 
-## Beispielprojekt
+### With real login and a file backend
 
-Ein lauffähiges Beispiel liegt unter [`examples/Smb.Sample.Server`](examples/Smb.Sample.Server/Program.cs):
-echter **NTLM-Login** + ordner-basierter Share (relativer `shared/`-Ordner). Es startet den Server,
-führt einen **TCP-Selbsttest** aus (anmelden → Verzeichnis listen → Datei lesen) und bleibt laufen.
-
-```bash
-dotnet run --project examples/Smb.Sample.Server
-# Anmeldung:    WORKGROUP\demo / demo123
-# === Selbsttest (echter TCP-Client) ===
-# Login als WORKGROUP\demo: OK
-# Login mit falschem Passwort wird abgelehnt: OK
-# Dateien im Share: ., notizen.txt, welcome.txt
-# Inhalt von welcome.txt: Hallo aus dem SMB-Share! …
-```
-
-So konfiguriert man echtes Login + Datei-Backend in eigenem Code:
+This wires up real NTLM login and serves a folder as a share:
 
 ```csharp
+using Smb.Auth;
+
 var users = new InMemoryIdentityBackend().AddUser("WORKGROUP", "demo", "demo123");
+
 await using var server = SmbServerBuilder.Create()
     .WithEndpoint(IPAddress.Any, 445)
-    .UseAuthentication(new NtlmSpnegoNegotiator(users, new NtlmServerOptions { NetbiosDomainName = "WORKGROUP" }))
+    .UseAuthentication(new NtlmSpnegoNegotiator(users,
+        new NtlmServerOptions { NetbiosDomainName = "WORKGROUP" }))
     .AddShare(new Share { Name = "Files", Type = ShareType.Disk,
-                          FileStore = new LocalFileStore(@"C:\daten\freigabe", readOnly: true) })
+                          FileStore = new LocalFileStore(@"C:\data\share", readOnly: true) })
     .Build();
+
 await server.StartAsync();
 ```
 
-## Architektur
+Instead of `InMemoryIdentityBackend` you can plug in any user source (LDAP, AD, a database …) — see
+[Modular authentication](#modular-authentication).
 
-Strikte Schichtung *Parse ↔ State ↔ Effect* (Context §2) — jede Schicht ein eigenes Projekt,
-ohne Zyklen:
+## Example project
 
-| Projekt | Inhalt |
-|---|---|
-| **Smb.Protocol** | Reine Wire-Typen: NBSS-Framing, SMB2-Header (sync/async), Enums, Negotiate/SessionSetup/TreeConnect/Echo, Transform-Header. Span-basiert, Little-Endian. Kein I/O, kein State. |
-| **Smb.Crypto** | Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD-Transform (AES-CCM/GCM 128/256), SP800-108-KDF, SMB-3-Key-Derivation, SHA-512-Preauth-Hash, MD4 + NTLMv2-Krypto. |
-| **Smb.Auth** | GSS/SPNEGO-Abstraktion: `IGssMechanism`, `ISpnegoNegotiator`, `IIdentityBackend`. SPNEGO-Token-Kodierung (ASN.1-DER), OIDs, In-Memory-Backend, Dev-Negotiator. |
-| **Smb.FileSystem** | `IShare` / `IFileStore`-Backend-Abstraktion (NTFS-Semantik auf beliebiges Backend). |
-| **Smb.Server** | Zustandsmodell (Connection/Session/TreeConnect/Open), Credit-Logik, Negotiate-Prozessor, Command-Dispatcher (Empfangs-Pipeline §19.1). |
-| **Smb.Host** | TCP-Listener (Default 445), per-Connection-Lese-Loop, NBSS-/Transform-Handling, Fluent-Builder. |
+A runnable example lives under [`examples/Smb.Sample.Server`](examples/Smb.Sample.Server/Program.cs):
+real **NTLM login** + a folder-based share. It starts the server, runs a TCP self-test
+(log in → list directory → read file) and stays running.
 
-### Modulare Authentifizierung (Kern der Anforderung)
-
-SESSION_SETUP spricht **nur** mit `ISpnegoNegotiator`. Neue Mechanismen = neues
-`IGssMechanism` registrieren; neue Identitätsquelle (z.B. LDAP/AD) = neues `IIdentityBackend` —
-**ohne Eingriff** in Protokoll- oder Server-Schicht (Context §9).
-
-```
-ISpnegoNegotiator  ──>  IGssMechanism (NTLM heute, Kerberos später)
-                                │
-                                └──>  IIdentityBackend (lokal heute, LDAP/AD später)
+```bash
+dotnet run --project examples/Smb.Sample.Server
+# Login: WORKGROUP\demo / demo123
 ```
 
-## Sicherheits-Defaults (Context §20)
+## Security
 
-- SMB1-Dateizugriff **aus** (nur Negotiate-Upgrade-Pfad vorgesehen).
-- **Signing erforderlich** per Default; 3.1.1 bevorzugt mit **Preauth-Integrity** (SHA-512).
-- Cipher-Präferenz **AES-128-GCM** > AES-256-GCM > AES-128-CCM > AES-256-CCM.
-- Signing-Präferenz **AES-GMAC** > AES-CMAC > HMAC-SHA256.
-- **Guest/Anonymous standardmäßig abgelehnt.**
-- **Per-Share-Verschlüsselung** erzwingbar (`Share.EncryptData`): Antworten werden verschlüsselt,
-  und unverschlüsselte Zugriffe auf einen verschlüsselten Tree werden mit `RejectUnencryptedAccess`
-  (Default an) abgelehnt; ein verschlüsselter Share auf einer Verbindung ohne 3.x-Cipher → `ACCESS_DENIED`.
-- Krypto ausschließlich über die .NET-BCL (`System.Security.Cryptography`).
+The library is secure out of the box — you don't have to switch security on first:
 
-> **Sicherheits-Audit:** Stand und offene Punkte siehe [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md)
-> (behobene Findings sind im Code mit `[AUDIT-2026-06]` markiert und durch `AuditFixTests` abgesichert).
-> Noch offen u.a.: NTLM-MIC-Verifikation (O1), 3.1.1-Negotiate-Validierung (O3), Credit-Buchhaltung (O6).
-> ⚠️ AES-256-Key-Derivation (M3) vor Kerberos-Einsatz gegen eine echte Windows-Interop-Aufzeichnung gegenprüfen.
+- **Signing required** by default; SMB 3.1.1 preferred with preauth integrity (SHA-512).
+- **Per-share encryption** enforceable (`Share.EncryptData`); unencrypted access is rejected.
+- **Guest/anonymous** rejected by default, **SMB1 file access** off.
+- Crypto exclusively via the .NET BCL (`System.Security.Cryptography`).
 
-## Verifikation
+For the details, algorithm preferences and the security-audit status see
+[Security defaults & audit](#security-defaults--audit).
 
-Build & Tests:
+## Contributing
+
+Build and tests run with a single command:
 
 ```bash
 dotnet test
 ```
 
-**CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) baut und testet bei jedem Push/PR auf
-Linux **und** Windows (Gate — ein roter Build oder Test blockiert). Liegt die Git-Wurzel oberhalb von
-`SmbServer/`, den `.github`-Ordner entsprechend eine Ebene höher schieben.
+Every push and pull request is built and tested on **Linux and Windows** via
+[GitHub Actions](.github/workflows/ci.yml) — a red build blocks.
 
-Die Suite (150 Tests) deckt u.a. ab:
+---
 
-- **Offizielle Krypto-Vektoren:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5),
-  NTOWFv2 (MS-NLMP §4.2-Beispiel).
-- Wire-Roundtrips: Header (sync/async), NBSS (Big-Endian-Längenpräfix), Negotiate-Contexts
-  (8-Byte-Alignment, Offset-Korrektheit).
-- Krypto: KDF-Determinismus, Schlüssel-Ableitung (3.0/3.1.1, AES-128/256, `ServerIn `-Label
-  mit Leerzeichen), Sign/Verify + Tamper-Erkennung (alle 3 Algorithmen), Transform-Roundtrip
-  + AEAD-Tag-Prüfung, Preauth-Hash-Kette.
-- Server end-to-end: NEGOTIATE → SESSION_SETUP → TREE_CONNECT → ECHO; Dialektwahl;
-  Cipher-/Signing-Aushandlung; Signaturpflicht (signiert akzeptiert, unsigniert abgelehnt);
-  Guest-Ablehnung; TCP-Integration über echtes NBSS.
-- Per-Share-Encryption: Tree-Markierung + ShareFlags, Klartext-Request auf verschlüsseltem Tree
-  abgelehnt (`RejectUnencryptedAccess`), Encrypted-Share-Connect ohne Cipher abgelehnt, und der
-  Host liefert die TREE_CONNECT-Antwort eines verschlüsselten Shares als TRANSFORM-Frame zurück.
-- Oplocks: Grant des angeforderten Levels auf einem Solo-Open (Batch/Exclusive), Herabstufung auf
-  Level II + OPLOCK_BREAK-Notification bei einem zweiten Open derselben Datei, Acknowledgment-Quittung,
-  Freigabe beim CLOSE; Lease-Break-Acknowledgment (noch) → `STATUS_NOT_SUPPORTED`.
-- Audit-Fixes (`AuditFixTests`): LOGOFF-Signaturpflicht, MessageId-Sequenzfenster (Replay/Out-of-Window
-  abgelehnt), MaximalAccess-Durchsetzung beim CREATE, Obergrenze ausstehender async-Operationen.
-- Pfad-Sandbox (`SymlinkSandboxTests`): Symlink/Reparse-Point innerhalb des Shares, der nach außen
-  zeigt, wird verweigert (Datei **und** Verzeichnis); normaler In-Root-Zugriff bleibt erlaubt (H4).
-- QUERY_DIRECTORY-Paging + stabile FileId (`QueryDirectoryPagingTests`, O2): großes Verzeichnis über
-  mehrere Seiten, Single-Entry, Buffer zu klein → `INFO_LENGTH_MISMATCH`.
-- Share-Modes / Persistentes Handle (`ShareModeManagerTests`, `LocalFileStoreHandleTests`,
-  `QueryDirectoryPagingTests`, O5): Sharing-Violation bei unverträglichem Zweit-Open + Freigabe nach
-  CLOSE; Read/Write/DeleteOnClose/Rename-while-open über ein dauerhaftes OS-Handle; stabile FileId.
+# For developers & background
+
+The rest of this document is a technical reference for contributors and the curious. You don't need
+it for normal use of the library.
+
+## Architecture
+
+Strict *Parse ↔ State ↔ Effect* layering — each layer its own project, no cycles:
+
+| Project | Contents |
+|---|---|
+| **Smb.Protocol** | Pure wire types: NBSS framing, SMB2 header (sync/async), enums, Negotiate/SessionSetup/TreeConnect/Echo, transform header. Span-based, little-endian. No I/O, no state. |
+| **Smb.Crypto** | Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD transform (AES-CCM/GCM 128/256), SP800-108 KDF, SMB 3 key derivation, SHA-512 preauth hash, MD4 + NTLMv2 crypto. |
+| **Smb.Auth** | GSS/SPNEGO abstraction: `IGssMechanism`, `ISpnegoNegotiator`, `IIdentityBackend`. SPNEGO token encoding (ASN.1 DER), OIDs, in-memory backend, dev negotiator. |
+| **Smb.FileSystem** | `IShare` / `IFileStore` backend abstraction (NTFS semantics over any backend). |
+| **Smb.Server** | State model (Connection/Session/TreeConnect/Open), credit logic, negotiate processor, command dispatcher (receive pipeline). |
+| **Smb.Host** | TCP listener (default 445), per-connection read loop, NBSS/transform handling, fluent builder. |
+
+Foundation and fact-check: [`SMB2-3_Server_Context.md`](../SMB2-3_Server_Context.md).
+
+### Modular authentication
+
+SESSION_SETUP talks **only** to `ISpnegoNegotiator`. New mechanisms = register a new `IGssMechanism`;
+new identity source (e.g. LDAP/AD) = a new `IIdentityBackend` — **without touching** the protocol or
+server layer.
+
+```
+ISpnegoNegotiator  ──>  IGssMechanism (NTLM today, Kerberos later)
+                                │
+                                └──>  IIdentityBackend (local today, LDAP/AD later)
+```
+
+## Security defaults & audit
+
+- SMB1 file access **off** (only the negotiate-upgrade path is provided).
+- **Signing required** by default; 3.1.1 preferred with **preauth integrity** (SHA-512).
+- Cipher preference **AES-128-GCM** > AES-256-GCM > AES-128-CCM > AES-256-CCM.
+- Signing preference **AES-GMAC** > AES-CMAC > HMAC-SHA256.
+- **Guest/anonymous rejected by default.**
+- **Per-share encryption** enforceable (`Share.EncryptData`): responses are encrypted, and
+  unencrypted access to an encrypted tree is rejected with `RejectUnencryptedAccess` (on by default);
+  an encrypted share on a connection without a 3.x cipher → `ACCESS_DENIED`.
+- Crypto exclusively via the .NET BCL (`System.Security.Cryptography`).
+
+> **Security audit:** status and open items in [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md)
+> (fixed findings are marked in code with `[AUDIT-2026-06]` and guarded by `AuditFixTests`).
+> Still open, among others: NTLM MIC verification (O1), 3.1.1 negotiate validation (O3),
+> credit accounting (O6).
+> ⚠️ Cross-check AES-256 key derivation (M3) against a real Windows interop capture before using Kerberos.
+
+## Verification
+
+The suite (150 tests) covers, among others:
+
+- **Official crypto vectors:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5), NTOWFv2 (MS-NLMP §4.2 example).
+- Wire roundtrips: header (sync/async), NBSS (big-endian length prefix), negotiate contexts
+  (8-byte alignment, offset correctness).
+- Crypto: KDF determinism, key derivation (3.0/3.1.1, AES-128/256, `ServerIn ` label with the
+  trailing space), sign/verify + tamper detection (all 3 algorithms), transform roundtrip
+  + AEAD tag check, preauth hash chain.
+- Server end-to-end: NEGOTIATE → SESSION_SETUP → TREE_CONNECT → ECHO; dialect selection;
+  cipher/signing negotiation; signing enforcement (signed accepted, unsigned rejected);
+  guest rejection; TCP integration over real NBSS.
+- Per-share encryption: tree marking + ShareFlags, plaintext request on an encrypted tree
+  rejected (`RejectUnencryptedAccess`), encrypted-share connect without a cipher rejected, and the
+  host returns the TREE_CONNECT response of an encrypted share as a TRANSFORM frame.
+- Oplocks: grant of the requested level on a solo open (Batch/Exclusive), downgrade to
+  Level II + OPLOCK_BREAK notification on a second open of the same file, acknowledgment,
+  release on CLOSE; lease-break acknowledgment (still) → `STATUS_NOT_SUPPORTED`.
+- Audit fixes (`AuditFixTests`): LOGOFF signing enforcement, MessageId sequence window
+  (replay/out-of-window rejected), MaximalAccess enforcement on CREATE, cap on pending async operations.
+- Path sandbox (`SymlinkSandboxTests`): a symlink/reparse point inside the share that points outside
+  is denied (file **and** directory); normal in-root access stays allowed (H4).
+- QUERY_DIRECTORY paging + stable FileId (`QueryDirectoryPagingTests`, O2): large directory across
+  multiple pages, single entry, buffer too small → `INFO_LENGTH_MISMATCH`.
+- Share modes / persistent handle (`ShareModeManagerTests`, `LocalFileStoreHandleTests`,
+  `QueryDirectoryPagingTests`, O5): sharing violation on an incompatible second open + release after
+  CLOSE; read/write/DeleteOnClose/rename-while-open over a persistent OS handle; stable FileId.
 
 ## Roadmap
 
-| Meilenstein | Status |
+| Milestone | Status |
 |---|---|
-| M1 Transport & Parsing | ✅ |
-| M2 Negotiate (inkl. 3.1.1-Contexts, Preauth-Hash) | ✅ |
-| M3 Auth (SPNEGO + **echtes NTLMv2-Login**, Key-Derivation, Signing) | ✅ (MIC-Verifikation noch offen) |
-| M4 Tree & Dateizugriff (CREATE/READ/QUERY_DIRECTORY/QUERY_INFO/CLOSE) | ✅ über `LocalFileStore` |
-| M5 Schreiben (WRITE, SET_INFO/Rename/Delete ✅; **Byte-Range-LOCK ✅** inkl. blockierend + CANCEL, austauschbarer `ILockManager`) | ✅ |
-| M6 Encryption & Härtung (Transform-Pfad) | ✅ Per-Share-Encryption verdrahtet (Tree-`EncryptData`, Antwort-Verschlüsselung inkl. TREE_CONNECT-Response) + Härtung: `RejectUnencryptedAccess` (Default an) lehnt Klartext-Zugriff auf verschlüsselte Trees ab; Encrypted-Share-Connect ohne 3.x-Cipher → `ACCESS_DENIED` |
-| Share-Enumeration (srvsvc NetrShareEnum über DCERPC/IPC$, IOCTL FSCTL_PIPE_TRANSCEIVE) | ✅ |
-| SMB1→SMB2 Negotiate-Upgrade (§6.1, für impacket u.a.) | ✅ |
-| M7 **CHANGE_NOTIFY ✅** (austauschbarer `IDirectoryWatcher`); **Oplocks ✅** (austauschbarer `IOplockManager`: Grant + OPLOCK_BREAK-Notification + Acknowledgment + Freigabe); **Leases** & Compound-Feinschliff offen | 🟡 |
-| Native Windows-Explorer-Interop (volle FSCC/IOCTL-Abdeckung, Secure Negotiate) | ⬜ |
-| M8 Kerberos, LDAP-Backend, Multichannel, Durable Handles, DFS, QUIC, RDMA | ⬜ |
+| M1 Transport & parsing | ✅ |
+| M2 Negotiate (incl. 3.1.1 contexts, preauth hash) | ✅ |
+| M3 Auth (SPNEGO + **real NTLMv2 login**, key derivation, signing) | ✅ (MIC verification still open) |
+| M4 Tree & file access (CREATE/READ/QUERY_DIRECTORY/QUERY_INFO/CLOSE) | ✅ via `LocalFileStore` |
+| M5 Writing (WRITE, SET_INFO/Rename/Delete ✅; **byte-range LOCK ✅** incl. blocking + CANCEL, pluggable `ILockManager`) | ✅ |
+| M6 Encryption & hardening (transform path) | ✅ Per-share encryption wired (tree `EncryptData`, response encryption incl. TREE_CONNECT response) + hardening: `RejectUnencryptedAccess` (on by default) rejects plaintext access to encrypted trees; encrypted-share connect without a 3.x cipher → `ACCESS_DENIED` |
+| Share enumeration (srvsvc NetrShareEnum over DCERPC/IPC$, IOCTL FSCTL_PIPE_TRANSCEIVE) | ✅ |
+| SMB1→SMB2 negotiate upgrade (§6.1, for impacket et al.) | ✅ |
+| M7 **CHANGE_NOTIFY ✅** (pluggable `IDirectoryWatcher`); **oplocks ✅** (pluggable `IOplockManager`: grant + OPLOCK_BREAK notification + acknowledgment + release); **leases** & compound polish open | 🟡 |
+| Native Windows Explorer interop (full FSCC/IOCTL coverage, Secure Negotiate) | ⬜ |
+| M8 Kerberos, LDAP backend, multichannel, durable handles, DFS, QUIC, RDMA | ⬜ |
 
-### Nächste konkrete Schritte für ein lesendes Share
+## License note
 
-1. `IFileStore`-Implementierung auf lokales Dateisystem (Backend-Handles, NT-Zeiten/Attribute).
-2. CREATE-Handler (Disposition, Sharing-Violation, Create-Contexts `MxAc`/`QFid`).
-3. QUERY_DIRECTORY (`FileIdBothDirectoryInformation`), QUERY_INFO, READ, CLOSE.
-4. Echter NTLMv2-`IGssMechanism` über die vorhandene `Smb.Crypto.NtlmCryptography`.
-
-## Lizenzhinweis
-
-Die zugrunde liegenden Microsoft Open Specifications stehen unter der Open Specifications
-Promise. Strukturen/Konstanten wurden neu implementiert (keine wörtlichen Textübernahmen).
+The underlying Microsoft Open Specifications are covered by the Open Specifications Promise.
+Structures/constants were reimplemented (no verbatim text was copied).
