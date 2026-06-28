@@ -19,7 +19,11 @@ The library was created based on the official Microsoft Specifications (MS-ERREF
 The library is available via download of the source files or as nuget package.
 URL is coming...
 
-# For developers & background
+## Using the library
+
+You will find an example with different usages under /examples.
+
+# More background
 
 The rest of this document is a technical reference for contributors and the curious. You don't need
 it for normal use of the library.
