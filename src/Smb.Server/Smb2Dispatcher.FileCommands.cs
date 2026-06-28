@@ -10,13 +10,13 @@ using Smb.Server.State;
 namespace Smb.Server;
 
 /// <summary>
-/// Datei-Commands (M4, Context §13–§16): CREATE, CLOSE, READ, WRITE, QUERY_DIRECTORY,
-/// QUERY_INFO über ein <see cref="IFileStore"/>-Backend. Read-Only-Browse funktioniert
-/// vollständig; Schreiben je nach Backend-Konfiguration.
+/// File commands (M4, Context §13–§16): CREATE, CLOSE, READ, WRITE, QUERY_DIRECTORY,
+/// QUERY_INFO via an <see cref="IFileStore"/> backend. Read-only browsing works
+/// fully; writing depends on backend configuration.
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
-    // Access-Mask-Bits (Context §13.1).
+    // Access mask bits (Context §13.1).
     private const uint FileReadData = 0x00000001, FileWriteData = 0x00000002, FileAppendData = 0x00000004;
     private const uint Delete = 0x00010000, GenericRead = 0x80000000, GenericWrite = 0x40000000;
     private const uint GenericAll = 0x10000000, MaximumAllowed = 0x02000000;
@@ -32,7 +32,7 @@ public sealed partial class Smb2Dispatcher
         }
         if (tree.Share.FileStore is null)
         {
-            error = NtStatus.NotSupported; // z.B. IPC$ ohne Datei-Backend
+            error = NtStatus.NotSupported; // e.g. IPC$ without a file backend
             return false;
         }
         store = tree.Share.FileStore;
@@ -51,7 +51,7 @@ public sealed partial class Smb2Dispatcher
         if (!session.TreeConnects.TryGetValue(header.TreeId, out SmbTreeConnect? tree))
             return BuildError(header, NtStatus.NetworkNameDeleted);
 
-        // Named-Pipe-Share (IPC$): DCERPC-Pipe öffnen statt Datei-Backend.
+        // Named-pipe share (IPC$): open a DCERPC pipe instead of using the file backend.
         if (tree.Share.Type == ShareType.Pipe)
             return HandlePipeCreate(connection, header, session, tree, segment);
 
@@ -60,12 +60,13 @@ public sealed partial class Smb2Dispatcher
 
         CreateRequest request = CreateRequest.Parse(segment, Smb2Header.Size);
 
-        // [AUDIT-2026-06] DesiredAccess gegen die von der Autorisierungs-Policy gewährte MaximalAccess
-        // durchsetzen (§3.3.5.9). Zuvor wurde DesiredAccess ungefiltert gewährt → eine Policy mit
-        // reduzierten Rechten (z.B. ReadOnly pro User/Gruppe) war für Datei-Operationen wirkungslos;
-        // nur das globale readOnly-Flag des FileStore begrenzte. MAXIMUM_ALLOWED gewährt genau die
-        // erlaubte Maske. Vergleich auf Intent-Ebene (Read/Write/Delete), um Generic-Bits korrekt zu
-        // behandeln. Siehe docs/SECURITY_AUDIT.md (Finding H3).
+        // [AUDIT-2026-06] Enforce DesiredAccess against the MaximalAccess granted by the
+        // authorization policy (§3.3.5.9). Previously DesiredAccess was granted unfiltered →
+        // a policy with reduced rights (e.g. ReadOnly per user/group) had no effect on file
+        // operations; only the global readOnly flag of the FileStore limited access.
+        // MAXIMUM_ALLOWED grants exactly the permitted mask. Comparison at intent level
+        // (Read/Write/Delete) to handle generic bits correctly.
+        // See docs/SECURITY_AUDIT.md (Finding H3).
         FileAccessIntent allowedIntent = MapAccess(tree.MaximalAccess);
         bool maximumAllowed = (request.DesiredAccess & MaximumAllowed) != 0;
         FileAccessIntent access = maximumAllowed ? allowedIntent : MapAccess(request.DesiredAccess);
@@ -100,8 +101,8 @@ public sealed partial class Smb2Dispatcher
         session.Opens[open.Key] = open;
         Interlocked.Increment(ref tree.OpenCount);
 
-        // Oplock anfordern (Context §15): Der Manager bestimmt das gewährte Level und liefert die
-        // durch diesen Open fälligen Breaks an andere Halter, die out-of-band benachrichtigt werden.
+        // Request oplock (Context §15): the manager determines the granted level and delivers
+        // any breaks due to other holders, who are notified out-of-band.
         OplockGrant grant = _server.Options.OplockManager.RequestOplock(open, request.RequestedOplockLevel);
         open.OplockLevel = grant.GrantedLevel;
         DispatchOplockBreaks(grant.Breaks);
@@ -131,11 +132,11 @@ public sealed partial class Smb2Dispatcher
         CreateRequest request = CreateRequest.Parse(segment, Smb2Header.Size);
         string pipeName = request.Name.TrimStart('\\');
 
-        // Aktuell nur srvsvc (Share-Enumeration). Andere Pipes → nicht gefunden.
+        // Currently only srvsvc (share enumeration). Other pipes → not found.
         if (!pipeName.Equals("srvsvc", StringComparison.OrdinalIgnoreCase))
             return BuildError(header, NtStatus.ObjectNameNotFound);
 
-        // Sichtbare Shares (über die Autorisierungs-Policy gefiltert) als Enumerationsquelle.
+        // Visible shares (filtered by the authorization policy) as the enumeration source.
         var entries = new List<ShareEntry>();
         foreach (IShare share in _server.GetVisibleShares(session.Identity ?? AnonymousIdentity, connection))
             entries.Add(new ShareEntry(share.Name, SrvsvcEndpoint.MapStype(share.Type), share.Remark));
@@ -175,7 +176,7 @@ public sealed partial class Smb2Dispatcher
 
         IoctlMessage.Request req = IoctlMessage.ParseRequest(segment, Smb2Header.Size);
 
-        // FSCTL_PIPE_TRANSCEIVE: DCERPC-Request → Response über die Named Pipe.
+        // FSCTL_PIPE_TRANSCEIVE: DCERPC request → response via the named pipe.
         if (req.CtlCode == IoctlMessage.FsctlPipeTransceive
             && TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open)
             && open.Pipe is { } pipe)
@@ -185,7 +186,7 @@ public sealed partial class Smb2Dispatcher
                 IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
         }
 
-        // FSCTL_SRV_ENUMERATE_SNAPSHOTS: „Vorherige Versionen" eines versionierten Shares auflisten.
+        // FSCTL_SRV_ENUMERATE_SNAPSHOTS: list "Previous Versions" of a versioned share.
         if (req.CtlCode == IoctlMessage.FsctlSrvEnumerateSnapshots)
             return HandleEnumerateSnapshots(header, session, req);
 
@@ -193,9 +194,9 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
-    /// Beantwortet FSCTL_SRV_ENUMERATE_SNAPSHOTS, wenn das Share-Backend Snapshots vorhält
-    /// (<see cref="ISnapshotStore"/>). Der Pfad des offenen Handles bestimmt, für welche Datei
-    /// (bzw. bei der Wurzel: für alle Dateien) die <c>@GMT-…</c>-Token geliefert werden.
+    /// Handles FSCTL_SRV_ENUMERATE_SNAPSHOTS when the share backend provides snapshots
+    /// (<see cref="ISnapshotStore"/>). The path of the open handle determines for which file
+    /// (or, at the root, for all files) the <c>@GMT-…</c> tokens are returned.
     /// </summary>
     private ResponseSegment HandleEnumerateSnapshots(Smb2Header header, SmbSession session, IoctlMessage.Request req)
     {
@@ -254,7 +255,7 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
 
-        // Named-Pipe-READ: liefert die gepufferte DCERPC-Antwort (Write→Read-Muster).
+        // Named-pipe READ: deliver the buffered DCERPC response (Write→Read pattern).
         if (open.Pipe is { } pipe)
             return MaybeSigned(session, RespHeader(header, session), ReadMessage.BuildResponseBody(pipe.TakeOutput()));
 
@@ -286,7 +287,7 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
 
-        // Named-Pipe-WRITE: DCERPC-Request verarbeiten, Antwort puffern (für nachfolgendes READ).
+        // Named-pipe WRITE: process the DCERPC request and buffer the response (for the subsequent READ).
         if (open.Pipe is { } pipe)
         {
             pipe.Transceive(req.Data);
@@ -323,7 +324,7 @@ public sealed partial class Smb2Dispatcher
         if ((req.Flags & QueryDirectoryMessage.FlagRestartScan) != 0)
             open.DirectoryEnumStarted = false;
 
-        // Zweite Abfrage ohne Restart → Ende (Context §14).
+        // Second query without restart → end (Context §14).
         if (open.DirectoryEnumStarted)
             return BuildError(header, NtStatus.NoMoreFiles);
 
@@ -341,7 +342,7 @@ public sealed partial class Smb2Dispatcher
 
         byte[] buffer = FsccStructures.BuildDirectoryListing(stats, req.InfoClass);
         if (buffer.Length > req.OutputBufferLength)
-            return BuildError(header, NtStatus.InvalidParameter); // Puffer zu klein (vereinfachte Phase-1-Variante)
+            return BuildError(header, NtStatus.InvalidParameter); // buffer too small (simplified phase-1 variant)
 
         open.DirectoryEnumStarted = true;
         return MaybeSigned(session, RespHeader(header, session), QueryDirectoryMessage.BuildResponseBody(buffer));
@@ -397,7 +398,7 @@ public sealed partial class Smb2Dispatcher
             FileInformationClass.FileDispositionInformation =>
                 store.SetDeleteOnClose(open.LocalOpen, req.Buffer.Length > 0 && req.Buffer[0] != 0),
             FileInformationClass.FileRenameInformation => DoRename(store, open.LocalOpen, req.Buffer),
-            // Zeiten/Attribute/Allocation akzeptieren wir (kein hartes Setzen nötig fürs Browsen/Schreiben).
+            // Times/attributes/allocation are accepted (no hard setting needed for browsing/writing).
             FileInformationClass.FileBasicInformation => NtStatus.Success,
             FileInformationClass.FileAllocationInformation => NtStatus.Success,
             FileInformationClass.FilePositionInformation => NtStatus.Success,
@@ -436,7 +437,7 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), body);
     }
 
-    // --- Hilfsfunktionen ---
+    // --- Helper functions ---
 
     private Smb2Header RespHeader(Smb2Header request, SmbSession session)
     {

@@ -3,16 +3,16 @@ using Smb.Protocol.Enums;
 namespace Smb.Server;
 
 /// <summary>
-/// Credit-/Flusskontroll-Logik (Context §7, MS-SMB2 §3.3.1.2). Berechnet CreditCharge
-/// für Multi-Credit-Operationen und entscheidet, wie viele Credits zu gewähren sind.
+/// Credit/flow-control logic (Context §7, MS-SMB2 §3.3.1.2). Calculates CreditCharge
+/// for multi-credit operations and decides how many credits to grant.
 /// </summary>
 public static class CreditManager
 {
     private const int CreditUnit = 65536; // 64 KiB pro Credit.
 
     /// <summary>
-    /// CreditCharge = ceil(max(SendPayload, ExpectedReceivePayload) / 65536), mind. 1.
-    /// Bei 2.0.2 immer 0 (ein implizites Credit je Request, Context §7).
+    /// CreditCharge = ceil(max(SendPayload, ExpectedReceivePayload) / 65536), minimum 1.
+    /// For 2.0.2 always 0 (one implicit credit per request, Context §7).
     /// </summary>
     public static ushort ComputeCreditCharge(SmbDialect dialect, int sendPayload, int expectedReceivePayload)
     {
@@ -24,15 +24,15 @@ public static class CreditManager
     }
 
     /// <summary>
-    /// Bestimmt die zu gewährenden Credits: mindestens so viele wie angefordert (damit der
-    /// Client Fortschritt macht), aber gedeckelt (Context §7: "großzügig, aber gedeckelt").
-    /// Mindestens 1.
+    /// Determines the credits to grant: at least as many as requested (so the client makes
+    /// progress), but capped (Context §7: "generous, but capped").
+    /// Minimum 1.
     /// </summary>
     public static ushort ComputeCreditGrant(ushort requested, ushort cap)
     {
-        // Großzügig gewähren, damit der Client schnell ein Credit-Polster aufbaut und auch
-        // Multi-Credit-Operationen (große READ/WRITE/IOCTL, je ~CreditCharge Credits) absenden
-        // kann. Sparsame Vergabe führt sonst zum Deadlock (Context §7). Mindestfloor, gedeckelt.
+        // Grant generously so the client quickly builds up a credit buffer and can also send
+        // multi-credit operations (large READ/WRITE/IOCTL, each ~CreditCharge credits).
+        // Stingy granting otherwise leads to deadlock (Context §7). Minimum floor, capped.
         const ushort floor = 256;
         int grant = Math.Max(requested, floor);
         if (grant > cap) grant = cap;
@@ -41,7 +41,7 @@ public static class CreditManager
     }
 
     /// <summary>
-    /// Prüft, ob eine MessageId im gültigen Sequenzfenster liegt (Context §7, §19.1 Schritt 3).
+    /// Checks whether a MessageId is within the valid sequence window (Context §7, §19.1 step 3).
     /// </summary>
     public static bool IsWithinWindow(ulong messageId, ulong windowStart, ulong windowSize)
         => messageId >= windowStart && messageId < windowStart + windowSize;

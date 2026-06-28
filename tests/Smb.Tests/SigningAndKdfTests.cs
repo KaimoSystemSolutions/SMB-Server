@@ -20,9 +20,9 @@ public class SigningAndKdfTests
 
         Assert.Equal(16, a.Length);
         Assert.Equal(32, c32.Length);
-        Assert.Equal(a, b); // deterministisch
-        // Hinweis: Die Output-Länge L fließt als [L]₄ in den PRF-Input ein (SP800-108 §5.1),
-        // daher unterscheidet sich der 32-Byte-Output bewusst von zwei verketteten 16-Byte-Outputs.
+        Assert.Equal(a, b); // deterministic
+        // Note: the output length L flows as [L]₄ into the PRF input (SP800-108 §5.1),
+        // so the 32-byte output intentionally differs from two concatenated 16-byte outputs.
         byte[] a2 = Sp800108CounterKdf.DeriveKey(kdk, label, context, 16);
         Assert.Equal(a, a2);
     }
@@ -41,7 +41,7 @@ public class SigningAndKdfTests
         Assert.Equal(16, keys.DecryptionKey.Length);
         Assert.Equal(16, keys.ApplicationKey.Length);
 
-        // Server-Encrypt (S2C) und -Decrypt (C2S) müssen verschieden sein (Context §8.3, §23).
+        // Server-encrypt (S2C) and server-decrypt (C2S) must differ (Context §8.3, §23).
         Assert.NotEqual(keys.EncryptionKey, keys.DecryptionKey);
         Assert.NotEqual(keys.SigningKey, keys.EncryptionKey);
     }
@@ -49,10 +49,10 @@ public class SigningAndKdfTests
     [Fact]
     public void Smb3KeyDerivation_311Aes256_DerivesFrom16ByteSessionKey_NotFullKey()
     {
-        // [AUDIT-2026-06] KDK für ALLE Keys ist die 16-Byte-SessionKey — auch für AES-256-Cipher-Keys
-        // (nur die Output-Länge L wird 256, §3.1.4.2). Beweis: ein ANDERER "voller" GSS-Key darf die
-        // abgeleiteten Keys NICHT verändern. Früher wurde fälschlich der volle Key als KDK genutzt →
-        // dieser Test würde dann fehlschlagen. Siehe docs/SECURITY_AUDIT.md (Finding M3).
+        // [AUDIT-2026-06] KDK for ALL keys is the 16-byte SessionKey — even for AES-256 cipher keys
+        // (only the output length L becomes 256, §3.1.4.2). Proof: a DIFFERENT "full" GSS key must
+        // NOT change the derived keys. Previously the full key was incorrectly used as the KDK →
+        // this test would then fail. See docs/SECURITY_AUDIT.md (Finding M3).
         byte[] sessionKey16 = RandomNumberGenerator.GetBytes(16);
         byte[] preauth = RandomNumberGenerator.GetBytes(64);
         byte[] fullKeyA = RandomNumberGenerator.GetBytes(32);
@@ -61,24 +61,24 @@ public class SigningAndKdfTests
         Smb3SessionKeys a = Smb3KeyDerivation.Derive(SmbDialect.Smb311, SmbCipherId.Aes256Gcm, sessionKey16, fullKeyA, preauth);
         Smb3SessionKeys b = Smb3KeyDerivation.Derive(SmbDialect.Smb311, SmbCipherId.Aes256Gcm, sessionKey16, fullKeyB, preauth);
 
-        Assert.Equal(16, a.SigningKey.Length);    // Signing bleibt AES-128.
-        Assert.Equal(32, a.EncryptionKey.Length); // AES-256 → 32-Byte-Output ...
+        Assert.Equal(16, a.SigningKey.Length);    // Signing stays AES-128.
+        Assert.Equal(32, a.EncryptionKey.Length); // AES-256 → 32-byte output ...
         Assert.Equal(32, a.DecryptionKey.Length);
-        Assert.Equal(a.EncryptionKey, b.EncryptionKey); // ... aber unabhängig vom vollen GSS-Key.
+        Assert.Equal(a.EncryptionKey, b.EncryptionKey); // ... but independent of the full GSS key.
         Assert.Equal(a.DecryptionKey, b.DecryptionKey);
     }
 
     [Fact]
     public void Smb30_DecryptionKeyLabel_HasSpaceBeforeNul()
     {
-        // Der "ServerIn "-Context (Leerzeichen vor NUL) muss eine andere DecryptionKey liefern,
-        // als wenn fälschlich "ServerIn\0" (ohne Leerzeichen) verwendet würde (Context §23).
+        // The "ServerIn " context (space before NUL) must produce a different DecryptionKey
+        // than if "ServerIn\0" (without space) were incorrectly used (Context §23).
         byte[] sessionKey = RandomNumberGenerator.GetBytes(16);
         Smb3SessionKeys keys = Smb3KeyDerivation.Derive(
             SmbDialect.Smb300, SmbCipherId.Aes128Ccm, sessionKey, sessionKey, []);
 
         byte[] wrongLabel = "SMB2AESCCM\0"u8.ToArray();
-        byte[] wrongContext = "ServerIn\0"u8.ToArray(); // ohne Leerzeichen!
+        byte[] wrongContext = "ServerIn\0"u8.ToArray(); // without space!
         byte[] wrong = Sp800108CounterKdf.DeriveKey(sessionKey, wrongLabel, wrongContext, 16);
 
         Assert.NotEqual(wrong, keys.DecryptionKey);
@@ -91,7 +91,7 @@ public class SigningAndKdfTests
     public void Signer_SignThenVerify_Succeeds(SmbSigningAlgorithmId alg)
     {
         byte[] key = RandomNumberGenerator.GetBytes(16);
-        byte[] message = RandomNumberGenerator.GetBytes(128); // ≥64 (Header) + Body
+        byte[] message = RandomNumberGenerator.GetBytes(128); // ≥64 (header) + body
         ulong messageId = 7;
 
         Smb2Signer.SignInPlace(alg, key, message, messageId, isServer: true, isCancel: false);
@@ -108,15 +108,15 @@ public class SigningAndKdfTests
         byte[] message = RandomNumberGenerator.GetBytes(96);
         Smb2Signer.SignInPlace(alg, key, message, 1, isServer: true, isCancel: false);
 
-        message[80] ^= 0xFF; // Body-Byte verfälschen
+        message[80] ^= 0xFF; // corrupt body byte
         Assert.False(Smb2Signer.Verify(alg, key, message, 1, isServer: true, isCancel: false));
     }
 
     [Fact]
     public void Gmac_ServerAndClientNonces_Differ()
     {
-        // Dieselbe Nachricht, aber isServer-Flag unterschiedlich → Signaturen müssen differieren
-        // (Nonce-LSB unterscheidet Server von Client, Context §10).
+        // Same message but different isServer flag → signatures must differ
+        // (nonce LSB distinguishes server from client, Context §10).
         byte[] key = RandomNumberGenerator.GetBytes(16);
         byte[] message = RandomNumberGenerator.GetBytes(64);
 

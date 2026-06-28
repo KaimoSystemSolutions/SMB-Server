@@ -4,7 +4,7 @@ using Smb.Protocol.Wire;
 
 namespace Smb.Server.Rpc;
 
-/// <summary>DCERPC-PDU-Typen (Connection-oriented, C706 / MS-RPCE §2.2.2.3).</summary>
+/// <summary>DCERPC PDU types (connection-oriented, C706 / MS-RPCE §2.2.2.3).</summary>
 public enum DcerpcPduType : byte
 {
     Request = 0,
@@ -17,18 +17,18 @@ public enum DcerpcPduType : byte
     AlterContextResp = 15,
 }
 
-/// <summary>Geparster DCERPC-PDU-Kopf plus (bei Request) Opnum und Stub.</summary>
+/// <summary>Parsed DCERPC PDU header plus (for requests) opnum and stub.</summary>
 public readonly record struct DcerpcRequest(DcerpcPduType Type, uint CallId, ushort Opnum, byte[] Stub);
 
 /// <summary>
-/// Minimaler Connection-oriented DCERPC-Layer (MS-RPCE). Genug, um einen Bind zu bestätigen und
-/// einen Request an einen Endpoint weiterzureichen. Little-Endian (packed_drep 10 00 00 00).
+/// Minimal connection-oriented DCERPC layer (MS-RPCE). Enough to acknowledge a bind and
+/// forward a request to an endpoint. Little-endian (packed_drep 10 00 00 00).
 /// </summary>
 public static class Dcerpc
 {
     public const int HeaderSize = 16;
 
-    /// <summary>NDR-Transfer-Syntax 8a885d04-1ceb-11c9-9fe8-08002b104860 v2.0 (16 Byte UUID).</summary>
+    /// <summary>NDR transfer syntax 8a885d04-1ceb-11c9-9fe8-08002b104860 v2.0 (16-byte UUID).</summary>
     public static ReadOnlySpan<byte> NdrTransferSyntax =>
     [
         0x04, 0x5D, 0x88, 0x8A, 0xEB, 0x1C, 0xC9, 0x11,
@@ -38,7 +38,7 @@ public static class Dcerpc
     public static DcerpcRequest Parse(ReadOnlySpan<byte> pdu)
     {
         if (pdu.Length < HeaderSize)
-            throw new SmbWireFormatException("DCERPC-PDU zu kurz.");
+            throw new SmbWireFormatException("DCERPC PDU too short.");
 
         var type = (DcerpcPduType)pdu[2];
         uint callId = BinaryPrimitives.ReadUInt32LittleEndian(pdu.Slice(12, 4));
@@ -58,7 +58,7 @@ public static class Dcerpc
         return new DcerpcRequest(type, callId, 0, []);
     }
 
-    /// <summary>Baut eine BIND_ACK-PDU mit einer akzeptierten Präsentation (NDR).</summary>
+    /// <summary>Builds a BIND_ACK PDU with one accepted presentation (NDR).</summary>
     public static byte[] BuildBindAck(uint callId, string secondaryAddress)
     {
         byte[] secAddr = Encoding.ASCII.GetBytes(secondaryAddress + "\0");
@@ -67,12 +67,12 @@ public static class Dcerpc
         WriteHeader(w, DcerpcPduType.BindAck, callId);
         w.WriteUInt16(4280);          // max_xmit_frag
         w.WriteUInt16(4280);          // max_recv_frag
-        w.WriteUInt32(0x00000053);    // assoc_group_id (beliebig, ≠0)
+        w.WriteUInt32(0x00000053);    // assoc_group_id (arbitrary, ≠0)
         w.WriteUInt16((ushort)secAddr.Length);
         w.WriteBytes(secAddr);
         AlignTo4(w);
 
-        // p_result_list: 1 Ergebnis (acceptance) mit NDR-Transfer-Syntax.
+        // p_result_list: 1 result (acceptance) with NDR transfer syntax.
         w.WriteByte(1);               // n_results
         w.WriteByte(0);               // reserved
         w.WriteUInt16(0);             // reserved2
@@ -85,7 +85,7 @@ public static class Dcerpc
         return w.ToArray();
     }
 
-    /// <summary>Baut eine RESPONSE-PDU mit dem NDR-Stub.</summary>
+    /// <summary>Builds a RESPONSE PDU with the NDR stub.</summary>
     public static byte[] BuildResponse(uint callId, ReadOnlySpan<byte> stub)
     {
         var w = new GrowableWriter(24 + stub.Length);
@@ -99,7 +99,7 @@ public static class Dcerpc
         return w.ToArray();
     }
 
-    /// <summary>Baut eine FAULT-PDU (z.B. für unbekannte Opnums).</summary>
+    /// <summary>Builds a FAULT PDU (e.g. for unknown opnums).</summary>
     public static byte[] BuildFault(uint callId, uint status)
     {
         var w = new GrowableWriter(32);

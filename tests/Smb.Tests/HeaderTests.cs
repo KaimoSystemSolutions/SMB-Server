@@ -67,7 +67,7 @@ public class HeaderTests
     {
         var header = new Smb2Header { Command = SmbCommand.Echo };
         byte[] bytes = header.ToArray();
-        // StructureSize (Offset 4) verfälschen.
+        // Corrupt StructureSize (offset 4).
         bytes[4] = 0x41;
         Assert.Throws<SmbWireFormatException>(() => Smb2Header.Read(bytes));
     }

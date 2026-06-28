@@ -13,9 +13,9 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// Oplocks end-to-end über den Dispatcher (Context §15): Grant beim CREATE, Herabstufung +
-/// OPLOCK_BREAK-Notification bei einem zweiten Open derselben Datei, Acknowledgment-Quittung,
-/// Freigabe beim CLOSE und Abgrenzung gegenüber (noch nicht unterstützten) Lease-Breaks.
+/// Oplocks end-to-end via the dispatcher (Context §15): grant at CREATE, downgrade +
+/// OPLOCK_BREAK notification on a second open of the same file, acknowledgment response,
+/// release at CLOSE and distinction from (not yet supported) lease breaks.
 /// </summary>
 public class OplockTests : IDisposable
 {
@@ -68,24 +68,24 @@ public class OplockTests : IDisposable
         var sent = new ConcurrentQueue<byte[]>();
         conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
-        // Erster Open hält einen Batch-Oplock (Solo-Open).
+        // First open holds a Batch oplock (solo open).
         byte[] first = OpenFile(d, conn, sid, tid, 10, oplock: (byte)OplockLevel.Batch);
         (ulong fp, ulong fv) = ExtractCreateFileId(first);
         Assert.Equal((byte)OplockLevel.Batch, GrantedOplock(first));
 
-        // Zweiter Open auf dieselbe Datei → Halter bricht auf Level II, neuer Open erhält Level II.
+        // Second open on the same file → holder breaks to Level II, new open receives Level II.
         byte[] second = OpenFile(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch);
         Assert.Equal((byte)OplockLevel.LevelII, GrantedOplock(second));
 
-        // Der erste Halter erhält out-of-band eine OPLOCK_BREAK-Notification (MessageId 0xFFFF…F).
+        // The first holder receives an out-of-band OPLOCK_BREAK notification (MessageId 0xFFFF…F).
         byte[] notify = await WaitForSend(sent);
         Smb2Header nh = Smb2Header.Read(notify);
         Assert.Equal(SmbCommand.OplockBreak, nh.Command);
         Assert.Equal(0xFFFFFFFFFFFFFFFFul, nh.MessageId);
-        Assert.Equal((byte)OplockLevel.LevelII, GrantedOplock(notify));   // gebrochenes Ziel-Level
+        Assert.Equal((byte)OplockLevel.LevelII, GrantedOplock(notify));   // broken target level
         (ulong np, ulong nv) = BreakFileId(notify);
         Assert.Equal(fp, np);
-        Assert.Equal(fv, nv);                                            // Notification adressiert den ersten Open
+        Assert.Equal(fv, nv);                                            // notification addresses the first open
     }
 
     [Fact]
@@ -96,9 +96,9 @@ public class OplockTests : IDisposable
 
         byte[] first = OpenFile(d, conn, sid, tid, 10, oplock: (byte)OplockLevel.Batch);
         (ulong fp, ulong fv) = ExtractCreateFileId(first);
-        OpenFile(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch); // löst den Break aus
+        OpenFile(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch); // triggers the break
 
-        // Der Halter bestätigt die Herabstufung auf Level II → Server quittiert mit OPLOCK_BREAK-Response.
+        // Holder confirms downgrade to Level II → server responds with OPLOCK_BREAK response.
         byte[] ack = d.ProcessMessage(conn,
             TestHelpers.BuildOplockBreakAck(12, sid, tid, fp, fv, (byte)OplockLevel.LevelII));
         Smb2Header ah = Smb2Header.Read(ack);
@@ -118,9 +118,9 @@ public class OplockTests : IDisposable
 
         byte[] first = OpenFile(d, conn, sid, tid, 10, oplock: (byte)OplockLevel.Batch);
         (ulong fp, ulong fv) = ExtractCreateFileId(first);
-        d.ProcessMessage(conn, TestHelpers.BuildCloseRequest(11, sid, tid, fp, fv)); // gibt den Oplock frei
+        d.ProcessMessage(conn, TestHelpers.BuildCloseRequest(11, sid, tid, fp, fv)); // releases the oplock
 
-        // Wieder einziger Open → erneut exklusiver Oplock möglich.
+        // Again the only open → exclusive oplock possible again.
         byte[] reopen = OpenFile(d, conn, sid, tid, 12, oplock: (byte)OplockLevel.Batch);
         Assert.Equal((byte)OplockLevel.Batch, GrantedOplock(reopen));
     }
@@ -128,17 +128,17 @@ public class OplockTests : IDisposable
     [Fact]
     public void OplockBreakAck_WithLeaseStructureSize_ReturnsNotSupported()
     {
-        // Ein Lease-Break-Acknowledgment (§2.2.24.2, StructureSize 36) wird noch nicht unterstützt.
+        // A lease break acknowledgment (§2.2.24.2, StructureSize 36) is not yet supported.
         var (d, conn, sid, tid) = Setup();
 
         var body = new byte[36];
-        BinaryPrimitives.WriteUInt16LittleEndian(body, 36); // StructureSize ≠ 24 → Lease-Break
+        BinaryPrimitives.WriteUInt16LittleEndian(body, 36); // StructureSize ≠ 24 → lease break
         byte[] leaseAck = TestHelpers.Concat(TestHelpers.BuildHeader(SmbCommand.OplockBreak, 20, sid, tid), body);
 
         Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(d.ProcessMessage(conn, leaseAck)).Status);
     }
 
-    // --- Setup & Hilfen (analog LockDispatcherTests) ---
+    // --- Setup & helpers (analogous to LockDispatcherTests) ---
 
     private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup()
     {
@@ -175,10 +175,10 @@ public class OplockTests : IDisposable
         return create;
     }
 
-    /// <summary>Liest das OplockLevel-Byte (Offset +2 im Body) — gilt für CREATE-Response und OPLOCK_BREAK gleichermaßen.</summary>
+    /// <summary>Reads the OplockLevel byte (offset +2 in body) — valid for both CREATE response and OPLOCK_BREAK.</summary>
     private static byte GrantedOplock(byte[] message) => message[Smb2Header.Size + 2];
 
-    /// <summary>FileId aus einem OPLOCK_BREAK-Body (Persistent @+8, Volatile @+16).</summary>
+    /// <summary>FileId from an OPLOCK_BREAK body (Persistent @+8, Volatile @+16).</summary>
     private static (ulong persistent, ulong vol) BreakFileId(byte[] message)
     {
         const int body = Smb2Header.Size;
@@ -208,6 +208,6 @@ public class OplockTests : IDisposable
             if (queue.TryDequeue(out byte[]? msg)) return msg;
             await Task.Delay(20);
         }
-        throw new Xunit.Sdk.XunitException("Keine out-of-band OPLOCK_BREAK-Notification innerhalb des Zeitlimits erhalten.");
+        throw new Xunit.Sdk.XunitException("No out-of-band OPLOCK_BREAK notification received within the time limit.");
     }
 }

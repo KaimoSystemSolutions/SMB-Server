@@ -12,8 +12,8 @@ namespace Smb.Tests;
 
 public class ShareAuthorizationTests
 {
-    // Policy: "Secret" nur für alice (sichtbar & zugreifbar, Vollzugriff);
-    // alle anderen User bekommen auf andere Shares nur Lesezugriff.
+    // Policy: "Secret" only for alice (visible & accessible, full access);
+    // all other users get read-only access on other shares.
     private static IShareAccessPolicy DemoPolicy() => new DelegateSharePolicy(
         authorize: ctx =>
         {
@@ -87,7 +87,7 @@ public class ShareAuthorizationTests
         byte[] resp = dispatcher.ProcessMessage(conn,
             TestHelpers.BuildTreeConnectRequest(2, sid, @"\\server\Data"));
         Assert.Equal(NtStatus.Success, Smb2Header.Read(resp).Status);
-        // bob erhält nur Lese-Zugriff — der Client sieht das an der MaximalAccess-Maske.
+        // bob gets read-only access — the client sees this via the MaximalAccess mask.
         Assert.Equal((uint)SmbAccessMask.ReadOnly, ReadMaximalAccess(resp));
     }
 
@@ -101,9 +101,9 @@ public class ShareAuthorizationTests
         var bobShares = state.GetVisibleShares(bob).Select(s => s.Name).ToList();
         var aliceShares = state.GetVisibleShares(alice).Select(s => s.Name).ToList();
 
-        Assert.DoesNotContain("Secret", bobShares);   // für bob ausgeblendet
+        Assert.DoesNotContain("Secret", bobShares);   // hidden from bob
         Assert.Contains("Data", bobShares);
-        Assert.Contains("Secret", aliceShares);        // für alice sichtbar
+        Assert.Contains("Secret", aliceShares);        // visible for alice
     }
 
     [Fact]

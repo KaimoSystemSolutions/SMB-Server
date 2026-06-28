@@ -6,10 +6,10 @@ using Smb.Server.State;
 namespace Smb.Server;
 
 /// <summary>
-/// CHANGE_NOTIFY (Context §16, MS-SMB2 §3.3.5.19): überwacht ein Verzeichnis-Handle auf
-/// Änderungen. Wie beim blockierenden LOCK geht zuerst eine Interim-Antwort
-/// (<c>STATUS_PENDING</c>) raus; die finale Antwort mit FILE_NOTIFY_INFORMATION folgt out-of-band,
-/// sobald eine Änderung eintritt — oder <c>STATUS_CANCELLED</c> bei CANCEL/Close.
+/// CHANGE_NOTIFY (Context §16, MS-SMB2 §3.3.5.19): watches a directory handle for
+/// changes. Like a blocking LOCK, an interim response (<c>STATUS_PENDING</c>) is sent
+/// first; the final response with FILE_NOTIFY_INFORMATION follows out-of-band once a
+/// change occurs — or <c>STATUS_CANCELLED</c> on CANCEL/Close.
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
@@ -24,15 +24,15 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
         if (open.LocalOpen is null || !open.LocalOpen.IsDirectory)
-            return BuildError(header, NtStatus.InvalidParameter); // CHANGE_NOTIFY nur auf Verzeichnis-Handles
+            return BuildError(header, NtStatus.InvalidParameter); // CHANGE_NOTIFY only on directory handles
 
         string? watchPath = open.LocalOpen.PhysicalPath;
         if (watchPath is null)
-            return BuildError(header, NtStatus.NotSupported); // Backend ohne realen Pfad (z.B. virtuell)
+            return BuildError(header, NtStatus.NotSupported); // backend without a real path (e.g. virtual)
 
-        // [AUDIT-2026-06] Ausstehende async-Operationen je Verbindung deckeln (Ressourcen-Schutz):
-        // jede CHANGE_NOTIFY-Subscription hält einen PendingRequest + ggf. einen Dateisystem-Watcher.
-        // Siehe docs/SECURITY_AUDIT.md (Finding H1).
+        // [AUDIT-2026-06] Cap outstanding async operations per connection (resource protection):
+        // each CHANGE_NOTIFY subscription holds a PendingRequest and possibly a filesystem watcher.
+        // See docs/SECURITY_AUDIT.md (Finding H1).
         if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
             return BuildError(header, NtStatus.InsufficientResources);
 
@@ -67,19 +67,19 @@ public sealed partial class Smb2Dispatcher
         }
 
         if (subscription is null)
-            return BuildError(header, NtStatus.NotSupported); // Watcher kann diesen Pfad nicht überwachen
+            return BuildError(header, NtStatus.NotSupported); // watcher cannot watch this path
 
-        once.Attach(subscription);                 // race-sicher: feuerte schon ein Event, wird hier sofort entsorgt
+        once.Attach(subscription);                 // race-safe: if an event already fired, disposed immediately here
         connection.PendingRequests[header.MessageId] = pending;
         pending.Token.Register(() => Complete(NtStatus.Cancelled, ErrorResponse.BuildBody()));
 
-        // Hinweis: theoretisch kann eine Änderung im µs-Fenster zwischen Watch() und dem Versand
-        // dieser Interim-Antwort eintreffen; in der Praxis liefern Dateisystem-Watcher Events erst
-        // ms später. Eine korrekte Pufferung von Änderungen zwischen zwei Requests bleibt offen.
+        // Note: theoretically a change can arrive in the µs window between Watch() and sending
+        // this interim response; in practice filesystem watchers deliver events ms later.
+        // Correct buffering of changes between two requests remains an open issue.
         return InterimResponse(header, session, asyncId);
     }
 
-    /// <summary>Sendet eine finale Antwort einer asynchron ausstehenden Operation out-of-band (ASYNC-Header).</summary>
+    /// <summary>Sends the final response for an asynchronously pending operation out-of-band (ASYNC header).</summary>
     private async Task SendAsyncFinalAsync(
         SmbConnection connection, Smb2Header request, SmbSession session, ulong asyncId, NtStatus status, byte[] body, bool encrypt)
     {
@@ -87,9 +87,9 @@ public sealed partial class Smb2Dispatcher
         h.Flags |= Smb2HeaderFlags.AsyncCommand;
         h.AsyncId = asyncId;
         h.SessionId = session.SessionId;
-        h.CreditRequestResponse = 0; // Credits wurden mit der Interim-Antwort gewährt.
+        h.CreditRequestResponse = 0; // Credits were granted with the interim response.
 
-        // Erfolg/Info wird signiert (falls die Session signiert), Fehler bleiben unsigniert — wie sonst.
+        // Success/info is signed (if the session signs); errors remain unsigned — as usual.
         ResponseSegment seg = status.IsSuccess()
             ? MaybeSigned(session, h, body)
             : ResponseSegment.Unsigned(h, body);
@@ -98,13 +98,13 @@ public sealed partial class Smb2Dispatcher
         Func<byte[], bool, Task>? sender = connection.SendRawAsync;
         if (sender is null) return;
         try { await sender(bytes, encrypt).ConfigureAwait(false); }
-        catch { /* Connection bereits weg */ }
+        catch { /* connection already gone */ }
     }
 
     /// <summary>
-    /// One-shot-Wächter für eine asynchrone Überwachung: stellt sicher, dass genau einer von
-    /// „Änderung eingetreten" und „abgebrochen" gewinnt, und entsorgt das Watcher-Handle
-    /// race-sicher (auch wenn das Event feuert, bevor das Handle angehängt wurde).
+    /// One-shot guard for an asynchronous watch: ensures exactly one of
+    /// "change occurred" and "cancelled" wins, and disposes the watcher handle
+    /// race-safely (even if an event fires before the handle is attached).
     /// </summary>
     private sealed class NotifyOnce
     {

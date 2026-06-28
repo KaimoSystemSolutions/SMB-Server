@@ -1,6 +1,6 @@
 namespace Smb.Server.Notification;
 
-/// <summary>Welche Änderungen ein CHANGE_NOTIFY beobachtet (= SMB2 CompletionFilter, MS-SMB2 §2.2.35).</summary>
+/// <summary>Which changes a CHANGE_NOTIFY observes (= SMB2 CompletionFilter, MS-SMB2 §2.2.35).</summary>
 [Flags]
 public enum ChangeNotifyFilter : uint
 {
@@ -19,7 +19,7 @@ public enum ChangeNotifyFilter : uint
     StreamWrite = 0x00000800,
 }
 
-/// <summary>Art einer Verzeichnis-Änderung (FILE_NOTIFY_INFORMATION Action, MS-FSCC §2.7.1).</summary>
+/// <summary>Type of a directory change (FILE_NOTIFY_INFORMATION Action, MS-FSCC §2.7.1).</summary>
 public enum FileNotifyAction : uint
 {
     Added = 1,
@@ -29,30 +29,30 @@ public enum FileNotifyAction : uint
     RenamedNewName = 5,
 }
 
-/// <summary>Eine einzelne beobachtete Änderung (Name relativ zum überwachten Verzeichnis, '\'-getrennt).</summary>
+/// <summary>A single observed change (name relative to the watched directory, '\'-separated).</summary>
 public readonly record struct FileNotifyEvent(FileNotifyAction Action, string RelativeName);
 
 /// <summary>
-/// <b>Einhak-Punkt für CHANGE_NOTIFY (Context §16).</b> Liefert Verzeichnis-Änderungen an den
-/// Server. Default <see cref="FileSystemDirectoryWatcher"/> (auf Basis von
-/// <see cref="System.IO.FileSystemWatcher"/>); eine eigene Implementierung kann z.B. an inotify,
-/// ZFS-Events oder einen verteilten Änderungs-Bus andocken. Verdrahtung:
+/// <b>CHANGE_NOTIFY seam (Context §16).</b> Delivers directory changes to the server.
+/// Default <see cref="FileSystemDirectoryWatcher"/> (based on
+/// <see cref="System.IO.FileSystemWatcher"/>); a custom implementation can attach to inotify,
+/// ZFS events, or a distributed change bus. Wiring:
 /// <c>SmbServerBuilder.UseDirectoryWatcher(...)</c>.
 /// </summary>
 public interface IDirectoryWatcher
 {
     /// <summary>
-    /// Beginnt, <paramref name="directoryFullPath"/> zu überwachen. Bei passenden Änderungen wird
-    /// <paramref name="onChanges"/> mit einem oder mehreren Events aufgerufen. Liefert ein
-    /// <see cref="IDisposable"/> zum Beenden — oder <c>null</c>, wenn dieser Pfad nicht überwacht
-    /// werden kann (dann antwortet der Server mit <c>STATUS_NOT_SUPPORTED</c>).
+    /// Begins watching <paramref name="directoryFullPath"/>. When matching changes occur,
+    /// <paramref name="onChanges"/> is called with one or more events. Returns an
+    /// <see cref="IDisposable"/> to stop watching — or <c>null</c> if this path cannot be
+    /// watched (in which case the server responds with <c>STATUS_NOT_SUPPORTED</c>).
     /// </summary>
     IDisposable? Watch(
         string directoryFullPath, bool watchSubtree, ChangeNotifyFilter filter,
         Action<IReadOnlyList<FileNotifyEvent>> onChanges);
 }
 
-/// <summary>Default: überwacht echte Verzeichnisse via <see cref="FileSystemWatcher"/>.</summary>
+/// <summary>Default: watches real directories via <see cref="FileSystemWatcher"/>.</summary>
 public sealed class FileSystemDirectoryWatcher : IDirectoryWatcher
 {
     public IDisposable? Watch(
@@ -105,7 +105,7 @@ public sealed class FileSystemDirectoryWatcher : IDirectoryWatcher
         if (f.HasFlag(ChangeNotifyFilter.LastAccess)) n |= NotifyFilters.LastAccess;
         if (f.HasFlag(ChangeNotifyFilter.Creation)) n |= NotifyFilters.CreationTime;
         if (f.HasFlag(ChangeNotifyFilter.Security)) n |= NotifyFilters.Security;
-        // Default, falls keine (uns bekannten) Bits gesetzt sind.
+        // Default if no (known) bits are set.
         return n == 0 ? NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite : n;
     }
 
@@ -113,7 +113,7 @@ public sealed class FileSystemDirectoryWatcher : IDirectoryWatcher
         => Path.GetRelativePath(root, fullPath).Replace('/', '\\');
 }
 
-/// <summary>Watcher, der nichts überwacht — CHANGE_NOTIFY wird damit zu <c>STATUS_NOT_SUPPORTED</c>.</summary>
+/// <summary>Watcher that watches nothing — CHANGE_NOTIFY becomes <c>STATUS_NOT_SUPPORTED</c>.</summary>
 public sealed class NullDirectoryWatcher : IDirectoryWatcher
 {
     public IDisposable? Watch(

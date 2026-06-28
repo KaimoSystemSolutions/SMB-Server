@@ -2,57 +2,57 @@ using Smb.Server.State;
 
 namespace Smb.Server.Locking;
 
-/// <summary>Ein normalisiertes Byte-Range-Lock-/Unlock-Element (aus dem LOCK-Request abgeleitet).</summary>
+/// <summary>A normalized byte-range lock/unlock element (derived from the LOCK request).</summary>
 public readonly record struct LockElement(ulong Offset, ulong Length, bool Exclusive, bool Unlock);
 
-/// <summary>Ergebnis einer Lock-/Unlock-Anforderung (mappt 1:1 auf NTSTATUS im Dispatcher).</summary>
+/// <summary>Result of a lock/unlock request (maps 1:1 to NTSTATUS in the dispatcher).</summary>
 public enum LockOutcome
 {
-    /// <summary>Alle Elemente gewährt bzw. freigegeben → <c>STATUS_SUCCESS</c>.</summary>
+    /// <summary>All elements granted or released → <c>STATUS_SUCCESS</c>.</summary>
     Granted,
-    /// <summary>Bereich kollidiert mit einem Lock eines anderen Open → <c>STATUS_LOCK_NOT_GRANTED</c>.</summary>
+    /// <summary>Range conflicts with a lock held by another open → <c>STATUS_LOCK_NOT_GRANTED</c>.</summary>
     Conflict,
-    /// <summary>Unlock eines nicht gehaltenen Bereichs → <c>STATUS_RANGE_NOT_LOCKED</c>.</summary>
+    /// <summary>Unlock of a range not currently locked → <c>STATUS_RANGE_NOT_LOCKED</c>.</summary>
     RangeNotLocked,
-    /// <summary>Ein wartender (blockierender) Lock wurde via CANCEL/Close abgebrochen → <c>STATUS_CANCELLED</c>.</summary>
+    /// <summary>A waiting (blocking) lock was cancelled via CANCEL/Close → <c>STATUS_CANCELLED</c>.</summary>
     Cancelled,
 }
 
 /// <summary>
-/// <b>Einhak-Punkt für Byte-Range-Locking (SMB2 LOCK, Context §15).</b> Der Server delegiert
-/// jede Sperr-Entscheidung hierher; die Default-Implementierung <see cref="InMemoryLockManager"/>
-/// hält die Locks prozesslokal. Eine eigene Implementierung kann das Locking z.B. an das
-/// Betriebssystem (<c>FileStream.Lock</c>) oder einen Cluster-Koordinator delegieren — relevant,
-/// wenn dieselbe Datei auch über andere Protokolle (NFS, lokal) gesperrt werden soll.
-/// Verdrahtung: <c>SmbServerBuilder.UseLockManager(...)</c>.
+/// <b>Byte-range locking seam (SMB2 LOCK, Context §15).</b> The server delegates every
+/// locking decision here; the default implementation <see cref="InMemoryLockManager"/>
+/// holds locks process-locally. A custom implementation can delegate locking to the OS
+/// (<c>FileStream.Lock</c>) or a cluster coordinator — relevant when the same file can also
+/// be locked via other protocols (NFS, local).
+/// Wiring: <c>SmbServerBuilder.UseLockManager(...)</c>.
 /// </summary>
 public interface ILockManager
 {
     /// <summary>
-    /// Nimmt (oder gibt frei) alle Elemente eines LOCK-Requests <b>atomar</b> für ein Open
-    /// (MS-SMB2 §3.3.5.14). Die Elemente sind entweder ausschließlich Locks oder ausschließlich
-    /// Unlocks (vom Aufrufer geprüft).
+    /// Applies (or releases) all elements of a LOCK request <b>atomically</b> for an open
+    /// (MS-SMB2 §3.3.5.14). The elements are either exclusively locks or exclusively
+    /// unlocks (verified by the caller).
     /// <para>
-    /// Kann ein einzelnes Lock nicht sofort gewährt werden und <paramref name="failImmediately"/>
-    /// ist <c>false</c>, läuft der zurückgegebene Task <b>asynchron weiter</b>, bis der Bereich
-    /// frei wird (→ <see cref="LockOutcome.Granted"/>) oder <paramref name="ct"/> ausgelöst wird
-    /// (CANCEL/Close → <see cref="LockOutcome.Cancelled"/>). Bei sofortiger Entscheidung ist der
-    /// Task bereits abgeschlossen (synchroner Schnellpfad).
+    /// If a single lock cannot be granted immediately and <paramref name="failImmediately"/>
+    /// is <c>false</c>, the returned task continues <b>asynchronously</b> until the range
+    /// becomes free (→ <see cref="LockOutcome.Granted"/>) or <paramref name="ct"/> is triggered
+    /// (CANCEL/Close → <see cref="LockOutcome.Cancelled"/>). When the decision is immediate,
+    /// the task is already completed (synchronous fast path).
     /// </para>
     /// </summary>
     Task<LockOutcome> ApplyAsync(SmbOpen owner, IReadOnlyList<LockElement> elements, bool failImmediately, CancellationToken ct);
 
     /// <summary>
-    /// Schneller, nie blockierender Konflikt-Check für READ/WRITE (MS-SMB2 §3.3.5.10/§3.3.5.12):
-    /// Ist der Bereich aus Sicht von <paramref name="owner"/> zugreifbar? <paramref name="forWrite"/>
-    /// =true prüft auch gegen <i>shared</i> Locks anderer Opens, =false nur gegen exklusive.
-    /// Eigene Locks des <paramref name="owner"/> blockieren dessen eigenen Zugriff nie.
+    /// Fast, never-blocking conflict check for READ/WRITE (MS-SMB2 §3.3.5.10/§3.3.5.12):
+    /// is the range accessible from the perspective of <paramref name="owner"/>? <paramref name="forWrite"/>
+    /// =true also checks against <i>shared</i> locks of other opens, =false only against exclusive.
+    /// The owner's own locks never block its own access.
     /// </summary>
     bool IsRangeAccessible(SmbOpen owner, ulong offset, ulong length, bool forWrite);
 
     /// <summary>
-    /// Gibt beim CLOSE alle Locks dieses Open frei und weckt dadurch evtl. wartende Locks
-    /// anderer Opens (MS-SMB2 §3.3.5.10: Close gibt alle Locks frei).
+    /// At CLOSE, releases all locks of this open and thereby wakes any waiting locks
+    /// of other opens (MS-SMB2 §3.3.5.10: close releases all locks).
     /// </summary>
     void ReleaseOwner(SmbOpen owner);
 }

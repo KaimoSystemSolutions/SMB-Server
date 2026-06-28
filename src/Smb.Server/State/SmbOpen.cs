@@ -5,8 +5,8 @@ using Smb.Server.Rpc;
 namespace Smb.Server.State;
 
 /// <summary>
-/// Zustand eines offenen Handles (Context §19, §3.3.1.10). FileId = {Persistent, Volatile}
-/// (Context §13). Verknüpft Session/TreeConnect mit dem Backend-Handle.
+/// State of an open handle (Context §19, §3.3.1.10). FileId = {Persistent, Volatile}
+/// (Context §13). Links session/tree connect with the backend handle.
 /// </summary>
 public sealed class SmbOpen
 {
@@ -15,7 +15,7 @@ public sealed class SmbOpen
     public required SmbSession Session { get; init; }
     public required SmbTreeConnect TreeConnect { get; init; }
 
-    /// <summary>Backend-Handle (<c>Open.LocalOpen</c>).</summary>
+    /// <summary>Backend handle (<c>Open.LocalOpen</c>).</summary>
     public IFileHandle? LocalOpen { get; set; }
 
     public uint GrantedAccess { get; set; }
@@ -24,19 +24,19 @@ public sealed class SmbOpen
     public bool DeleteOnClose { get; set; }
 
     /// <summary>
-    /// Aktuell für dieses Open gewährtes Oplock-Level (Context §15). Wird beim CREATE gesetzt und
-    /// bei einem Break herabgestuft. Maßgeblich ist der <c>IOplockManager</c>; dieser Wert spiegelt
-    /// das zuletzt diesem Open gewährte Level (für Tests/Diagnose).
+    /// Oplock level currently granted for this open (Context §15). Set at CREATE and
+    /// downgraded on a break. The <c>IOplockManager</c> is authoritative; this value mirrors
+    /// the last level granted to this open (for tests/diagnostics).
     /// </summary>
     public OplockLevel OplockLevel { get; set; } = OplockLevel.None;
 
-    /// <summary>Wurde dieses (Verzeichnis-)Open bereits via QUERY_DIRECTORY aufgelistet? (Context §14)</summary>
+    /// <summary>Has this (directory) open already been enumerated via QUERY_DIRECTORY? (Context §14)</summary>
     public bool DirectoryEnumStarted { get; set; }
 
-    /// <summary>Bei Named-Pipe-Opens (IPC$, z.B. \PIPE\srvsvc): der DCERPC-Pipe-Zustand. Sonst null.</summary>
+    /// <summary>For named-pipe opens (IPC$, e.g. \PIPE\srvsvc): the DCERPC pipe state. Otherwise null.</summary>
     public RpcPipe? Pipe { get; set; }
 
-    /// <summary>True, wenn dies ein Named-Pipe-Open (DCERPC) ist.</summary>
+    /// <summary>True if this is a named-pipe open (DCERPC).</summary>
     public bool IsPipe => Pipe is not null;
 
     public (ulong Persistent, ulong Volatile) Key => (PersistentFileId, VolatileFileId);

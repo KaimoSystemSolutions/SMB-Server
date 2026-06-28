@@ -50,7 +50,7 @@ public class NegotiateMessageTests
             DialectRevision = SmbDialect.Smb311,
             ServerGuid = new byte[16],
             Capabilities = Smb2Capabilities.LargeMtu,
-            SecurityBuffer = new byte[] { 1, 2, 3, 4, 5 }, // ungerade Länge → erzwingt Context-Padding
+            SecurityBuffer = new byte[] { 1, 2, 3, 4, 5 }, // odd length → forces context padding
             NegotiateContexts =
             [
                 new PreauthIntegrityContext { HashAlgorithms = [PreauthHashAlgorithm.Sha512], Salt = new byte[32] },
@@ -64,12 +64,12 @@ public class NegotiateMessageTests
         r.Seek(6);
         Assert.Equal(2, r.ReadUInt16());                        // NegotiateContextCount
 
-        // NegotiateContextOffset steht bei Body-Offset 60 (absolut ab Nachrichtenbeginn).
+        // NegotiateContextOffset is at body offset 60 (absolute from message start).
         r.Seek(60);
         uint ctxOffsetAbs = r.ReadUInt32();
-        Assert.True(ctxOffsetAbs % 8 == 0, "Context-Liste muss 8-Byte-aligned beginnen.");
+        Assert.True(ctxOffsetAbs % 8 == 0, "Context list must begin 8-byte aligned.");
 
-        // Vom (absoluten) Offset zurück in den Body rechnen und Contexts lesen.
+        // Convert from absolute offset back into body and read contexts.
         int ctxOffsetInBody = (int)ctxOffsetAbs - Smb2Header.Size;
         NegotiateContext first = NegotiateContext.Read(body.AsSpan(ctxOffsetInBody), out int consumed);
         Assert.IsType<PreauthIntegrityContext>(first);

@@ -6,9 +6,9 @@ using Smb.Protocol.Enums;
 namespace Smb.Server.State;
 
 /// <summary>
-/// Zustand einer TCP-Verbindung (Context §19, §3.3.1.7). Eine TCP-Verbindung = eine
-/// SMB2-Connection; mehrere Sessions können sie teilen. Hält das Sequenz-/Credit-Fenster,
-/// die ausgehandelten Dialekt-/Krypto-Parameter und (3.1.1) den Preauth-Hash.
+/// State of a TCP connection (Context §19, §3.3.1.7). One TCP connection = one
+/// SMB2 connection; multiple sessions can share it. Holds the sequence/credit window,
+/// the negotiated dialect/crypto parameters and (3.1.1) the preauth hash.
 /// </summary>
 public sealed class SmbConnection
 {
@@ -16,7 +16,7 @@ public sealed class SmbConnection
 
     public Guid ConnectionId { get; } = Guid.NewGuid();
 
-    /// <summary>Ausgehandelter Dialekt (None bis NEGOTIATE abgeschlossen).</summary>
+    /// <summary>Negotiated dialect (None until NEGOTIATE completes).</summary>
     public SmbDialect Dialect { get; set; } = SmbDialect.None;
 
     public bool NegotiateDone { get; set; }
@@ -27,43 +27,43 @@ public sealed class SmbConnection
     public SmbSecurityMode ClientSecurityMode { get; set; }
     public SmbSecurityMode ServerSecurityMode { get; set; }
 
-    /// <summary>Soll auf dieser Connection signiert werden (Context §10).</summary>
+    /// <summary>Whether this connection should be signed (Context §10).</summary>
     public bool ShouldSign { get; set; }
 
     public bool SupportsEncryption { get; set; }
 
     /// <summary>
-    /// Large-MTU / Multi-Credit ausgehandelt (Client UND Server, ab 2.1, Context §7).
-    /// Steuert, ob große READ/WRITE/TRANSACT-Puffer erlaubt sind.
+    /// Large-MTU / multi-credit negotiated (client AND server, from 2.1, Context §7).
+    /// Controls whether large READ/WRITE/TRANSACT buffers are permitted.
     /// </summary>
     public bool SupportsMultiCredit { get; set; }
 
-    /// <summary>Effektiv für diese Connection ausgehandelte Maximalgrößen (Context §6).
-    /// Ohne Large-MTU auf 64 KiB gedeckelt — sonst überschreiten Antwort-Frames die
-    /// 17-Bit-NBSS-Grenze älterer Clients (z.B. pysmb).</summary>
+    /// <summary>Maximum sizes effectively negotiated for this connection (Context §6).
+    /// Capped at 64 KiB without large MTU — otherwise response frames exceed the
+    /// 17-bit NBSS boundary of older clients (e.g. pysmb).</summary>
     public uint MaxReadSize { get; set; } = 0x10000;
     public uint MaxWriteSize { get; set; } = 0x10000;
     public uint MaxTransactSize { get; set; } = 0x10000;
 
-    // Ausgehandelte 3.1.1-Parameter (Context §6.4).
+    // Negotiated 3.1.1 parameters (Context §6.4).
     public PreauthHashAlgorithm PreauthIntegrityHashId { get; set; } = PreauthHashAlgorithm.Sha512;
     public SmbCipherId CipherId { get; set; } = SmbCipherId.None;
     public SmbSigningAlgorithmId SigningAlgorithmId { get; set; } = SmbSigningAlgorithmId.HmacSha256;
 
-    /// <summary>Laufender Preauth-Integrity-Hash (nur 3.1.1, Context §6.4, §8.2).</summary>
+    /// <summary>Running preauth integrity hash (3.1.1 only, Context §6.4, §8.2).</summary>
     public PreauthIntegrityHash PreauthHash { get; } = new();
 
-    /// <summary>Sessions auf dieser Connection (SessionId → Session).</summary>
+    /// <summary>Sessions on this connection (SessionId → session).</summary>
     public ConcurrentDictionary<ulong, SmbSession> Sessions { get; } = new();
 
     public DateTimeOffset CreationTime { get; } = DateTimeOffset.UtcNow;
 
-    // --- Credit-/Sequenzfenster (Context §7, §3.3.1.7) ---
+    // --- Credit / sequence window (Context §7, §3.3.1.7) ---
 
-    /// <summary>Untere Grenze des gültigen MessageId-Fensters.</summary>
+    /// <summary>Lower bound of the valid MessageId window.</summary>
     public ulong SequenceWindowStart { get; set; }
 
-    /// <summary>Größe des gültigen MessageId-Fensters (= erteilte Credits).</summary>
+    /// <summary>Size of the valid MessageId window (= granted credits).</summary>
     public ulong SequenceWindowSize { get; set; } = 1;
 
     public ushort OutstandingRequestCount { get; set; }
@@ -72,29 +72,29 @@ public sealed class SmbConnection
 
     private long _fileIdCounter;
 
-    /// <summary>Vergibt eine neue, eindeutige (volatile) FileId für ein Open (Context §13).</summary>
+    /// <summary>Allocates a new, unique (volatile) FileId for an open (Context §13).</summary>
     public ulong AllocateFileId() => (ulong)Interlocked.Increment(ref _fileIdCounter);
 
-    // --- Asynchrone (out-of-band) Antworten: blockierende Locks, später ChangeNotify/Oplocks ---
+    // --- Asynchronous (out-of-band) responses: blocking locks, later ChangeNotify/oplocks ---
 
     private long _asyncIdCounter;
 
-    /// <summary>Vergibt eine neue, pro Connection eindeutige AsyncId (Context §4, ASYNC-Header).</summary>
+    /// <summary>Allocates a new, per-connection unique AsyncId (Context §4, ASYNC header).</summary>
     public ulong AllocateAsyncId() => (ulong)Interlocked.Increment(ref _asyncIdCounter);
 
     /// <summary>
-    /// Vom Host gesetzter, serialisierter Sendekanal für eine bereits fertige (Header+Body, ggf.
-    /// signierte) SMB2-Antwort. Verschlüsselung und NBSS-Rahmung übernimmt der Host. Erlaubt es,
-    /// die <i>finale</i> Antwort einer asynchron ausstehenden Operation out-of-band zu senden.
-    /// Das <c>bool</c>-Argument erzwingt die Verschlüsselung — nötig bei ASYNC-Antworten, deren
-    /// Header keine TreeId trägt und bei denen der Host die Per-Share-Pflicht sonst nicht erkennt.
+    /// Serialized send channel set by the host for a completed (header+body, optionally signed)
+    /// SMB2 response. Encryption and NBSS framing are handled by the host. Allows sending the
+    /// <i>final</i> response of an asynchronously pending operation out-of-band.
+    /// The <c>bool</c> argument forces encryption — needed for ASYNC responses whose header
+    /// carries no TreeId and where the host would otherwise not detect the per-share requirement.
     /// </summary>
     public Func<byte[], bool, Task>? SendRawAsync { get; set; }
 
-    /// <summary>Ausstehende asynchrone Operationen (MessageId → Eintrag), für CANCEL/Teardown.</summary>
+    /// <summary>Outstanding asynchronous operations (MessageId → entry), for CANCEL/teardown.</summary>
     public ConcurrentDictionary<ulong, PendingAsyncRequest> PendingRequests { get; } = new();
 
-    /// <summary>Bricht alle ausstehenden asynchronen Operationen ab (Connection-Teardown).</summary>
+    /// <summary>Cancels all outstanding asynchronous operations (connection teardown).</summary>
     public void CancelAllPending()
     {
         foreach (PendingAsyncRequest p in PendingRequests.Values) p.Cancel();

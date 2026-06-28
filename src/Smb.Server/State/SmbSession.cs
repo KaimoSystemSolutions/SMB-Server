@@ -4,7 +4,7 @@ using Smb.Crypto;
 
 namespace Smb.Server.State;
 
-/// <summary>Lebenszyklus-Zustand einer Session (Context §8.1).</summary>
+/// <summary>Lifecycle state of a session (Context §8.1).</summary>
 public enum SessionState
 {
     InProgress,
@@ -13,9 +13,9 @@ public enum SessionState
 }
 
 /// <summary>
-/// Zustand einer authentifizierten (oder in Authentifizierung befindlichen) Session
-/// (Context §19, §3.3.1.8). Hält Identität, abgeleitete Keys und die Tabellen für
-/// TreeConnects/Opens.
+/// State of an authenticated (or authenticating) session
+/// (Context §19, §3.3.1.8). Holds identity, derived keys and the tables for
+/// tree connects/opens.
 /// </summary>
 public sealed class SmbSession
 {
@@ -25,7 +25,7 @@ public sealed class SmbSession
 
     public SessionState State { get; set; } = SessionState.InProgress;
 
-    /// <summary>Zustandsbehafteter SPNEGO-Kontext für den laufenden Auth-Flow.</summary>
+    /// <summary>Stateful SPNEGO context for the running auth flow.</summary>
     public ISpnegoServerContext? AuthContext { get; set; }
 
     public SecurityIdentity? Identity { get; set; }
@@ -35,22 +35,23 @@ public sealed class SmbSession
     public bool EncryptData { get; set; }
 
     /// <summary>
-    /// Voller GSS-Session-Key. Hinweis (§3.1.4.2): KDK für ALLE abgeleiteten Schlüssel ist die auf
-    /// 16 Byte gekürzte <see cref="SessionKey"/> — auch für AES-256-Cipher-Keys. Dieses Feld wird
-    /// daher aktuell nicht als KDK verwendet (siehe [AUDIT-2026-06] in Smb3KeyDerivation).
+    /// Full GSS session key. Note (§3.1.4.2): the KDK for ALL derived keys is
+    /// <see cref="SessionKey"/> truncated to 16 bytes — even for AES-256 cipher keys.
+    /// This field is therefore not currently used as the KDK (see [AUDIT-2026-06] in
+    /// Smb3KeyDerivation).
     /// </summary>
     public byte[] FullSessionKey { get; set; } = [];
 
-    /// <summary>Erste 16 Byte des GSS-Session-Keys (KDK für Signing/App/AES-128).</summary>
+    /// <summary>First 16 bytes of the GSS session key (KDK for signing/app/AES-128).</summary>
     public byte[] SessionKey { get; set; } = [];
 
-    // Abgeleitete Keys (3.x; bei 2.x ist SigningKey = voller GSS-Key, Context §8.3).
+    // Derived keys (3.x; for 2.x SigningKey = full GSS key, Context §8.3).
     public byte[] SigningKey { get; set; } = [];
     public byte[] EncryptionKey { get; set; } = [];
     public byte[] DecryptionKey { get; set; } = [];
     public byte[] ApplicationKey { get; set; } = [];
 
-    /// <summary>Preauth-Integrity-Hash der Session (3.1.1; von der Connection übernommen, Context §8.2).</summary>
+    /// <summary>Preauth integrity hash of the session (3.1.1; taken from the connection, Context §8.2).</summary>
     public PreauthIntegrityHash? PreauthHash { get; set; }
 
     public ConcurrentDictionary<ulong, SmbTreeConnect> TreeConnects { get; } = new();
@@ -59,10 +60,10 @@ public sealed class SmbSession
     private long _encryptionNonce;
 
     /// <summary>
-    /// [AUDIT-2026-06] Liefert den nächsten monoton steigenden AEAD-Nonce-Zähler (beginnt bei 1).
-    /// MS-SMB2 §3.3.4.1.4 verlangt einen je <see cref="EncryptionKey"/> eindeutigen, NICHT zufälligen
-    /// Nonce-Wert (Nonce-Wiederverwendung bricht AES-GCM/CCM). Da der EncryptionKey pro Session gilt,
-    /// genügt ein Session-lokaler Zähler. Siehe docs/SECURITY_AUDIT.md (Finding M1).
+    /// [AUDIT-2026-06] Returns the next monotonically increasing AEAD nonce counter (starts at 1).
+    /// MS-SMB2 §3.3.4.1.4 requires a unique, NON-random nonce value per <see cref="EncryptionKey"/>
+    /// (nonce reuse breaks AES-GCM/CCM). Since the encryption key is per-session, a session-local
+    /// counter suffices. See docs/SECURITY_AUDIT.md (Finding M1).
     /// </summary>
     public ulong NextEncryptionNonce() => (ulong)Interlocked.Increment(ref _encryptionNonce);
 

@@ -15,9 +15,9 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// Regressionstests für die Sicherheits-Audit-Fixes vom 2026-06 (Marker <c>[AUDIT-2026-06]</c> im
-/// Code, Details in <c>docs/SECURITY_AUDIT.md</c>). Jeder Test nagelt genau ein Finding fest und
-/// schlägt an, falls der Fix zurückgedreht wird.
+/// Regression tests for the security audit fixes from 2026-06 (marker <c>[AUDIT-2026-06]</c> in
+/// the code, details in <c>docs/SECURITY_AUDIT.md</c>). Each test pins exactly one finding and
+/// fails if the fix is reverted.
 /// </summary>
 public sealed class AuditFixTests : IDisposable
 {
@@ -36,7 +36,7 @@ public sealed class AuditFixTests : IDisposable
         try { Directory.Delete(_shareDir, true); } catch { /* ignore */ }
     }
 
-    // --- Finding M4: LOGOFF muss auf signaturpflichtiger Session signiert sein ---
+    // --- Finding M4: LOGOFF must be signed on a session that requires signing ---
 
     [Fact]
     public void Logoff_Unsigned_RejectedWhenSigningRequired()
@@ -50,17 +50,17 @@ public sealed class AuditFixTests : IDisposable
         SmbSession session = state.SessionGlobalList[ss.SessionId];
         SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(conn.Dialect, conn.SigningAlgorithmId);
 
-        // Eingeschleustes, unsigniertes LOGOFF → ACCESS_DENIED, Session bleibt gültig.
+        // Injected, unsigned LOGOFF → ACCESS_DENIED, session remains valid.
         byte[] denied = d.ProcessMessage(conn, TestHelpers.BuildLogoffRequest(2, ss.SessionId));
         Assert.Equal(NtStatus.AccessDenied, Smb2Header.Read(denied).Status);
         Assert.Equal(SessionState.Valid, state.SessionGlobalList[ss.SessionId].State);
 
-        // Korrekt signiertes LOGOFF → Success.
+        // Correctly signed LOGOFF → Success.
         byte[] ok = d.ProcessMessage(conn, TestHelpers.BuildLogoffRequest(3, ss.SessionId, session.SigningKey, alg));
         Assert.Equal(NtStatus.Success, Smb2Header.Read(ok).Status);
     }
 
-    // --- Finding H2: MessageId-Sequenzfenster wird durchgesetzt ---
+    // --- Finding H2: MessageId sequence window is enforced ---
 
     [Fact]
     public void SequenceWindow_RejectsReplayedAndOutOfWindowMessageId()
@@ -69,23 +69,23 @@ public sealed class AuditFixTests : IDisposable
         d.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
         ulong sid = Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(1, 0, [0x01]))).SessionId;
 
-        // Gültiges ECHO (mid=2) → Success; das Fenster rückt vor.
+        // Valid ECHO (mid=2) → Success; the window advances.
         Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(2, sid))).Status);
 
-        // Replay derselben MessageId (jetzt unterhalb des Fensters) → InvalidParameter.
+        // Replay of the same MessageId (now below the window) → InvalidParameter.
         Assert.Equal(NtStatus.InvalidParameter, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(2, sid))).Status);
 
-        // MessageId weit jenseits der erteilten Credits → InvalidParameter.
+        // MessageId far beyond granted credits → InvalidParameter.
         Assert.Equal(NtStatus.InvalidParameter, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(10_000_000, sid))).Status);
     }
 
-    // --- Finding H3: DesiredAccess wird gegen die MaximalAccess der Policy durchgesetzt ---
+    // --- Finding H3: DesiredAccess is enforced against the policy's MaximalAccess ---
 
     [Fact]
     public void Create_WriteAccess_DeniedWhenPolicyGrantsReadOnly()
     {
-        // FileStore ist SCHREIBBAR — die Ablehnung muss also aus der Policy (ReadOnly) kommen, nicht
-        // aus dem readOnly-Flag des Stores. So beweist der Test, dass MaximalAccess greift.
+        // FileStore is WRITABLE — the denial must come from the policy (ReadOnly), not
+        // from the store's readOnly flag. This proves that MaximalAccess takes effect.
         var policy = new DelegateSharePolicy(authorize: _ => ShareAccessResult.Grant(SmbAccessMask.ReadOnly));
         var (d, conn, sid, tid) = FileServer(policy: policy, readOnlyStore: false);
 
@@ -105,7 +105,7 @@ public sealed class AuditFixTests : IDisposable
     [Fact]
     public void Create_WriteAccess_AllowedWhenPolicyGrantsReadWrite()
     {
-        // Gegenprobe: dieselbe schreibende Anforderung wird mit ausreichender MaximalAccess gewährt.
+        // Counter-check: the same write request is granted with sufficient MaximalAccess.
         var policy = new DelegateSharePolicy(authorize: _ => ShareAccessResult.Grant(SmbAccessMask.ReadWrite));
         var (d, conn, sid, tid) = FileServer(policy: policy, readOnlyStore: false);
 
@@ -115,7 +115,7 @@ public sealed class AuditFixTests : IDisposable
         Assert.Equal(NtStatus.Success, Smb2Header.Read(writeOpen).Status);
     }
 
-    // --- Finding H1: gleichzeitig ausstehende async-Operationen werden gedeckelt ---
+    // --- Finding H1: simultaneously outstanding async operations are capped ---
 
     [Fact]
     public void OutstandingAsyncRequests_AreCappedPerConnection()
@@ -123,19 +123,19 @@ public sealed class AuditFixTests : IDisposable
         var (d, conn, sid, tid) = FileServer(
             policy: new AllowAllSharePolicy(), readOnlyStore: false,
             lockManager: new NeverGrantLockManager(), maxOutstanding: 2);
-        conn.SendRawAsync = (_, _) => Task.CompletedTask; // out-of-band-Senke (finale Antworten)
+        conn.SendRawAsync = (_, _) => Task.CompletedTask; // out-of-band sink (final responses)
 
         (ulong p, ulong v) = OpenLockFile(d, conn, sid, tid, mid: 5);
 
-        // Zwei blockierende Locks → beide bleiben PENDING (zählen als ausstehend).
+        // Two blocking locks → both remain PENDING (count as outstanding).
         Assert.Equal(NtStatus.Pending, BlockingLock(d, conn, sid, tid, p, v, mid: 6, offset: 0));
         Assert.Equal(NtStatus.Pending, BlockingLock(d, conn, sid, tid, p, v, mid: 7, offset: 100));
 
-        // Dritter blockierender Lock überschreitet die Obergrenze → INSUFFICIENT_RESOURCES.
+        // Third blocking lock exceeds the limit → INSUFFICIENT_RESOURCES.
         Assert.Equal(NtStatus.InsufficientResources, BlockingLock(d, conn, sid, tid, p, v, mid: 8, offset: 200));
     }
 
-    // --- Setup-Helfer ---
+    // --- Setup helpers ---
 
     private static (Smb2Dispatcher d, SmbServerState state, SmbConnection conn) DevServer(
         bool requireSigning, ISpnegoNegotiator negotiator)
@@ -195,11 +195,11 @@ public sealed class AuditFixTests : IDisposable
         ulong p, ulong v, ulong mid, ulong offset)
     {
         byte[] resp = d.ProcessMessage(conn, TestHelpers.BuildLockRequest(mid, sid, tid, p, v,
-            [(offset, 10, (uint)LockFlags.ExclusiveLock)])); // ohne FAIL_IMMEDIATELY → blockierend
+            [(offset, 10, (uint)LockFlags.ExclusiveLock)])); // without FAIL_IMMEDIATELY → blocking
         return Smb2Header.Read(resp).Status;
     }
 
-    /// <summary>Lock-Manager, der jede Anforderung dauerhaft "pending" hält (nur Abbruch via Token).</summary>
+    /// <summary>Lock manager that keeps every request permanently "pending" (only cancelled via token).</summary>
     private sealed class NeverGrantLockManager : ILockManager
     {
         public Task<LockOutcome> ApplyAsync(SmbOpen owner, IReadOnlyList<LockElement> e, bool fail, CancellationToken ct)

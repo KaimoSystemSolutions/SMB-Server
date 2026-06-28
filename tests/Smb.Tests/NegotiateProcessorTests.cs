@@ -60,7 +60,7 @@ public class NegotiateProcessorTests
         Assert.Equal(SmbCipherId.Aes128Gcm, connection.CipherId);
         Assert.Equal(SmbSigningAlgorithmId.AesGmac, connection.SigningAlgorithmId);
 
-        // Antwort enthält genau je einen ausgewählten Cipher/Signing-Context.
+        // Response contains exactly one selected cipher/signing context each.
         EncryptionContext enc = response.NegotiateContexts.OfType<EncryptionContext>().Single();
         Assert.Equal(SmbCipherId.Aes128Gcm, Assert.Single(enc.Ciphers));
         SigningContext sign = response.NegotiateContexts.OfType<SigningContext>().Single();

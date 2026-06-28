@@ -10,9 +10,9 @@ using Smb.Protocol.Wire;
 namespace Smb.Sample.Server;
 
 /// <summary>
-/// Kompakter SMB-Client nur für die Demo: verbindet sich über TCP, meldet sich per NTLM mit
-/// Credentials an, verbindet einen Share, listet das Verzeichnis und liest eine Datei.
-/// Verwendet Dialekt 2.1 (ohne Signing/Encryption), um die Demo schlank zu halten.
+/// Compact SMB client for the demo only: connects via TCP, authenticates via NTLM with
+/// credentials, connects a share, lists the directory and reads a file.
+/// Uses dialect 2.1 (without signing/encryption) to keep the demo lean.
 /// </summary>
 internal sealed class DemoClient : IDisposable
 {
@@ -98,7 +98,7 @@ internal sealed class DemoClient : IDisposable
         return payload;
     }
 
-    // --- Request-Bauer (kompakt, Dialekt 2.1) ---
+    // --- Request builders (compact, dialect 2.1) ---
 
     private byte[] Header(SmbCommand cmd) => new Smb2Header
     {
@@ -181,7 +181,7 @@ internal sealed class DemoClient : IDisposable
         return Concat(Header(SmbCommand.Close), b.ToArray());
     }
 
-    // --- Parse-Hilfen ---
+    // --- Parse helpers ---
 
     private static byte[] SecurityBuffer(byte[] resp)
     {

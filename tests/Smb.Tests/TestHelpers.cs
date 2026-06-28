@@ -160,8 +160,8 @@ internal static class TestHelpers
         return message;
     }
 
-    /// <summary>Baut einen CREATE-Request (öffnet Datei/Verzeichnis). <paramref name="requestedOplockLevel"/>
-    /// belegt das RequestedOplockLevel-Byte (0=None, 1=LevelII, 8=Exclusive, 9=Batch).</summary>
+    /// <summary>Builds a CREATE request (opens a file/directory). <paramref name="requestedOplockLevel"/>
+    /// sets the RequestedOplockLevel byte (0=None, 1=LevelII, 8=Exclusive, 9=Batch).</summary>
     public static byte[] BuildCreateRequest(ulong messageId, ulong sessionId, uint treeId, string name,
         uint desiredAccess, uint disposition, uint options, byte[]? signingKey = null,
         SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac, byte requestedOplockLevel = 0)
@@ -353,7 +353,7 @@ internal static class TestHelpers
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
     }
 
-    /// <summary>Baut einen CHANGE_NOTIFY-Request für ein Verzeichnis-Handle.</summary>
+    /// <summary>Builds a CHANGE_NOTIFY request for a directory handle.</summary>
     public static byte[] BuildChangeNotifyRequest(ulong messageId, ulong sessionId, uint treeId,
         ulong persistentId, ulong volatileId, uint completionFilter, ushort flags = 0,
         uint outputBufferLength = 65536, byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)

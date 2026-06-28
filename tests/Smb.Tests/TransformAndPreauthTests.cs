@@ -23,7 +23,7 @@ public class TransformAndPreauthTests
 
         byte[] frame = Smb2Transform.Encrypt(cipher, key, sessionId, nonce, plaintext);
 
-        // Frame beginnt mit Transform-ProtocolId und ist um den Header länger.
+        // Frame starts with Transform protocol ID and is longer by the header size.
         Assert.True(SmbProtocolIds.IsTransform(frame));
         Assert.Equal(TransformHeader.Size + plaintext.Length, frame.Length);
 
@@ -39,8 +39,8 @@ public class TransformAndPreauthTests
         byte[] nonce = RandomNumberGenerator.GetBytes(12);
         byte[] frame = Smb2Transform.Encrypt(SmbCipherId.Aes128Gcm, key, 1, nonce, plaintext);
 
-        frame[^1] ^= 0xFF; // letztes Ciphertext-Byte verfälschen
-        // AesGcm wirft AuthenticationTagMismatchException (abgeleitet von CryptographicException).
+        frame[^1] ^= 0xFF; // corrupt last ciphertext byte
+        // AesGcm throws AuthenticationTagMismatchException (derived from CryptographicException).
         Assert.ThrowsAny<CryptographicException>(() => Smb2Transform.Decrypt(SmbCipherId.Aes128Gcm, key, frame));
     }
 
@@ -73,7 +73,7 @@ public class TransformAndPreauthTests
         hash.Append(msg1);
         hash.Append(msg2);
 
-        // Unabhängige Referenzberechnung: H=0; H=SHA512(H‖m1); H=SHA512(H‖m2).
+        // Independent reference computation: H=0; H=SHA512(H‖m1); H=SHA512(H‖m2).
         byte[] h = new byte[64];
         h = SHA512.HashData(Concat(h, msg1));
         h = SHA512.HashData(Concat(h, msg2));
@@ -90,7 +90,7 @@ public class TransformAndPreauthTests
         PreauthIntegrityHash clone = hash.Clone();
         clone.Append(new byte[] { 4, 5, 6 });
 
-        Assert.NotEqual(hash.Value, clone.Value); // Clone-Änderung darf Original nicht beeinflussen.
+        Assert.NotEqual(hash.Value, clone.Value); // changes to the clone must not affect the original.
     }
 
     private static byte[] Concat(byte[] a, byte[] b)

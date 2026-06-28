@@ -4,20 +4,20 @@ using Smb.Server.State;
 namespace Smb.Server.Oplocks;
 
 /// <summary>
-/// Prozesslokaler Default-<see cref="IOplockManager"/>: verwaltet die gewährten Oplocks in-memory,
-/// gruppiert pro Datei (Schlüssel = realer Backend-Pfad des Open, identisch zum
-/// <see cref="Locking.InMemoryLockManager"/>). Die Granting-Policy ist bewusst konservativ:
+/// Process-local default <see cref="IOplockManager"/>: manages granted oplocks in memory,
+/// grouped per file (key = actual backend path of the open, identical to
+/// <see cref="Locking.InMemoryLockManager"/>). The granting policy is intentionally conservative:
 /// <list type="bullet">
-/// <item>Ein <b>einzelner</b> Open auf eine Datei erhält den angeforderten Oplock — auch
+/// <item>A <b>single</b> open on a file receives the requested oplock level — including
 /// Exclusive/Batch.</item>
-/// <item>Sobald ein <b>weiterer</b> Open dieselbe Datei öffnet, brechen gehaltene Exclusive/Batch-
-/// Oplocks auf <see cref="OplockLevel.LevelII"/> (Read-Caching bleibt); der neue Open erhält selbst
-/// höchstens Level II.</item>
+/// <item>Once a <b>second</b> open accesses the same file, held Exclusive/Batch oplocks break
+/// down to <see cref="OplockLevel.LevelII"/> (read caching is preserved); the new open receives
+/// at most Level II itself.</item>
 /// </list>
-/// Damit ist die Kern-Mechanik (Grant → Break → Acknowledge → Release) abgebildet. Bewusst <i>nicht</i>
-/// modelliert sind das Brechen von Level II auf None bei schreibendem Zweitzugriff sowie das Warten
-/// auf das Acknowledgment, bevor der konfligierende Zugriff fortfährt — beides bleibt einem späteren
-/// Schliff vorbehalten (siehe README-Roadmap).
+/// This covers the core mechanics (Grant → Break → Acknowledge → Release). Intentionally <i>not</i>
+/// modelled: breaking Level II to None on a writing second access, and waiting for the
+/// acknowledgment before the conflicting access proceeds — both are deferred to a later pass
+/// (see README roadmap).
 /// </summary>
 public sealed class InMemoryOplockManager : IOplockManager
 {
@@ -26,8 +26,8 @@ public sealed class InMemoryOplockManager : IOplockManager
 
     public OplockGrant RequestOplock(SmbOpen open, OplockLevel requested)
     {
-        // Nur klassische Oplocks behandeln; ein Lease (0xFF) läuft über CREATE-Contexts und ist
-        // (noch) nicht implementiert → kein Oplock.
+        // Only handle classic oplocks; a lease (0xFF) goes via CREATE contexts and is
+        // not yet implemented → no oplock.
         if (requested is not (OplockLevel.LevelII or OplockLevel.Exclusive or OplockLevel.Batch))
             return OplockGrant.None;
 
@@ -38,13 +38,13 @@ public sealed class InMemoryOplockManager : IOplockManager
 
             if (state.Holders.Count == 0)
             {
-                // Solo-Open: bekommt das angeforderte Level (auch Exclusive/Batch).
+                // Solo open: receives the requested level (including Exclusive/Batch).
                 state.Holders.Add(new Holder(open, requested));
                 return new OplockGrant(requested, Array.Empty<OplockBreak>());
             }
 
-            // Weiterer Open auf dieselbe Datei: gehaltene Exclusive/Batch-Oplocks müssen auf Level II
-            // herabbrechen. Ein exklusiver Oplock wird bei Mehrfach-Open nicht (mehr) gewährt.
+            // Another open on the same file: held Exclusive/Batch oplocks must break to Level II.
+            // An exclusive oplock is no longer granted with multiple opens.
             var breaks = new List<OplockBreak>();
             foreach (Holder h in state.Holders)
             {
@@ -71,7 +71,7 @@ public sealed class InMemoryOplockManager : IOplockManager
             {
                 if (ReferenceEquals(h.Open, open))
                 {
-                    h.Level = newLevel;   // Ein Acknowledgment stuft nur herab; der Client bestimmt das Ziel-Level.
+                    h.Level = newLevel;   // An acknowledgment only downgrades; the client determines the target level.
                     return h.Level;
                 }
             }
@@ -91,7 +91,7 @@ public sealed class InMemoryOplockManager : IOplockManager
         }
     }
 
-    // --- intern ---
+    // --- internal ---
 
     private FileOplockState GetOrAdd(string key)
     {

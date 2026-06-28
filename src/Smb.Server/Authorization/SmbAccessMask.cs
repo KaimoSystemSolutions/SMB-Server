@@ -1,8 +1,8 @@
 namespace Smb.Server.Authorization;
 
 /// <summary>
-/// NT-Access-Mask-Bits (Context §13.1, MS-DTYP ACCESS_MASK). Wird als gewährte Zugriffsmaske
-/// (MaximalAccess) bei TREE_CONNECT/CREATE genutzt — Clients respektieren diese Maske.
+/// NT access mask bits (Context §13.1, MS-DTYP ACCESS_MASK). Used as the granted access mask
+/// (MaximalAccess) at TREE_CONNECT/CREATE — clients respect this mask.
 /// </summary>
 [Flags]
 public enum SmbAccessMask : uint
@@ -31,18 +31,18 @@ public enum SmbAccessMask : uint
     GenericWrite = 0x40000000,
     GenericRead = 0x80000000,
 
-    /// <summary>Voller Zugriff (FILE_ALL_ACCESS = 0x001F01FF).</summary>
+    /// <summary>Full access (FILE_ALL_ACCESS = 0x001F01FF).</summary>
     FullAccess =
         FileReadData | FileWriteData | FileAppendData | FileReadEa | FileWriteEa |
         FileExecute | FileDeleteChild | FileReadAttributes | FileWriteAttributes |
         Delete | ReadControl | WriteDac | WriteOwner | Synchronize,
 
-    /// <summary>Nur-Lese-Zugriff (lesen + Attribute + Execute + ReadControl + Synchronize).</summary>
+    /// <summary>Read-only access (read + attributes + execute + ReadControl + Synchronize).</summary>
     ReadOnly =
         FileReadData | FileReadEa | FileReadAttributes | FileExecute |
         ReadControl | Synchronize,
 
-    /// <summary>Lesen und Schreiben (kein Löschen/keine ACL-Änderung).</summary>
+    /// <summary>Read and write (no delete/no ACL modification).</summary>
     ReadWrite =
         FileReadData | FileWriteData | FileAppendData | FileReadEa | FileWriteEa |
         FileReadAttributes | FileWriteAttributes | FileExecute | ReadControl | Synchronize,

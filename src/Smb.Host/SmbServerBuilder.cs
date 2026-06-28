@@ -12,9 +12,9 @@ using Smb.Server.Notification;
 namespace Smb.Host;
 
 /// <summary>
-/// Fluent-Builder für einen <see cref="SmbServer"/> mit sicheren Defaults (Context §20).
-/// Macht die Lib "einfach und dynamisch" nutzbar: Endpoint, Auth-Provider und Shares
-/// werden deklarativ zusammengesteckt.
+/// Fluent builder for a <see cref="SmbServer"/> with secure defaults (Context §20).
+/// Makes the library "simple and dynamic" to use: endpoint, auth provider and shares
+/// are assembled declaratively.
 /// </summary>
 public sealed class SmbServerBuilder
 {
@@ -24,7 +24,7 @@ public sealed class SmbServerBuilder
 
     public static SmbServerBuilder Create() => new();
 
-    /// <summary>Setzt den Lausch-Endpunkt (Default 0.0.0.0:445).</summary>
+    /// <summary>Sets the listen endpoint (default 0.0.0.0:445).</summary>
     public SmbServerBuilder WithEndpoint(IPAddress address, int port)
     {
         _endpoint = new IPEndPoint(address, port);
@@ -37,14 +37,14 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    /// <summary>Setzt den Servernamen (Anzeige/NETNAME).</summary>
+    /// <summary>Sets the server name (display/NETNAME).</summary>
     public SmbServerBuilder WithServerName(string name)
     {
         _options.ServerName = name;
         return this;
     }
 
-    /// <summary>Begrenzt den Dialektbereich (Default 2.0.2 … 3.1.1).</summary>
+    /// <summary>Limits the dialect range (default 2.0.2 … 3.1.1).</summary>
     public SmbServerBuilder WithDialectRange(SmbDialect min, SmbDialect max)
     {
         _options.MinDialect = min;
@@ -52,21 +52,21 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    /// <summary>Signing erzwingen (Default true) oder lockern.</summary>
+    /// <summary>Require signing (default true) or relax it.</summary>
     public SmbServerBuilder RequireSigning(bool require = true)
     {
         _options.RequireMessageSigning = require;
         return this;
     }
 
-    /// <summary>Verschlüsselung global verlangen (Default false; pro Share aktivierbar).</summary>
+    /// <summary>Require encryption globally (default false; can be enabled per share).</summary>
     public SmbServerBuilder RequireEncryption(bool require = true)
     {
         _options.RequireEncryption = require;
         return this;
     }
 
-    /// <summary>Setzt den Auth-Provider (SPNEGO/GSS) — z.B. NTLM/Kerberos (Context §9).</summary>
+    /// <summary>Sets the auth provider (SPNEGO/GSS) — e.g. NTLM/Kerberos (Context §9).</summary>
     public SmbServerBuilder UseAuthentication(ISpnegoNegotiator negotiator)
     {
         _options.SpnegoNegotiator = negotiator;
@@ -82,7 +82,7 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    /// <summary>Fügt einen Share hinzu.</summary>
+    /// <summary>Adds a share.</summary>
     public SmbServerBuilder AddShare(IShare share)
     {
         _options.Shares.Add(share);
@@ -90,10 +90,10 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
-    /// Fügt einen schreibbaren Disk-Share mit Versionierung („Vorherige Versionen") hinzu: ein
-    /// <see cref="LocalFileStore"/> über <paramref name="directory"/>, umhüllt von einem
-    /// <see cref="VersioningFileStore"/>. Überschriebene Datei-Inhalte bleiben als Snapshots
-    /// über <c>@GMT-…</c>-Pfade und FSCTL_SRV_ENUMERATE_SNAPSHOTS abrufbar.
+    /// Adds a writable disk share with versioning ("Previous Versions"): a
+    /// <see cref="LocalFileStore"/> over <paramref name="directory"/>, wrapped by a
+    /// <see cref="VersioningFileStore"/>. Overwritten file contents remain available as snapshots
+    /// via <c>@GMT-…</c> paths and FSCTL_SRV_ENUMERATE_SNAPSHOTS.
     /// </summary>
     public SmbServerBuilder AddVersionedShare(
         string name, string directory, bool encrypt = false, string remark = "", int maxVersionsPerFile = 64)
@@ -111,7 +111,7 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
-    /// Setzt die Autorisierungs-Policy (Share-Sichtbarkeit + Zugriffsprüfung beim TREE_CONNECT).
+    /// Sets the authorization policy (share visibility + access check at TREE_CONNECT).
     /// </summary>
     public SmbServerBuilder UseShareAuthorization(IShareAccessPolicy policy)
     {
@@ -120,9 +120,9 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
-    /// Hakt die Autorisierung per Lambda ein — ideal für eigene Fileserver-Logik:
-    /// <paramref name="authorizeConnect"/> entscheidet Zugriff + Zugriffsmaske beim TREE_CONNECT,
-    /// <paramref name="isVisible"/> filtert die Share-Anzeige (Default: alle sichtbar).
+    /// Hooks in authorization via lambda — ideal for custom file server logic:
+    /// <paramref name="authorizeConnect"/> decides access + access mask at TREE_CONNECT,
+    /// <paramref name="isVisible"/> filters share visibility (default: all visible).
     /// </summary>
     public SmbServerBuilder UseShareAuthorization(
         Func<ShareAccessContext, ShareAccessResult> authorizeConnect,
@@ -133,9 +133,9 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
-    /// Setzt die Byte-Range-Lock-Verwaltung (SMB2 LOCK, Context §15). Default ist prozesslokal
-    /// (<see cref="InMemoryLockManager"/>); eine eigene <see cref="ILockManager"/>-Implementierung
-    /// kann das Locking z.B. ans Betriebssystem oder einen Cluster delegieren.
+    /// Sets the byte-range lock management (SMB2 LOCK, Context §15). Default is process-local
+    /// (<see cref="InMemoryLockManager"/>); a custom <see cref="ILockManager"/> implementation
+    /// can delegate locking to the OS or a cluster, for example.
     /// </summary>
     public SmbServerBuilder UseLockManager(ILockManager lockManager)
     {
@@ -144,9 +144,9 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
-    /// Setzt die Quelle für CHANGE_NOTIFY (Context §16). Default überwacht echte Verzeichnisse via
-    /// <see cref="FileSystemWatcher"/>; eine eigene <see cref="IDirectoryWatcher"/>-Implementierung
-    /// kann an inotify, ZFS-Events o.ä. andocken, oder <see cref="NullDirectoryWatcher"/> schaltet ab.
+    /// Sets the source for CHANGE_NOTIFY (Context §16). Default monitors real directories via
+    /// <see cref="FileSystemWatcher"/>; a custom <see cref="IDirectoryWatcher"/> implementation
+    /// can hook into inotify, ZFS events, etc., or <see cref="NullDirectoryWatcher"/> disables it.
     /// </summary>
     public SmbServerBuilder UseDirectoryWatcher(IDirectoryWatcher watcher)
     {
@@ -154,14 +154,14 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    /// <summary>Konfiguriert die Optionen direkt (für Feineinstellungen).</summary>
+    /// <summary>Configures options directly (for fine-grained settings).</summary>
     public SmbServerBuilder Configure(Action<SmbServerOptions> configure)
     {
         configure(_options);
         return this;
     }
 
-    /// <summary>Setzt einen Log-Callback (z.B. Konsole).</summary>
+    /// <summary>Sets a log callback (e.g. console).</summary>
     public SmbServerBuilder WithLogger(Action<string> log)
     {
         _log = log;

@@ -1,13 +1,13 @@
-using Smb.Server.State;
+﻿using Smb.Server.State;
 
 namespace Smb.Server.Locking;
 
 /// <summary>
-/// Prozesslokaler Default-<see cref="ILockManager"/>: hält Byte-Range-Locks in-memory, gruppiert
-/// pro Datei (Schlüssel = realer Backend-Pfad des Open). Konflikte werden nur zwischen
-/// <i>verschiedenen</i> Opens geprüft; ein Open kollidiert nie mit sich selbst. Blockierende
-/// Locks (ohne <c>FAIL_IMMEDIATELY</c>) warten asynchron über einen
-/// <see cref="TaskCompletionSource{TResult}"/>, der bei Unlock/Close erneut ausgewertet wird.
+/// Process-local default <see cref="ILockManager"/>: holds byte-range locks in memory, grouped
+/// per file (key = actual backend path of the open). Conflicts are only checked between
+/// <i>different</i> opens; an open never conflicts with itself. Blocking
+/// locks (without <c>FAIL_IMMEDIATELY</c>) wait asynchronously via a
+/// <see cref="TaskCompletionSource{TResult}"/> that is re-evaluated on unlock/close.
 /// </summary>
 public sealed class InMemoryLockManager : ILockManager
 {
@@ -26,7 +26,7 @@ public sealed class InMemoryLockManager : ILockManager
             if (elements[0].Unlock)
                 return Task.FromResult(ApplyUnlocks(state, owner, elements));
 
-            // Lock-Pfad: alle Elemente atomar auf Konflikt prüfen.
+            // Lock path: atomically check all elements for conflicts.
             bool conflict = false;
             foreach (LockElement e in elements)
                 if (Conflicts(state, owner, e.Offset, e.Length, e.Exclusive)) { conflict = true; break; }
@@ -38,16 +38,16 @@ public sealed class InMemoryLockManager : ILockManager
                 return Task.FromResult(LockOutcome.Granted);
             }
 
-            // Konflikt: ohne Warten (oder bei Mehrfach-Locks) sofort scheitern.
+            // Conflict: fail immediately without waiting (or for multi-element locks).
             if (failImmediately || elements.Count != 1)
                 return Task.FromResult(LockOutcome.Conflict);
 
-            // Genau ein blockierendes Lock → asynchron warten, bis der Bereich frei wird.
+            // Exactly one blocking lock → wait asynchronously until the range becomes free.
             LockElement single = elements[0];
             var tcs = new TaskCompletionSource<LockOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
             var waiter = new Waiter(owner, single.Offset, single.Length, single.Exclusive, tcs);
             state.Waiters.Add(waiter);
-            // CANCEL/Close lösen ct aus → Waiter entfernen und abbrechen.
+            // CANCEL/Close triggers ct → remove waiter and cancel.
             waiter.Registration = ct.Register(() =>
             {
                 lock (_gate) { if (!state.Waiters.Remove(waiter)) return; }
@@ -66,9 +66,9 @@ public sealed class InMemoryLockManager : ILockManager
             if (!_files.TryGetValue(key, out FileLockState? state)) return true;
             foreach (ActiveLock a in state.Active)
             {
-                if (ReferenceEquals(a.Owner, owner)) continue;       // eigene Locks blockieren nie
+                if (ReferenceEquals(a.Owner, owner)) continue;       // own locks never block
                 if (!Overlaps(offset, length, a.Offset, a.Length)) continue;
-                if (forWrite || a.Exclusive) return false;           // Read kollidiert nur mit exklusiven
+                if (forWrite || a.Exclusive) return false;           // read conflicts only with exclusive
             }
             return true;
         }
@@ -101,8 +101,8 @@ public sealed class InMemoryLockManager : ILockManager
 
     private LockOutcome ApplyUnlocks(FileLockState state, SmbOpen owner, IReadOnlyList<LockElement> elements)
     {
-        // Jeder Unlock muss exakt ein Lock desselben Open treffen (Offset+Length). Erst alle finden
-        // (Atomarität), dann entfernen — bei Fehlen STATUS_RANGE_NOT_LOCKED ohne Änderung.
+        // Each unlock must match exactly one lock from the same open (offset+length). Find all first
+        // (atomicity), then remove — if any is missing return STATUS_RANGE_NOT_LOCKED without change.
         var indices = new List<int>(elements.Count);
         foreach (LockElement e in elements)
         {
@@ -125,7 +125,7 @@ public sealed class InMemoryLockManager : ILockManager
         return LockOutcome.Granted;
     }
 
-    /// <summary>Prüft wartende Locks erneut und gewährt alle, die jetzt konfliktfrei sind.</summary>
+    /// <summary>Re-evaluates waiting locks and grants all that are now conflict-free.</summary>
     private static void WakeWaiters(FileLockState state)
     {
         for (int i = 0; i < state.Waiters.Count; )
@@ -149,12 +149,12 @@ public sealed class InMemoryLockManager : ILockManager
         {
             if (ReferenceEquals(a.Owner, owner)) continue;
             if (!Overlaps(offset, length, a.Offset, a.Length)) continue;
-            if (exclusive || a.Exclusive) return true;   // Konflikt, sobald eine Seite exklusiv ist
+            if (exclusive || a.Exclusive) return true;   // conflict as soon as one side is exclusive
         }
         return false;
     }
 
-    /// <summary>Überlappung zweier Byte-Bereiche, überlaufsicher via 128-Bit-Endberechnung.</summary>
+    /// <summary>Overlap of two byte ranges, overflow-safe via 128-bit end calculation.</summary>
     private static bool Overlaps(ulong aOff, ulong aLen, ulong bOff, ulong bLen)
     {
         if (aLen == 0 || bLen == 0) return false;

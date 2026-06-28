@@ -13,8 +13,8 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// Voller Pfad mit echten Credentials: NEGOTIATE → NTLM-Login → TREE_CONNECT →
-/// CREATE/QUERY_DIRECTORY/READ/CLOSE über einen lokal hinterlegten Ordner.
+/// Full path with real credentials: NEGOTIATE → NTLM login → TREE_CONNECT →
+/// CREATE/QUERY_DIRECTORY/READ/CLOSE over a locally backed folder.
 /// </summary>
 public class FileBrowseTests : IDisposable
 {
@@ -24,7 +24,7 @@ public class FileBrowseTests : IDisposable
     {
         _shareDir = Path.Combine(Path.GetTempPath(), "smbtest_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_shareDir);
-        File.WriteAllText(Path.Combine(_shareDir, "hello.txt"), "Hallo SMB!");
+        File.WriteAllText(Path.Combine(_shareDir, "hello.txt"), "Hello SMB!");
         File.WriteAllBytes(Path.Combine(_shareDir, "data.bin"), [1, 2, 3, 4, 5]);
     }
 
@@ -36,13 +36,13 @@ public class FileBrowseTests : IDisposable
     [Fact]
     public void Login_Mount_List_Read_Works()
     {
-        // --- Server mit echtem NTLM + lokalem Ordner-Backend ---
+        // --- Server with real NTLM + local folder backend ---
         var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "S3cret!");
         var options = new SmbServerOptions
         {
             ServerGuid = new byte[16],
             SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
-            RequireMessageSigning = false, // Test fokussiert auf Datei-I/O; Signing-Pfad ist separat getestet
+            RequireMessageSigning = false, // test focuses on file I/O; signing path is tested separately
         };
         options.Shares.Add(Share.CreateIpc());
         options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: true) });
@@ -54,7 +54,7 @@ public class FileBrowseTests : IDisposable
         // --- NEGOTIATE ---
         dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
 
-        // --- NTLM-Login mit Credentials ---
+        // --- NTLM login with credentials ---
         var client = new NtlmClient("DOM", "alice", "S3cret!");
         byte[] r1 = dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
         var h1 = Smb2Header.Read(r1);
@@ -71,7 +71,7 @@ public class FileBrowseTests : IDisposable
         Assert.Equal(NtStatus.Success, tcHeader.Status);
         uint treeId = tcHeader.TreeId;
 
-        // --- CREATE (Wurzelverzeichnis öffnen) ---
+        // --- CREATE (open root directory) ---
         byte[] openDir = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
             4, sessionId, treeId, name: "", desiredAccess: 0x00000001,
             disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.DirectoryFile));
@@ -87,7 +87,7 @@ public class FileBrowseTests : IDisposable
         Assert.Contains("hello.txt", names);
         Assert.Contains("data.bin", names);
 
-        // --- CREATE (Datei öffnen) + READ + CLOSE ---
+        // --- CREATE (open file) + READ + CLOSE ---
         byte[] openFile = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
             6, sessionId, treeId, name: "hello.txt", desiredAccess: 0x00000001,
             disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile));
@@ -97,7 +97,7 @@ public class FileBrowseTests : IDisposable
         byte[] read = dispatcher.ProcessMessage(conn, TestHelpers.BuildReadRequest(
             7, sessionId, treeId, filePersistent, fileVolatile, length: 256, offset: 0));
         Assert.Equal(NtStatus.Success, Smb2Header.Read(read).Status);
-        Assert.Equal("Hallo SMB!", Encoding.UTF8.GetString(ExtractReadData(read)));
+        Assert.Equal("Hello SMB!", Encoding.UTF8.GetString(ExtractReadData(read)));
 
         byte[] close = dispatcher.ProcessMessage(conn, TestHelpers.BuildCloseRequest(8, sessionId, treeId, filePersistent, fileVolatile));
         Assert.Equal(NtStatus.Success, Smb2Header.Read(close).Status);
@@ -120,9 +120,9 @@ public class FileBrowseTests : IDisposable
 
         (ulong sessionId, uint treeId) = LoginAndConnect(dispatcher, conn);
 
-        // --- Datei schreiben ---
+        // --- Write file ---
         byte[] create = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
-            4, sessionId, treeId, "neu.txt", desiredAccess: 0x00000003 /* read+write */,
+            4, sessionId, treeId, "new.txt", desiredAccess: 0x00000003 /* read+write */,
             disposition: (uint)CreateDisposition.OverwriteIf, options: (uint)CreateOptions.NonDirectoryFile));
         Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
         (ulong p, ulong v) = ExtractCreateFileId(create);
@@ -132,11 +132,11 @@ public class FileBrowseTests : IDisposable
         Assert.Equal(NtStatus.Success, Smb2Header.Read(write).Status);
         dispatcher.ProcessMessage(conn, TestHelpers.BuildCloseRequest(6, sessionId, treeId, p, v));
 
-        Assert.Equal("Test123", File.ReadAllText(Path.Combine(_shareDir, "neu.txt")));
+        Assert.Equal("Test123", File.ReadAllText(Path.Combine(_shareDir, "new.txt")));
 
-        // --- Datei löschen (SET_INFO FileDispositionInformation + CLOSE) ---
+        // --- Delete file (SET_INFO FileDispositionInformation + CLOSE) ---
         byte[] openForDelete = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
-            7, sessionId, treeId, "neu.txt", desiredAccess: 0x00010000 /* DELETE */,
+            7, sessionId, treeId, "new.txt", desiredAccess: 0x00010000 /* DELETE */,
             disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile));
         (ulong dp, ulong dv) = ExtractCreateFileId(openForDelete);
 
@@ -146,7 +146,7 @@ public class FileBrowseTests : IDisposable
         Assert.Equal(NtStatus.Success, Smb2Header.Read(setInfo).Status);
         dispatcher.ProcessMessage(conn, TestHelpers.BuildCloseRequest(9, sessionId, treeId, dp, dv));
 
-        Assert.False(File.Exists(Path.Combine(_shareDir, "neu.txt")), "Datei sollte nach DELETE_ON_CLOSE weg sein.");
+        Assert.False(File.Exists(Path.Combine(_shareDir, "new.txt")), "File should be gone after DELETE_ON_CLOSE.");
     }
 
     [Fact]
@@ -168,13 +168,13 @@ public class FileBrowseTests : IDisposable
 
         // mkdir
         byte[] mkdir = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
-            4, sessionId, treeId, "neuerOrdner", desiredAccess: 0x001F01FF,
+            4, sessionId, treeId, "newFolder", desiredAccess: 0x001F01FF,
             disposition: (uint)CreateDisposition.Create, options: (uint)CreateOptions.DirectoryFile));
         Assert.Equal(NtStatus.Success, Smb2Header.Read(mkdir).Status);
-        Assert.True(Directory.Exists(Path.Combine(_shareDir, "neuerOrdner")));
+        Assert.True(Directory.Exists(Path.Combine(_shareDir, "newFolder")));
         (ulong p, ulong v) = ExtractCreateFileId(mkdir);
 
-        // Das neue (leere) Verzeichnis listen → "." und ".." erwartet.
+        // List the new (empty) directory → expect "." and "..".
         byte[] list = dispatcher.ProcessMessage(conn, TestHelpers.BuildQueryDirectoryRequest(
             5, sessionId, treeId, p, v,
             (byte)FileInformationClass.FileIdBothDirectoryInformation, "*", outputBufferLength: 65536));
@@ -228,7 +228,7 @@ public class FileBrowseTests : IDisposable
         Assert.Equal(NtStatus.ObjectNameNotFound, Smb2Header.Read(open).Status);
     }
 
-    // --- Parse-Hilfen ---
+    // --- Parse helpers ---
 
     private static byte[] ExtractSecurityBuffer(byte[] response)
     {
@@ -240,7 +240,7 @@ public class FileBrowseTests : IDisposable
 
     private static (ulong persistent, ulong vol) ExtractCreateFileId(byte[] response)
     {
-        // CREATE-Response: FileId persistent bei Body-Offset 64, volatile bei 72.
+        // CREATE response: FileId persistent at body offset 64, volatile at 72.
         const int body = Smb2Header.Size;
         ulong persistent = BinaryPrimitives.ReadUInt64LittleEndian(response.AsSpan(body + 64, 8));
         ulong vol = BinaryPrimitives.ReadUInt64LittleEndian(response.AsSpan(body + 72, 8));
@@ -266,7 +266,7 @@ public class FileBrowseTests : IDisposable
         {
             int next = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos, 4));
             int nameLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos + 60, 4));
-            // FileIdBothDirectoryInformation: Name beginnt bei Eintrags-Offset 104.
+            // FileIdBothDirectoryInformation: name starts at entry offset 104.
             names.Add(Encoding.Unicode.GetString(buffer.Slice(pos + 104, nameLen)));
             if (next == 0) break;
             pos += next;

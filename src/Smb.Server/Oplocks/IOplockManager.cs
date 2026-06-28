@@ -4,15 +4,15 @@ using Smb.Server.State;
 namespace Smb.Server.Oplocks;
 
 /// <summary>
-/// Ein fälliger Oplock-Break: Der <see cref="Holder"/> hält aktuell einen Oplock, der wegen eines
-/// neuen, konfligierenden Zugriffs auf <see cref="NewLevel"/> herabgestuft werden muss. Der
-/// Dispatcher verschickt daraufhin eine OPLOCK_BREAK-Notification an den Halter (Effect).
+/// A pending oplock break: the <see cref="Holder"/> currently holds an oplock that must be
+/// downgraded to <see cref="NewLevel"/> due to a new, conflicting access. The dispatcher
+/// then sends an OPLOCK_BREAK notification to the holder.
 /// </summary>
 public readonly record struct OplockBreak(SmbOpen Holder, OplockLevel NewLevel);
 
 /// <summary>
-/// Ergebnis einer Oplock-Anforderung beim CREATE: das tatsächlich gewährte Level plus die durch
-/// diesen Open ausgelösten Breaks an <i>andere</i> Halter.
+/// Result of an oplock request at CREATE: the actually granted level plus the breaks
+/// triggered by this open against <i>other</i> holders.
 /// </summary>
 public readonly record struct OplockGrant(OplockLevel GrantedLevel, IReadOnlyList<OplockBreak> Breaks)
 {
@@ -20,42 +20,42 @@ public readonly record struct OplockGrant(OplockLevel GrantedLevel, IReadOnlyLis
 }
 
 /// <summary>
-/// <b>Einhak-Punkt für Oplocks (SMB2, Context §15, MS-SMB2 §3.3.5.9/§3.3.4.6).</b> Der Server
-/// delegiert jede Oplock-Entscheidung hierher; die Default-Implementierung
-/// <see cref="InMemoryOplockManager"/> verwaltet die gewährten Oplocks prozesslokal je Datei.
+/// <b>Oplock seam (SMB2, Context §15, MS-SMB2 §3.3.5.9/§3.3.4.6).</b> The server delegates
+/// every oplock decision here; the default implementation
+/// <see cref="InMemoryOplockManager"/> manages granted oplocks process-locally per file.
 /// <para>
-/// Die Schnittstelle ist <b>reiner Zustand</b> (Parse↔State↔Effect, Context §2): Sie <i>entscheidet</i>,
-/// welche Breaks fällig sind, verschickt sie aber nicht — das übernimmt der Dispatcher out-of-band
-/// über <see cref="SmbConnection.SendRawAsync"/>. So bleibt die Oplock-Policy frei von I/O und
-/// testbar; eine eigene Implementierung kann sie z.B. an einen Cluster-Koordinator delegieren.
+/// The interface is <b>pure state</b> (Parse↔State↔Effect, Context §2): it <i>decides</i>
+/// which breaks are pending but does not send them — the dispatcher handles that out-of-band
+/// via <see cref="SmbConnection.SendRawAsync"/>. This keeps the oplock policy free of I/O
+/// and testable; a custom implementation can delegate to a cluster coordinator, for example.
 /// </para>
-/// Verdrahtung: <c>SmbServerOptions.OplockManager</c>.
+/// Wiring: <c>SmbServerOptions.OplockManager</c>.
 /// </summary>
 public interface IOplockManager
 {
     /// <summary>
-    /// Registriert einen neuen Open und gewährt — abhängig von bereits offenen Handles derselben
-    /// Datei — das passende Oplock-Level (MS-SMB2 §3.3.5.9). Konfligiert die Anforderung mit
-    /// bestehenden Oplocks anderer Opens, enthält <see cref="OplockGrant.Breaks"/> die fälligen
-    /// Herabstufungen; deren Halter werden vom Dispatcher benachrichtigt.
+    /// Registers a new open and grants — depending on already open handles for the same file —
+    /// the appropriate oplock level (MS-SMB2 §3.3.5.9). If the request conflicts with existing
+    /// oplocks of other opens, <see cref="OplockGrant.Breaks"/> contains the pending downgrades;
+    /// their holders are notified by the dispatcher.
     /// </summary>
     OplockGrant RequestOplock(SmbOpen open, OplockLevel requested);
 
     /// <summary>
-    /// Verarbeitet das OPLOCK_BREAK-Acknowledgment eines Clients (§3.3.5.22.1): der Halter bestätigt
-    /// die Herabstufung seines Oplocks auf <paramref name="newLevel"/>. Liefert das nun gültige Level
-    /// (in der Regel <paramref name="newLevel"/>) für die Antwort zurück.
+    /// Processes an OPLOCK_BREAK acknowledgment from a client (§3.3.5.22.1): the holder
+    /// confirms the downgrade of its oplock to <paramref name="newLevel"/>. Returns the now
+    /// active level (typically <paramref name="newLevel"/>) for the response.
     /// </summary>
     OplockLevel Acknowledge(SmbOpen open, OplockLevel newLevel);
 
-    /// <summary>Gibt beim CLOSE den Oplock dieses Open frei (MS-SMB2 §3.3.5.10).</summary>
+    /// <summary>At CLOSE, releases the oplock of this open (MS-SMB2 §3.3.5.10).</summary>
     void ReleaseOwner(SmbOpen open);
 }
 
 /// <summary>
-/// <see cref="IOplockManager"/>, der nie einen Oplock gewährt — CREATE liefert stets
-/// <see cref="OplockLevel.None"/>. Damit lassen sich Oplocks vollständig abschalten
-/// (Verdrahtung: <c>SmbServerOptions.OplockManager = new NullOplockManager()</c>).
+/// <see cref="IOplockManager"/> that never grants an oplock — CREATE always returns
+/// <see cref="OplockLevel.None"/>. Use this to disable oplocks entirely
+/// (wiring: <c>SmbServerOptions.OplockManager = new NullOplockManager()</c>).
 /// </summary>
 public sealed class NullOplockManager : IOplockManager
 {

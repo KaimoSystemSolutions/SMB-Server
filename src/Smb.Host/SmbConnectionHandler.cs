@@ -11,11 +11,11 @@ using Smb.Server.State;
 namespace Smb.Host;
 
 /// <summary>
-/// Lese-Loop einer einzelnen TCP-Verbindung (Context §3, §19.1). Dekodiert NBSS-Frames,
-/// entschlüsselt Transform-Frames, ruft den Dispatcher und schreibt die (ggf. verschlüsselte,
-/// NBSS-gerahmte) Antwort zurück. Schreibvorgänge laufen serialisiert über
-/// <see cref="_writeLock"/> — so können asynchron ausstehende Operationen (z.B. blockierende
-/// LOCKs) ihre finale Antwort out-of-band senden, ohne die Lese-Antworten zu verschachteln.
+/// Read loop for a single TCP connection (Context §3, §19.1). Decodes NBSS frames,
+/// decrypts transform frames, calls the dispatcher and writes the (optionally encrypted,
+/// NBSS-framed) response back. Write operations are serialized via
+/// <see cref="_writeLock"/> — so asynchronously pending operations (e.g. blocking
+/// LOCKs) can send their final response out-of-band without interleaving with read responses.
 /// </summary>
 internal sealed class SmbConnectionHandler
 {
@@ -41,60 +41,60 @@ internal sealed class SmbConnectionHandler
             using NetworkStream stream = client.GetStream();
             var prefix = new byte[NbssFrame.HeaderLength];
 
-            // Out-of-band-Sendekanal bereitstellen: asynchron fertiggestellte Antworten (z.B. ein
-            // blockierender LOCK, der gewährt/abgebrochen wurde) gehen über denselben serialisierten
-            // Writer. Verschlüsselung/Rahmung passieren zentral in SendFramedAsync.
+            // Provide an out-of-band send channel: asynchronously completed responses (e.g. a
+            // blocking LOCK that was granted/cancelled) go through the same serialized
+            // writer. Encryption/framing happen centrally in SendFramedAsync.
             connection.SendRawAsync = (raw, forceEncrypt) => SendFramedAsync(stream, connection, raw, forceEncrypt, ct);
 
             while (!ct.IsCancellationRequested)
             {
-                // 1. NBSS-Präfix lesen (4 Byte, 24-Bit Big-Endian Länge).
+                // 1. Read NBSS prefix (4 bytes, 24-bit big-endian length).
                 if (!await TryReadExactAsync(stream, prefix, ct)) break;
                 int length = NbssFrame.ReadLength(prefix);
                 if (length <= 0 || length > NbssFrame.MaxPayloadLength) break;
 
-                // 2. Payload lesen.
+                // 2. Read payload.
                 var payload = new byte[length];
                 if (!await TryReadExactAsync(stream, payload, ct)) break;
 
-                // 3. Verarbeiten (entschlüsseln → dispatchen). Leere Antwort = nichts senden (z.B. CANCEL).
+                // 3. Process (decrypt → dispatch). Empty response = nothing to send (e.g. CANCEL).
                 byte[] response = ProcessFrame(connection, payload);
                 if (response.Length == 0) continue;
 
-                // 4. Verschlüsseln (falls nötig), NBSS-rahmen, serialisiert zurückschreiben.
+                // 4. Encrypt (if necessary), NBSS-frame, write back in serialized fashion.
                 await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct);
             }
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or SocketException)
         {
-            // Verbindungsabbruch ist normal.
+            // Connection drop is normal.
         }
         catch (Exception ex)
         {
-            _log?.Invoke($"[conn {connection.ConnectionId:N}] Fehler: {ex.Message}");
+            _log?.Invoke($"[conn {connection.ConnectionId:N}] Error: {ex.Message}");
         }
         finally
         {
             connection.SendRawAsync = null;
-            connection.CancelAllPending();            // wartende LOCKs etc. abbrechen
+            connection.CancelAllPending();            // cancel pending LOCKs etc.
             _server.Connections.TryRemove(connection.ConnectionId, out _);
             _writeLock.Dispose();
             client.Dispose();
         }
     }
 
-    /// <summary>Entschlüsselt (falls Transform) und dispatcht. Liefert die rohe SMB2-Antwort (leer = nichts senden).</summary>
+    /// <summary>Decrypts (if transform frame) and dispatches. Returns the raw SMB2 response (empty = nothing to send).</summary>
     private byte[] ProcessFrame(SmbConnection connection, byte[] payload)
     {
         ReadOnlySpan<byte> message = payload;
         bool transportEncrypted = false;
 
-        // Transform-Frame? → entschlüsseln (Context §11, §19.1 Schritt 1).
+        // Transform frame? → decrypt (Context §11, §19.1 step 1).
         if (SmbProtocolIds.IsTransform(payload))
         {
             TransformHeader th = TransformHeader.Read(payload);
             if (!_server.SessionGlobalList.TryGetValue(th.SessionId, out SmbSession? session))
-                return []; // unbekannte Session → verwerfen.
+                return []; // unknown session → discard.
 
             try
             {
@@ -102,28 +102,28 @@ internal sealed class SmbConnectionHandler
             }
             catch
             {
-                return []; // Auth-Tag-Fehler → verwerfen.
+                return []; // Auth tag error → discard.
             }
 
             transportEncrypted = true;
 
-            // Der Client hat Verschlüsselung aktiviert (z.B. smbprotocol mit dem Default
-            // require_encryption=True). Ab jetzt verschlüsseln wir auch die Antworten dieser Session
-            // (§3.3.4.1.4: war der Request verschlüsselt, MUSS die Antwort verschlüsselt sein).
+            // The client has enabled encryption (e.g. smbprotocol with the default
+            // require_encryption=True). From now on we also encrypt the responses for this session
+            // (§3.3.4.1.4: if the request was encrypted, the response MUST be encrypted too).
             //
-            // [AUDIT-2026-06] Eine erfolgreich entschlüsselte Nachricht ist durch das AEAD bereits
-            // authentifiziert und wird nicht zusätzlich signiert (§3.1.4.1). Das wird jetzt PRO FRAME
-            // im Dispatcher behandelt (VerifyInboundSignature überspringt verschlüsselte Frames).
-            // Früher wurde hier session.SigningRequired DAUERHAFT gelöscht — ein Downgrade, sobald ein
-            // späterer Klartext-Frame durchkam (z.B. RejectUnencryptedAccess=false). Nicht mehr.
-            // Siehe docs/SECURITY_AUDIT.md (Finding M2).
+            // [AUDIT-2026-06] A successfully decrypted message is already authenticated by AEAD
+            // and is not additionally signed (§3.1.4.1). This is now handled PER FRAME
+            // in the dispatcher (VerifyInboundSignature skips encrypted frames).
+            // Previously session.SigningRequired was permanently cleared here — a downgrade as soon as a
+            // later plaintext frame arrived (e.g. RejectUnencryptedAccess=false). No longer.
+            // See docs/SECURITY_AUDIT.md (Finding M2).
             session.EncryptData = true;
         }
 
         return _dispatcher.ProcessMessage(connection, message, transportEncrypted);
     }
 
-    /// <summary>Verschlüsselt die Antwort bei Bedarf, rahmt sie als NBSS und schreibt sie serialisiert.</summary>
+    /// <summary>Encrypts the response if needed, frames it as NBSS and writes it in serialized fashion.</summary>
     private async Task SendFramedAsync(NetworkStream stream, SmbConnection connection, byte[] rawResponse, bool forceEncrypt, CancellationToken ct)
     {
         byte[] outBytes = MaybeEncrypt(connection, rawResponse, forceEncrypt);
@@ -142,9 +142,9 @@ internal sealed class SmbConnectionHandler
     }
 
     /// <summary>
-    /// Verschlüsselt die Antwort, wenn die adressierte Session global Verschlüsselung verlangt
-    /// ODER die Antwort zu einem verschlüsselungspflichtigen Tree gehört (per-Share-Encryption,
-    /// §3.3.4.1.4 — schließt die TREE_CONNECT-Antwort eines verschlüsselten Shares ein).
+    /// Encrypts the response if the addressed session requires encryption globally,
+    /// OR if the response belongs to a tree that requires encryption (per-share encryption,
+    /// §3.3.4.1.4 — includes the TREE_CONNECT response of an encrypted share).
     /// </summary>
     private byte[] MaybeEncrypt(SmbConnection connection, byte[] response, bool forceEncrypt = false)
     {
@@ -169,9 +169,9 @@ internal sealed class SmbConnectionHandler
             : 0;
 
     /// <summary>
-    /// Liest die TreeId aus einem SYNC-Antwort-Header (Offset 36). ASYNC-Antworten
-    /// (Flag SMB2_FLAGS_ASYNC_COMMAND) führen an dieser Stelle die AsyncId — dort gibt es
-    /// keine TreeId, daher false (Session-globale Verschlüsselung greift dann weiterhin).
+    /// Reads the TreeId from a SYNC response header (offset 36). ASYNC responses
+    /// (flag SMB2_FLAGS_ASYNC_COMMAND) carry the AsyncId at this position — there is
+    /// no TreeId there, so false is returned (session-global encryption still applies).
     /// </summary>
     private static bool TryReadResponseTreeId(ReadOnlySpan<byte> response, out uint treeId)
     {
@@ -184,10 +184,10 @@ internal sealed class SmbConnectionHandler
     }
 
     /// <summary>
-    /// [AUDIT-2026-06] Baut die AEAD-Nonce aus einem monoton steigenden Session-Zähler (NICHT zufällig).
-    /// MS-SMB2 §3.3.4.1.4 verlangt einen je EncryptionKey eindeutigen Nonce-Wert; ein zufälliger
-    /// 11/12-Byte-Wert läuft in die Geburtstagsgrenze (bei AES-GCM ist Nonce-Wiederholung fatal).
-    /// Der Zähler (LE in den ersten 8 Byte; Rest 0) garantiert Eindeutigkeit pro Session/Key.
+    /// [AUDIT-2026-06] Builds the AEAD nonce from a monotonically increasing session counter (NOT random).
+    /// MS-SMB2 §3.3.4.1.4 requires a nonce value unique per EncryptionKey; a random
+    /// 11/12-byte value runs into the birthday bound (with AES-GCM, nonce reuse is fatal).
+    /// The counter (LE in the first 8 bytes; remainder 0) guarantees uniqueness per session/key.
     /// </summary>
     private static byte[] BuildNonce(SmbCipherId cipher, ulong counter)
     {

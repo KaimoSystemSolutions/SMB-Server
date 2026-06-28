@@ -10,9 +10,9 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// Tests für „Vorherige Versionen" / Snapshots: <see cref="VersioningFileStore"/>,
-/// <c>@GMT-…</c>-Pfadauflösung und den FSCTL_SRV_ENUMERATE_SNAPSHOTS-Response.
-/// Spiegelt die Szenarien aus dem externen <c>smb_version_tester.py</c>.
+/// Tests for "Previous Versions" / snapshots: <see cref="VersioningFileStore"/>,
+/// <c>@GMT-…</c> path resolution, and the FSCTL_SRV_ENUMERATE_SNAPSHOTS response.
+/// Mirrors the scenarios from the external <c>smb_version_tester.py</c>.
 /// </summary>
 public class VersioningTests : IDisposable
 {
@@ -62,16 +62,16 @@ public class VersioningTests : IDisposable
         var store = new VersioningFileStore(new LocalFileStore(_dir, readOnly: false));
 
         Assert.Equal(NtStatus.Success, Write(store, "f.txt", "Version 1"));
-        DateTime t = DateTime.UtcNow;                 // Zeitpunkt, zu dem V1 aktuell ist
+        DateTime t = DateTime.UtcNow;                 // point in time when V1 is current
         Thread.Sleep(50);
-        Assert.Equal(NtStatus.Success, Write(store, "f.txt", "Version 2")); // sichert V1, schreibt V2
+        Assert.Equal(NtStatus.Success, Write(store, "f.txt", "Version 2")); // saves V1, writes V2
 
-        // Aktuelle Datei = V2.
+        // Current file = V2.
         (NtStatus cur, byte[] curData) = ReadAll(store, "f.txt");
         Assert.Equal(NtStatus.Success, cur);
         Assert.Equal("Version 2", Encoding.UTF8.GetString(curData));
 
-        // @GMT-Pfad zum Zeitpunkt von V1 liefert V1.
+        // @GMT path at the time of V1 returns V1.
         string snapPath = GmtToken.Format(t) + "\\f.txt";
         (NtStatus snap, byte[] snapData) = ReadAll(store, snapPath);
         Assert.Equal(NtStatus.Success, snap);
@@ -87,7 +87,7 @@ public class VersioningTests : IDisposable
         Thread.Sleep(50);
         Assert.Equal(NtStatus.Success, Write(store, "f.txt", "Updated"));
 
-        // Schreiben auf den Snapshot-Pfad (OverwriteIf, Write-Access) muss abgelehnt werden.
+        // Writing to the snapshot path (OverwriteIf, write access) must be rejected.
         string snapPath = GmtToken.Format(t) + "\\f.txt";
         NtStatus status = Write(store, snapPath, "SHOULD FAIL");
         Assert.Equal(NtStatus.AccessDenied, status);
@@ -97,11 +97,11 @@ public class VersioningTests : IDisposable
     public void FreshFile_HasNoSnapshots()
     {
         var store = new VersioningFileStore(new LocalFileStore(_dir, readOnly: false));
-        Assert.Equal(NtStatus.Success, Write(store, "once.txt", "nur einmal"));
+        Assert.Equal(NtStatus.Success, Write(store, "once.txt", "only once"));
 
         Assert.Empty(((ISnapshotStore)store).GetSnapshots("once.txt"));
 
-        // Ein @GMT-Zugriff ohne vorhandene Version → ObjectNameNotFound.
+        // A @GMT access with no existing version → ObjectNameNotFound.
         string snapPath = GmtToken.Format(DateTime.UtcNow) + "\\once.txt";
         (NtStatus status, _) = ReadAll(store, snapPath);
         Assert.Equal(NtStatus.ObjectNameNotFound, status);
@@ -119,7 +119,7 @@ public class VersioningTests : IDisposable
         Assert.Single(times);
         Assert.All(times, t => Assert.Equal(DateTimeKind.Utc, t.Kind));
 
-        // Wurzel/Leerpfad aggregiert alle Snapshots.
+        // Root/empty path aggregates all snapshots.
         Assert.Single(((ISnapshotStore)store).GetSnapshots(""));
     }
 
@@ -153,16 +153,16 @@ public class VersioningTests : IDisposable
     {
         string[] tokens = [GmtToken.Format(DateTime.UtcNow)];
 
-        // maxOutput = 12 → nur Zähler, kein Array; aber benötigte Größe wird gemeldet.
+        // maxOutput = 12 → counters only, no array; but the required size is reported.
         byte[] body = IoctlMessage.BuildEnumerateSnapshotsResponse(tokens, maxOutputResponse: 12);
 
         Assert.Equal(12, body.Length);
         Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0, 4)));  // NumberOfSnapshots
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4, 4)));  // Returned
-        Assert.True(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(8, 4)) > 0);   // benötigte Größe
+        Assert.True(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(8, 4)) > 0);   // required size
     }
 
-    // ─── Hilfen ────────────────────────────────────────────────
+    // ─── Helpers ────────────────────────────────────────────────
 
     private static NtStatus Write(IFileStore store, string path, string content)
     {

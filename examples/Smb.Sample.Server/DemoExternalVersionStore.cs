@@ -6,26 +6,26 @@ using Smb.Protocol.Enums;
 namespace Smb.Sample.Server;
 
 /// <summary>
-/// <b>Beispiel: eigene Versionierung in die Lib einklinken.</b>
+/// <b>Example: plugging custom versioning into the library.</b>
 /// <para>
-/// Die Lib gibt nur die Naht vor — <see cref="IFileStore"/> (Datei-Backend) und optional
-/// <see cref="ISnapshotStore"/> (für FSCTL_SRV_ENUMERATE_SNAPSHOTS). Der Server-Core parst
-/// <c>@GMT-…</c>-Pfade NICHT selbst; er reicht den Pfad an <see cref="Create"/> durch. Damit
-/// kann ein eigener Fileserver seine (beliebig komplexe) Versions-/Snapshot-Logik hier
-/// unterbringen, ohne irgendetwas am Core zu ändern.
+/// The library only defines the seam — <see cref="IFileStore"/> (file backend) and optionally
+/// <see cref="ISnapshotStore"/> (for FSCTL_SRV_ENUMERATE_SNAPSHOTS). The server core does NOT
+/// parse <c>@GMT-…</c> paths itself; it passes the path through to <see cref="Create"/>. This
+/// allows a custom file server to place its (arbitrarily complex) versioning/snapshot logic here
+/// without touching anything in the core.
 /// </para>
 /// <para>
-/// Dieser Demo-Store ist absichtlich ANDERS als der mitgelieferte In-Memory-
-/// <c>VersioningFileStore</c>: Er legt jede überschriebene Version <b>persistent auf Platte</b>
-/// ab (Sidecar-Verzeichnis) — Versionen überleben also einen Neustart. Stellvertretend für ein
-/// „echtes" System steht hier das Dateisystem; bei dir wäre es z.B. ZFS-Snapshots, eine DB,
-/// ein Object-Store o.ä. Verdrahtet wird er ganz normal über <c>AddShare(new Share { FileStore = … })</c>.
+/// This demo store is intentionally DIFFERENT from the built-in in-memory
+/// <c>VersioningFileStore</c>: it stores every overwritten version <b>persistently on disk</b>
+/// (sidecar directory) — versions survive a restart. The file system stands in for a
+/// "real" system; in practice you might use ZFS snapshots, a database, an object store, etc.
+/// Wire it up normally via <c>AddShare(new Share { FileStore = … })</c>.
 /// </para>
 /// </summary>
 public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
 {
-    private readonly IFileStore _inner;       // dein eigentliches Backend (hier: LocalFileStore)
-    private readonly string _versionRoot;     // wo die Versions-Blobs liegen (außerhalb des Shares)
+    private readonly IFileStore _inner;       // your actual backend (here: LocalFileStore)
+    private readonly string _versionRoot;     // where the version blobs live (outside the share)
     private readonly Action<string>? _log;
 
     public DemoExternalVersionStore(IFileStore inner, string versionRoot, Action<string>? log = null)
@@ -42,15 +42,15 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
     {
         createAction = CreateOutcome.Opened;
 
-        // (1) @GMT-Snapshot-Zugriff → read-only aus dem externen Versionsspeicher bedienen.
-        //     Den Token-Parser der Lib darf man gern mitbenutzen (GmtToken), muss man aber nicht.
+        // (1) @GMT snapshot access → serve read-only from the external version store.
+        //     The lib's token parser (GmtToken) can be reused but doesn't have to be.
         if (GmtToken.TrySplitSnapshotPath(path, out DateTime snapAt, out string realPath))
         {
             bool wantsWrite = access.HasFlag(FileAccessIntent.Write) || access.HasFlag(FileAccessIntent.Delete)
                 || disposition is CreateDispositionIntent.Create or CreateDispositionIntent.Overwrite
                     or CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
             if (wantsWrite)
-                return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); // Snapshots sind read-only.
+                return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); // snapshots are read-only.
 
             if (!TryResolveSnapshot(realPath, snapAt, out byte[] bytes, out FileEntryInfo info))
                 return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
@@ -58,7 +58,7 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
             return FileStoreResult<IFileHandle>.Ok(new ReadOnlyBlobHandle(realPath, bytes, info));
         }
 
-        // (2) Vor jedem Überschreiben die aktuelle Version sichern, dann ans Backend delegieren.
+        // (2) Before each overwrite, save the current version, then delegate to the backend.
         if (disposition is CreateDispositionIntent.Overwrite or CreateDispositionIntent.OverwriteIf
             or CreateDispositionIntent.Supersede)
             CaptureVersion(path);
@@ -90,7 +90,7 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
         if (handle is ReadOnlyBlobHandle)
             return delete ? NtStatus.AccessDenied : NtStatus.Success;
 
-        // Auch vor dem Löschen die letzte Version festhalten (analog zum Überschreiben).
+        // Also capture the last version before deletion (analogous to overwriting).
         if (delete && !handle.IsDirectory && !string.IsNullOrEmpty(handle.Path))
             CaptureVersion(handle.Path);
 
@@ -100,7 +100,7 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
     public NtStatus Flush(IFileHandle handle)
         => handle is ReadOnlyBlobHandle ? NtStatus.Success : _inner.Flush(handle);
 
-    // ── ISnapshotStore: speist FSCTL_SRV_ENUMERATE_SNAPSHOTS aus DEINEM System ──
+    // ── ISnapshotStore: feeds FSCTL_SRV_ENUMERATE_SNAPSHOTS from YOUR system ──
 
     public IReadOnlyList<DateTime> GetSnapshots(string path)
     {
@@ -119,18 +119,18 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
         return [.. set];
     }
 
-    // ── Intern: persistenter Versionsspeicher (eine .blob-Datei je Version) ──
+    // ── Internal: persistent version store (one .blob file per version) ──
 
     private void CaptureVersion(string path)
     {
         if (!TryReadAll(path, out byte[] content))
-            return; // Datei existiert (noch) nicht → nichts zu sichern.
+            return; // file does not yet exist → nothing to save.
 
         string dir = VersionDir(path);
         Directory.CreateDirectory(dir);
         string blob = System.IO.Path.Combine(dir, DateTime.UtcNow.Ticks + ".blob");
         File.WriteAllBytes(blob, content);
-        _log?.Invoke($"Version von '{path}' gesichert ({content.Length} Bytes) → {System.IO.Path.GetFileName(blob)}");
+        _log?.Invoke($"Version of '{path}' saved ({content.Length} bytes) → {System.IO.Path.GetFileName(blob)}");
     }
 
     private bool TryResolveSnapshot(string realPath, DateTime snapAt, out byte[] content, out FileEntryInfo info)
@@ -141,7 +141,7 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
         if (!Directory.Exists(dir))
             return false;
 
-        // Die Version, die zum Snapshot-Zeitpunkt aktuell war: kleinste Version-Zeit ≥ angefragt.
+        // The version that was current at snapshot time: smallest version time ≥ requested.
         DateTime floor = FloorToSecond(snapAt);
         string? best = null;
         DateTime bestTime = DateTime.MaxValue;
@@ -240,7 +240,7 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
     }
 }
 
-/// <summary>Read-only Handle, das den Inhalt einer persistierten Version (Blob) bedient.</summary>
+/// <summary>Read-only handle that serves the contents of a persisted version (blob).</summary>
 internal sealed class ReadOnlyBlobHandle : IFileHandle
 {
     private readonly byte[] _data;

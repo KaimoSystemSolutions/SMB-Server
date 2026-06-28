@@ -6,59 +6,59 @@ using Smb.Server.State;
 namespace Smb.Server.Authorization;
 
 /// <summary>
-/// Kontext einer Share-Autorisierungsentscheidung. Enthält die authentifizierte Identität,
-/// den betroffenen Share und (sofern vorhanden) die Verbindung — damit kann eine Policy nach
-/// User, Gruppen-SID, Dialekt, ClientGuid usw. unterscheiden.
+/// Context of a share authorization decision. Contains the authenticated identity,
+/// the affected share and (if present) the connection — allowing a policy to distinguish by
+/// user, group SID, dialect, ClientGuid, etc.
 /// </summary>
 public sealed class ShareAccessContext
 {
     public required SecurityIdentity Identity { get; init; }
     public required IShare Share { get; init; }
 
-    /// <summary>Verbindung (für Dialekt/ClientGuid/Verschlüsselungsstatus). Bei reiner Enumeration ggf. null.</summary>
+    /// <summary>Connection (for dialect/ClientGuid/encryption status). May be null for pure enumeration.</summary>
     public SmbConnection? Connection { get; init; }
 
-    /// <summary>Bequemer Zugriff auf den Share-Namen.</summary>
+    /// <summary>Convenient access to the share name.</summary>
     public string ShareName => Share.Name;
 }
 
-/// <summary>Ergebnis einer Verbindungs-Autorisierung (Context §12: Zugriff prüfen, MaximalAccess liefern).</summary>
+/// <summary>Result of a connection authorization (Context §12: check access, return MaximalAccess).</summary>
 public sealed class ShareAccessResult
 {
     public bool Allowed { get; private init; }
 
-    /// <summary>Gewährte Zugriffsmaske (nur relevant bei <see cref="Allowed"/>). Begrenzt auch den späteren Datei-Zugriff.</summary>
+    /// <summary>Granted access mask (only relevant when <see cref="Allowed"/>). Also limits subsequent file access.</summary>
     public SmbAccessMask MaximalAccess { get; private init; }
 
-    /// <summary>NTSTATUS bei Ablehnung (Default <c>STATUS_ACCESS_DENIED</c>, Context §12).</summary>
+    /// <summary>NTSTATUS on denial (default <c>STATUS_ACCESS_DENIED</c>, Context §12).</summary>
     public NtStatus DenyStatus { get; private init; }
 
-    /// <summary>Erlaubt die Verbindung mit der angegebenen (Default: vollen) Zugriffsmaske.</summary>
+    /// <summary>Allows the connection with the specified (default: full) access mask.</summary>
     public static ShareAccessResult Grant(SmbAccessMask maximalAccess = SmbAccessMask.FullAccess)
         => new() { Allowed = true, MaximalAccess = maximalAccess };
 
-    /// <summary>Lehnt die Verbindung ab.</summary>
+    /// <summary>Denies the connection.</summary>
     public static ShareAccessResult Deny(NtStatus status = NtStatus.AccessDenied)
         => new() { Allowed = false, DenyStatus = status };
 }
 
 /// <summary>
-/// <b>Einhak-Punkt für Autorisierung.</b> Wird vom Server konsultiert, um
-/// (a) bei der Share-Auflistung zu filtern (<see cref="IsVisible"/>, Access-Based Enumeration)
-/// und (b) beim TREE_CONNECT Zugriff + Zugriffsmaske zu bestimmen
-/// (<see cref="AuthorizeConnect"/>, Context §12). Eigene Implementierung setzen, um z.B. nur
-/// bestimmten Usern/Gruppen Zugriff zu geben.
+/// <b>Authorization seam.</b> Consulted by the server to
+/// (a) filter the share listing (<see cref="IsVisible"/>, access-based enumeration)
+/// and (b) determine access + access mask at TREE_CONNECT
+/// (<see cref="AuthorizeConnect"/>, Context §12). Set a custom implementation to grant access only
+/// to specific users/groups.
 /// </summary>
 public interface IShareAccessPolicy
 {
-    /// <summary>True, wenn der Share dem User in einer Auflistung angezeigt werden darf.</summary>
+    /// <summary>True if the share may be shown to the user in a listing.</summary>
     bool IsVisible(ShareAccessContext context);
 
-    /// <summary>Entscheidet über die TREE_CONNECT-Verbindung und liefert die gewährte Zugriffsmaske.</summary>
+    /// <summary>Decides the TREE_CONNECT connection and returns the granted access mask.</summary>
     ShareAccessResult AuthorizeConnect(ShareAccessContext context);
 }
 
-/// <summary>Default-Policy: alle Shares sichtbar, voller Zugriff für jede gültige Session (bisheriges Verhalten).</summary>
+/// <summary>Default policy: all shares visible, full access for every valid session (previous behaviour).</summary>
 public sealed class AllowAllSharePolicy : IShareAccessPolicy
 {
     public bool IsVisible(ShareAccessContext context) => true;
@@ -66,7 +66,7 @@ public sealed class AllowAllSharePolicy : IShareAccessPolicy
 }
 
 /// <summary>
-/// Delegate-basierte Policy — erlaubt das Einhaken per Lambda, ohne eine Klasse zu schreiben:
+/// Delegate-based policy — allows hooking in via lambda without writing a class:
 /// <code>
 /// new DelegateSharePolicy(
 ///     isVisible:  ctx => ctx.Identity.UserName == "alice" || ctx.ShareName != "Secret",

@@ -6,8 +6,8 @@ using Smb.Server.Authorization;
 namespace Smb.Server.State;
 
 /// <summary>
-/// Globaler Server-Zustand (Context §19, §3.3.1.5): GUID, Shares und globale Tabellen.
-/// Threadsicher, da von mehreren Connection-Loops geteilt.
+/// Global server state (Context §19, §3.3.1.5): GUID, shares and global tables.
+/// Thread-safe, as it is shared by multiple connection loops.
 /// </summary>
 public sealed class SmbServerState
 {
@@ -23,16 +23,16 @@ public sealed class SmbServerState
     public SmbServerOptions Options { get; }
     public ShareCollection Shares { get; }
 
-    /// <summary>SessionId → Session (global über alle Connections, Context §19).</summary>
+    /// <summary>SessionId → session (global across all connections, Context §19).</summary>
     public ConcurrentDictionary<ulong, SmbSession> SessionGlobalList { get; } = new();
 
-    /// <summary>Aktive Connections.</summary>
+    /// <summary>Active connections.</summary>
     public ConcurrentDictionary<Guid, SmbConnection> Connections { get; } = new();
 
     /// <summary>
-    /// Liefert die für <paramref name="identity"/> sichtbaren Shares gemäß
-    /// <see cref="SmbServerOptions.ShareAccessPolicy"/> (Access-Based Enumeration, Context §12).
-    /// Das ist die Quelle für einen künftigen <c>srvsvc</c>-NetShareEnum-Handler über IPC$.
+    /// Returns the shares visible to <paramref name="identity"/> according to
+    /// <see cref="SmbServerOptions.ShareAccessPolicy"/> (access-based enumeration, Context §12).
+    /// This is the source for a future <c>srvsvc</c> NetShareEnum handler over IPC$.
     /// </summary>
     public IReadOnlyList<IShare> GetVisibleShares(SecurityIdentity identity, SmbConnection? connection = null)
     {
@@ -46,7 +46,7 @@ public sealed class SmbServerState
         return result;
     }
 
-    /// <summary>Vergibt eine neue, eindeutige SessionId (nie 0, Context §8.1).</summary>
+    /// <summary>Allocates a new, unique SessionId (never 0, Context §8.1).</summary>
     public ulong AllocateSessionId()
     {
         ulong id;

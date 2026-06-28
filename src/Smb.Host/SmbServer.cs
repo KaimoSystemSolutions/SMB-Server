@@ -7,8 +7,8 @@ using Smb.Server.State;
 namespace Smb.Host;
 
 /// <summary>
-/// Öffentlicher SMB-2/3-Server-Host (Context §3, §19). Lauscht auf TCP (Default 445),
-/// nimmt Verbindungen an und bedient sie nebenläufig. Einfache Nutzung:
+/// Public SMB-2/3 server host (Context §3, §19). Listens on TCP (default 445),
+/// accepts connections and serves them concurrently. Simple usage:
 /// <code>
 /// await using var server = SmbServerBuilder.Create()
 ///     .WithEndpoint(IPAddress.Any, 445)
@@ -36,21 +36,21 @@ public sealed class SmbServer : IAsyncDisposable
         _log = log;
     }
 
-    /// <summary>Der lokale Endpunkt, auf dem gelauscht wird (nach <see cref="StartAsync"/> mit echtem Port).</summary>
+    /// <summary>The local endpoint on which the server is listening (after <see cref="StartAsync"/> with the actual port).</summary>
     public IPEndPoint Endpoint => (IPEndPoint)(_listener?.LocalEndpoint ?? _endpoint);
 
-    /// <summary>Server-Zustand (Shares, Sessions) — für Tests/Diagnose.</summary>
+    /// <summary>Server state (shares, sessions) — for tests/diagnostics.</summary>
     public SmbServerState State => _state;
 
-    /// <summary>Startet den Listener und die Accept-Schleife (Context §3.3.3: Listener auf 445 öffnen).</summary>
+    /// <summary>Starts the listener and the accept loop (Context §3.3.3: open listener on 445).</summary>
     public Task StartAsync(CancellationToken ct = default)
     {
-        if (_listener is not null) throw new InvalidOperationException("Server läuft bereits.");
+        if (_listener is not null) throw new InvalidOperationException("Server is already running.");
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _listener = new TcpListener(_endpoint);
         _listener.Start();
-        _log?.Invoke($"SMB-Server lauscht auf {_listener.LocalEndpoint}.");
+        _log?.Invoke($"SMB server listening on {_listener.LocalEndpoint}.");
         _acceptLoop = AcceptLoopAsync(_cts.Token);
         return Task.CompletedTask;
     }
@@ -70,14 +70,14 @@ public sealed class SmbServer : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { /* Stop */ }
-        catch (ObjectDisposedException) { /* Listener gestoppt */ }
+        catch (ObjectDisposedException) { /* Listener stopped */ }
         finally
         {
             await Task.WhenAll(clientTasks.Where(t => !t.IsFaulted));
         }
     }
 
-    /// <summary>Stoppt den Listener und beendet die Accept-Schleife.</summary>
+    /// <summary>Stops the listener and terminates the accept loop.</summary>
     public async Task StopAsync()
     {
         if (_cts is null) return;
@@ -98,7 +98,7 @@ public sealed class SmbServer : IAsyncDisposable
 
     private static void EnsureIpcShare(ShareCollection shares)
     {
-        // IPC$ muss existieren — viele Clients verbinden es zuerst (Context §12, §23).
+        // IPC$ must exist — many clients connect to it first (Context §12, §23).
         if (!shares.Contains("IPC$"))
             shares.Add(Share.CreateIpc());
     }

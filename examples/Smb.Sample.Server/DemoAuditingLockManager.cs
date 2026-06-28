@@ -4,24 +4,25 @@ using Smb.Server.State;
 namespace Smb.Sample.Server;
 
 /// <summary>
-/// <b>Beispiel: eigene Byte-Range-Lock-Verwaltung in die Lib einklinken.</b>
+/// <b>Example: plugging custom byte-range lock management into the library.</b>
 /// <para>
-/// Die Lib gibt nur die Naht <see cref="ILockManager"/> vor und liefert mit
-/// <c>InMemoryLockManager</c> einen prozesslokalen Default. Wer mehr braucht, implementiert das
-/// Interface selbst und verdrahtet es über <c>SmbServerBuilder.UseLockManager(...)</c> — nichts am
-/// Core muss angefasst werden. Typische Gründe für eine eigene Implementierung:
+/// The library only defines the seam <see cref="ILockManager"/> and ships with
+/// <c>InMemoryLockManager</c> as a process-local default. Whoever needs more implements
+/// the interface and wires it via <c>SmbServerBuilder.UseLockManager(...)</c> — nothing in
+/// the core needs to be changed. Typical reasons for a custom implementation:
 /// </para>
 /// <list type="bullet">
-///   <item>persistenter <b>Audit-Trail</b> aller Sperren (das macht diese Demo),</item>
-///   <item>Delegation ans <b>Betriebssystem</b> (<c>FileStream.Lock</c> auf den realen Pfad
-///         <see cref="SmbOpen.LocalOpen"/>.Path) — dann sehen auch andere Prozesse bzw. NFS die
-///         Sperre (Cross-Protocol-Locking, relevant z.B. unter TrueNAS),</item>
-///   <item>Koordination über einen <b>Cluster</b> (verteilte Lock-Tabelle).</item>
+///   <item>persistent <b>audit trail</b> of all locks (what this demo does),</item>
+///   <item>delegation to the <b>OS</b> (<c>FileStream.Lock</c> on the real path
+///         <see cref="SmbOpen.LocalOpen"/>.Path) — then other processes or NFS also see
+///         the lock (cross-protocol locking, relevant e.g. under TrueNAS),</item>
+///   <item>coordination via a <b>cluster</b> (distributed lock table).</item>
 /// </list>
 /// <para>
-/// Bewusst als <b>Decorator</b> gebaut: Die eigentliche Konflikt-/Warte-Logik bleibt beim inneren
-/// Manager (Default In-Memory), dieser Wrapper ergänzt nur den Querschnittsaspekt „Auditing". So
-/// muss man die (subtile) Lock-Semantik nicht neu erfinden, um eigene Aspekte zu ergänzen.
+/// Intentionally built as a <b>decorator</b>: the actual conflict/waiting logic stays with
+/// the inner manager (default in-memory); this wrapper only adds the cross-cutting concern
+/// of auditing. That way you don't have to re-implement the (subtle) lock semantics just
+/// to add your own aspects.
 /// </para>
 /// </summary>
 public sealed class DemoAuditingLockManager : ILockManager
@@ -52,14 +53,14 @@ public sealed class DemoAuditingLockManager : ILockManager
     {
         bool ok = _inner.IsRangeAccessible(owner, offset, length, forWrite);
         if (!ok)
-            Audit($"{(forWrite ? "WRITE" : "READ")} abgewiesen (Lock-Konflikt): {Key(owner)} [{offset}..{offset + length}]");
+            Audit($"{(forWrite ? "WRITE" : "READ")} denied (lock conflict): {Key(owner)} [{offset}..{offset + length}]");
         return ok;
     }
 
     public void ReleaseOwner(SmbOpen owner)
     {
         _inner.ReleaseOwner(owner);
-        Audit($"RELEASE {Key(owner)} (Handle geschlossen)");
+        Audit($"RELEASE {Key(owner)} (handle closed)");
     }
 
     private void Audit(string message)

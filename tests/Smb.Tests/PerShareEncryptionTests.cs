@@ -16,11 +16,10 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// M6 — Per-Share-Verschlüsselung (SMB2_SHAREFLAG_ENCRYPT_DATA, §3.3.5.7 / §3.3.4.1.4 /
-/// §3.3.5.2.11). Deckt ab: TREE_CONNECT-Härtung (kein 3.x-Encryption → ACCESS_DENIED),
-/// Markierung des Tree, Ablehnung unverschlüsselter Requests auf einen verschlüsselten Tree,
-/// die <c>RejectUnencryptedAccess</c>-Option und die tatsächliche Verschlüsselung der Antwort
-/// über den Host.
+/// M6 — Per-share encryption (SMB2_SHAREFLAG_ENCRYPT_DATA, §3.3.5.7 / §3.3.4.1.4 /
+/// §3.3.5.2.11). Covers: TREE_CONNECT hardening (no 3.x encryption → ACCESS_DENIED),
+/// marking the tree, rejection of unencrypted requests on an encrypted tree,
+/// the <c>RejectUnencryptedAccess</c> option, and actual response encryption via the host.
 /// </summary>
 public class PerShareEncryptionTests : IDisposable
 {
@@ -30,7 +29,7 @@ public class PerShareEncryptionTests : IDisposable
     {
         _shareDir = Path.Combine(Path.GetTempPath(), "smbenc_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_shareDir);
-        File.WriteAllText(Path.Combine(_shareDir, "geheim.txt"), "streng vertraulich");
+        File.WriteAllText(Path.Combine(_shareDir, "secret.txt"), "strictly confidential");
     }
 
     public void Dispose()
@@ -66,7 +65,7 @@ public class PerShareEncryptionTests : IDisposable
         return (new Smb2Dispatcher(state), state, new SmbConnection());
     }
 
-    /// <summary>NEGOTIATE (+ optional Cipher) und SESSION_SETUP (Dev = anonym, ein Schritt).</summary>
+    /// <summary>NEGOTIATE (+ optional cipher) and SESSION_SETUP (Dev = anonymous, one step).</summary>
     private static ulong Handshake(Smb2Dispatcher d, SmbConnection conn, SmbDialect dialect, bool withCipher)
     {
         d.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest(
@@ -91,11 +90,11 @@ public class PerShareEncryptionTests : IDisposable
         Smb2Header h = Smb2Header.Read(tc);
         Assert.Equal(NtStatus.Success, h.Status);
 
-        // ShareFlags (Body-Offset 4) trägt SMB2_SHAREFLAG_ENCRYPT_DATA.
+        // ShareFlags (body offset 4) carries SMB2_SHAREFLAG_ENCRYPT_DATA.
         uint shareFlags = BinaryPrimitives.ReadUInt32LittleEndian(tc.AsSpan(Smb2Header.Size + 4, 4));
-        Assert.True((shareFlags & (uint)ShareFlags.EncryptData) != 0, "ShareFlags müssen EncryptData melden.");
+        Assert.True((shareFlags & (uint)ShareFlags.EncryptData) != 0, "ShareFlags must report EncryptData.");
 
-        // Tree-Zustand verlangt Verschlüsselung.
+        // Tree state requires encryption.
         SmbTreeConnect tree = state.SessionGlobalList[sid].TreeConnects[h.TreeId];
         Assert.True(tree.EncryptData);
     }
@@ -104,7 +103,7 @@ public class PerShareEncryptionTests : IDisposable
     public void TreeConnect_EncryptedShare_OnConnectionWithoutEncryption_AccessDenied()
     {
         var (d, _, conn) = NewServer();
-        // SMB 2.1 kann nicht verschlüsseln → der Server darf den Share nicht im Klartext herausgeben.
+        // SMB 2.1 cannot encrypt → the server must not hand out the share in plaintext.
         ulong sid = Handshake(d, conn, SmbDialect.Smb210, withCipher: false);
         Assert.False(conn.SupportsEncryption);
 
@@ -132,7 +131,7 @@ public class PerShareEncryptionTests : IDisposable
         uint treeId = Smb2Header.Read(
             d.ProcessMessage(conn, TestHelpers.BuildTreeConnectRequest(2, sid, @"\\server\Secret"))).TreeId;
 
-        // Unverschlüsselter CREATE auf den verschlüsselungspflichtigen Tree → ACCESS_DENIED.
+        // Unencrypted CREATE on the encryption-required tree → ACCESS_DENIED.
         byte[] resp = d.ProcessMessage(conn, OpenRootCreate(3, sid, treeId), transportEncrypted: false);
         Assert.Equal(NtStatus.AccessDenied, Smb2Header.Read(resp).Status);
     }
@@ -145,7 +144,7 @@ public class PerShareEncryptionTests : IDisposable
         uint treeId = Smb2Header.Read(
             d.ProcessMessage(conn, TestHelpers.BuildTreeConnectRequest(2, sid, @"\\server\Secret"))).TreeId;
 
-        // Derselbe CREATE, aber verschlüsselt angeliefert → passiert die Schranke und wird verarbeitet.
+        // Same CREATE but delivered encrypted → passes the gate and is processed.
         byte[] resp = d.ProcessMessage(conn, OpenRootCreate(3, sid, treeId), transportEncrypted: true);
         Assert.Equal(NtStatus.Success, Smb2Header.Read(resp).Status);
     }
@@ -158,7 +157,7 @@ public class PerShareEncryptionTests : IDisposable
         uint treeId = Smb2Header.Read(
             d.ProcessMessage(conn, TestHelpers.BuildTreeConnectRequest(2, sid, @"\\server\Secret"))).TreeId;
 
-        // Mit abgeschalteter Erzwingung wird der unverschlüsselte Request normal verarbeitet.
+        // With enforcement disabled, the unencrypted request is processed normally.
         byte[] resp = d.ProcessMessage(conn, OpenRootCreate(3, sid, treeId), transportEncrypted: false);
         Assert.Equal(NtStatus.Success, Smb2Header.Read(resp).Status);
     }
@@ -182,22 +181,22 @@ public class PerShareEncryptionTests : IDisposable
         await client.ConnectAsync(IPAddress.Loopback, server.Endpoint.Port);
         await using NetworkStream stream = client.GetStream();
 
-        // 1) NEGOTIATE (3.1.1 + GCM) — Klartext.
+        // 1) NEGOTIATE (3.1.1 + GCM) — plaintext.
         await SendFramed(stream, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311], ciphers: [SmbCipherId.Aes128Gcm]));
         Assert.True(TestHelpers.IsSmb2(await ReadFramed(stream)));
 
-        // 2) SESSION_SETUP (Dev = anonym, ein Schritt) — Klartext.
+        // 2) SESSION_SETUP (Dev = anonymous, one step) — plaintext.
         await SendFramed(stream, TestHelpers.BuildSessionSetupRequest(1, 0, [0x01]));
         byte[] ssResp = await ReadFramed(stream);
         ulong sessionId = Smb2Header.Read(ssResp).SessionId;
         Assert.Equal(NtStatus.Success, Smb2Header.Read(ssResp).Status);
 
-        // 3) TREE_CONNECT zum verschlüsselten Share — Request Klartext, Antwort MUSS verschlüsselt
-        //    zurückkommen (TRANSFORM-Frame), weil der Share Verschlüsselung erzwingt (§3.3.4.1.4).
+        // 3) TREE_CONNECT to the encrypted share — request in plaintext, response MUST come back
+        //    encrypted (TRANSFORM frame) because the share enforces encryption (§3.3.4.1.4).
         await SendFramed(stream, TestHelpers.BuildTreeConnectRequest(2, sessionId, @"\\server\Secret"));
         byte[] tcResp = await ReadFramed(stream);
         Assert.True(SmbProtocolIds.IsTransform(tcResp),
-            "Die TREE_CONNECT-Antwort eines verschlüsselten Shares muss als TRANSFORM-Frame verschlüsselt sein.");
+            "The TREE_CONNECT response of an encrypted share must be sent as an encrypted TRANSFORM frame.");
 
         await server.StopAsync();
     }

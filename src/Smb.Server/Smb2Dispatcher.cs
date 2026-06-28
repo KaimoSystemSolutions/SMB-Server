@@ -11,11 +11,11 @@ using Smb.Server.State;
 namespace Smb.Server;
 
 /// <summary>
-/// Verarbeitet eine vollständige (bereits ent-NBSS-gerahmte und ggf. entschlüsselte)
-/// eingehende SMB2-Nachricht und liefert die Antwort. Implementiert die Empfangs-Pipeline
-/// (Context §19.1) für die Phase-1-Commands: NEGOTIATE, SESSION_SETUP, TREE_CONNECT,
-/// TREE_DISCONNECT, LOGOFF, ECHO. Übrige Commands → <c>STATUS_NOT_SUPPORTED</c>.
-/// Compound-Ketten (NextCommand) werden zerlegt und einzeln beantwortet (Context §7).
+/// Processes a complete (already un-NBSS-framed and optionally decrypted)
+/// incoming SMB2 message and returns the response. Implements the receive pipeline
+/// (Context §19.1) for the core commands: NEGOTIATE, SESSION_SETUP, TREE_CONNECT,
+/// TREE_DISCONNECT, LOGOFF, ECHO. Other commands → <c>STATUS_NOT_SUPPORTED</c>.
+/// Compound chains (NextCommand) are split and answered individually (Context §7).
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
@@ -31,10 +31,10 @@ public sealed partial class Smb2Dispatcher
     private readonly Action<string>? _log;
 
     /// <summary>
-    /// [AUDIT-2026-06] Kam der gerade verarbeitete Frame über einen TRANSFORM-Header (verschlüsselt)?
-    /// Pro <see cref="ProcessMessage"/>-Aufruf gesetzt. Da ProcessMessage je Connection-Dispatcher
-    /// sequenziell läuft, ist dieses Feld innerhalb eines Aufrufs eindeutig. Steuert das Überspringen
-    /// der Eingangs-Signaturprüfung (AEAD authentifiziert bereits, §3.1.4.1).
+    /// [AUDIT-2026-06] Did the currently processed frame arrive via a TRANSFORM header (encrypted)?
+    /// Set per <see cref="ProcessMessage"/> call. Since ProcessMessage runs sequentially per connection dispatcher,
+    /// this field is unambiguous within one call. Controls skipping of the
+    /// inbound signature check (AEAD already authenticates, §3.1.4.1).
     /// </summary>
     private bool _frameWasEncrypted;
 
@@ -45,19 +45,19 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
-    /// Verarbeitet eine eingehende Nachricht (eine oder mehrere via NextCommand verkettete
-    /// SMB2-Nachrichten). Liefert die zusammengesetzte Antwort. <paramref name="transportEncrypted"/>
-    /// gibt an, ob die Nachricht über einen TRANSFORM-Frame (verschlüsselt) ankam (§11).
+    /// Processes an incoming message (one or more SMB2 messages chained via NextCommand).
+    /// Returns the assembled response. <paramref name="transportEncrypted"/>
+    /// indicates whether the message arrived via a TRANSFORM frame (encrypted) (§11).
     /// </summary>
     public byte[] ProcessMessage(SmbConnection connection, ReadOnlySpan<byte> message, bool transportEncrypted = false)
     {
-        // SMB1 Multi-Protocol-Negotiate (§6.1): Altclients (z.B. impacket) schicken zuerst ein
-        // SMB1 SMB_COM_NEGOTIATE (ProtocolId FF 53 4D 42). Darauf mit einer SMB2-NEGOTIATE-Response
-        // mit DialectRevision 0x02FF (Wildcard) antworten; danach kommt das echte SMB2-NEGOTIATE.
+        // SMB1 Multi-Protocol-Negotiate (§6.1): legacy clients (e.g. impacket) first send an
+        // SMB1 SMB_COM_NEGOTIATE (ProtocolId FF 53 4D 42). Respond with an SMB2 NEGOTIATE response
+        // with DialectRevision 0x02FF (wildcard); the real SMB2 NEGOTIATE follows after.
         if (SmbProtocolIds.IsSmb1(message) && message.Length > 4 && message[4] == 0x72 /* SMB_COM_NEGOTIATE */)
             return BuildSmb1WildcardNegotiateResponse();
 
-        _frameWasEncrypted = transportEncrypted; // [AUDIT-2026-06] gilt für alle Segmente dieses Frames.
+        _frameWasEncrypted = transportEncrypted; // [AUDIT-2026-06] applies to all segments of this frame.
 
         var segments = new List<ResponseSegment>();
         int offset = 0;
@@ -73,19 +73,19 @@ public sealed partial class Smb2Dispatcher
             }
             catch (SmbWireFormatException ex)
             {
-                // Malformed Header → generische Fehlerantwort (Context §19.1 Schritt 6).
-                _log?.Invoke($"[parse] ungültiger Header → INVALID_PARAMETER: {ex.Message}; Bytes: {Hex(message[offset..])}");
+                // Malformed header → generic error response (Context §19.1 step 6).
+                _log?.Invoke($"[parse] invalid header → INVALID_PARAMETER: {ex.Message}; Bytes: {Hex(message[offset..])}");
                 segments.Add(BuildError(new Smb2Header { Command = SmbCommand.Negotiate }, NtStatus.InvalidParameter));
                 break;
             }
 
-            // Compound-Grenzen bestimmen.
+            // Determine compound boundaries.
             int segmentLength = header.NextCommand != 0
                 ? (int)header.NextCommand
                 : message.Length - offset;
             ReadOnlySpan<byte> segment = message.Slice(offset, segmentLength);
 
-            // Related-Operation erbt SessionId/TreeId des Vorgängers (Context §7).
+            // Related operation inherits SessionId/TreeId from the predecessor (Context §7).
             if (header.Flags.HasFlag(Smb2HeaderFlags.RelatedOperations))
             {
                 header.SessionId = relatedSessionId;
@@ -99,7 +99,7 @@ public sealed partial class Smb2Dispatcher
 
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} tid={header.TreeId} len={segment.Length} charge={header.CreditCharge}");
             ResponseSegment? response = DispatchOne(connection, header, segment, transportEncrypted);
-            _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(keine Antwort)")}");
+            _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");
             if (response is { } seg) segments.Add(seg);
 
             if (header.NextCommand == 0) break;
@@ -113,15 +113,15 @@ public sealed partial class Smb2Dispatcher
     {
         try
         {
-            // Verschlüsselungspflicht prüfen, bevor der Command überhaupt verarbeitet wird
-            // (§3.3.5.2.11): Ist die Session global oder der adressierte Tree verschlüsselungs-
-            // pflichtig und kam der Request unverschlüsselt an → ablehnen.
+            // Check encryption requirement before the command is processed at all
+            // (§3.3.5.2.11): if the session globally or the addressed tree requires
+            // encryption and the request arrived unencrypted → reject.
             if (!transportEncrypted && RequiresEncryptedTransport(connection, header))
                 return BuildError(header, NtStatus.AccessDenied);
 
-            // [AUDIT-2026-06] MessageId gegen das Sequenz-/Credit-Fenster prüfen (§3.3.5.2.3).
-            // Bisher toter Code (CreditManager.IsWithinWindow wurde nie aufgerufen) → Replays und
-            // wild springende MessageIds wurden akzeptiert. Siehe docs/SECURITY_AUDIT.md (Finding H2).
+            // [AUDIT-2026-06] Validate MessageId against the sequence/credit window (§3.3.5.2.3).
+            // Previously dead code (CreditManager.IsWithinWindow was never called) → replays and
+            // wildly jumping MessageIds were accepted. See docs/SECURITY_AUDIT.md (Finding H2).
             if (!ValidateSequence(connection, header))
                 return BuildError(header, NtStatus.InvalidParameter);
 
@@ -156,20 +156,19 @@ public sealed partial class Smb2Dispatcher
         }
         catch (Exception ex)
         {
-            // Schutznetz: Ein einzelner fehlgeschlagener Command (z.B. eine Dateisystem-
-            // Ausnahme bei einem ungewöhnlichen Pfad) darf NIE die ganze Verbindung abreißen.
-            // Auf einen sauberen NTSTATUS abbilden statt die Ausnahme bis in die Lese-Schleife
-            // durchschlagen zu lassen (wo IOException stillschweigend als Disconnect gilt).
+            // Safety net: a single failed command (e.g. a filesystem exception for an unusual path)
+            // must NEVER tear down the whole connection. Map to a clean NTSTATUS instead of letting
+            // the exception propagate to the read loop (where IOException silently counts as disconnect).
             _log?.Invoke($"[error] {header.Command} mid={header.MessageId} → {ex.GetType().Name}: {ex.Message}");
             return BuildError(header, MapException(ex));
         }
     }
 
     /// <summary>
-    /// Bestimmt, ob ein Request verschlüsselt ankommen MUSS (RejectUnencryptedAccess, §3.3.5.2.11):
-    /// wenn die adressierte Session global verschlüsselt ist oder der adressierte Tree EncryptData
-    /// verlangt. NEGOTIATE/SESSION_SETUP sind ausgenommen — deren Token-Austausch läuft im Klartext.
-    /// Existiert die Session (noch) nicht, greift die reguläre Session-Prüfung im Handler.
+    /// Determines whether a request MUST arrive encrypted (RejectUnencryptedAccess, §3.3.5.2.11):
+    /// when the addressed session is globally encrypted or the addressed tree requires EncryptData.
+    /// NEGOTIATE/SESSION_SETUP are exempted — their token exchange runs in plaintext.
+    /// If the session does not (yet) exist, the regular session check in the handler applies.
     /// </summary>
     private bool RequiresEncryptedTransport(SmbConnection connection, Smb2Header header)
     {
@@ -181,11 +180,11 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
-    /// [AUDIT-2026-06] Prüft die MessageId gegen das gültige Sequenzfenster und zieht dessen untere
-    /// Grenze nach (§3.3.5.2.3). Ausnahmen: vor abgeschlossenem NEGOTIATE; NEGOTIATE selbst; CANCEL
-    /// (referenziert eine bereits konsumierte MessageId und trägt keine neue); Related-Compound-
-    /// Elemente (werden mit dem Lead-Element gebündelt). Anfragen treffen pro Verbindung monoton
-    /// steigend ein (TCP ist geordnet), daher genügt das Nachziehen der Untergrenze.
+    /// [AUDIT-2026-06] Validates the MessageId against the valid sequence window and advances its lower
+    /// bound (§3.3.5.2.3). Exceptions: before NEGOTIATE is complete; NEGOTIATE itself; CANCEL
+    /// (references an already-consumed MessageId and carries no new one); related compound
+    /// elements (bundled with the lead element). Requests arrive monotonically increasing per connection
+    /// (TCP is ordered), so advancing the lower bound is sufficient.
     /// </summary>
     private static bool ValidateSequence(SmbConnection connection, Smb2Header header)
     {
@@ -208,14 +207,14 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
-    /// Muss eine (ASYNC-)Antwort verschlüsselt werden? Bei ASYNC-Headern fehlt die TreeId, daher
-    /// kann der Host die Per-Share-Pflicht nicht aus den Bytes ableiten — wir bestimmen sie hier aus
-    /// Session (global) bzw. dem Tree des zugehörigen Open und geben sie an den Sendekanal weiter.
+    /// Does an (ASYNC) response need to be encrypted? ASYNC headers lack the TreeId, so
+    /// the host cannot derive the per-share requirement from the bytes — we determine it here from
+    /// the session (global) or the tree of the associated open and pass it to the send channel.
     /// </summary>
     private static bool ResponseNeedsEncryption(SmbSession session, SmbOpen? open)
         => session.EncryptData || (open?.TreeConnect.EncryptData ?? false);
 
-    /// <summary>Bildet eine unerwartete .NET-Ausnahme auf einen passenden NTSTATUS ab.</summary>
+    /// <summary>Maps an unexpected .NET exception to an appropriate NTSTATUS.</summary>
     private static NtStatus MapException(Exception ex) => ex switch
     {
         UnauthorizedAccessException => NtStatus.AccessDenied,
@@ -234,9 +233,9 @@ public sealed partial class Smb2Dispatcher
     // --- SMB1 → SMB2 Upgrade (Context §6.1) ---
 
     /// <summary>
-    /// Antwort auf ein SMB1 SMB_COM_NEGOTIATE: eine SMB2-NEGOTIATE-Response mit Wildcard-Dialekt
-    /// 0x02FF. Der Client schickt danach ein echtes SMB2-NEGOTIATE. Diese Antwort verändert den
-    /// Connection-Zustand nicht (kein finaler Dialekt, kein Preauth-Hash).
+    /// Response to an SMB1 SMB_COM_NEGOTIATE: an SMB2 NEGOTIATE response with wildcard dialect
+    /// 0x02FF. The client then sends a real SMB2 NEGOTIATE. This response does not modify
+    /// connection state (no final dialect, no preauth hash).
     /// </summary>
     private byte[] BuildSmb1WildcardNegotiateResponse()
     {
@@ -285,7 +284,7 @@ public sealed partial class Smb2Dispatcher
         NegotiateResponse response = NegotiateProcessor.BuildResponse(connection, request, _server.Options, securityBuffer);
         connection.NegotiateDone = true;
 
-        // Sequenzfenster initialisieren (Context §7).
+        // Initialize sequence window (Context §7).
         connection.SequenceWindowStart = header.MessageId + 1;
         connection.SequenceWindowSize = _server.Options.MaxCreditsPerResponse;
 
@@ -293,7 +292,7 @@ public sealed partial class Smb2Dispatcher
         respHeader.CreditRequestResponse = CreditManager.ComputeCreditGrant(header.CreditRequestResponse, _server.Options.MaxCreditsPerResponse);
         byte[] body = response.ToBody();
 
-        // Preauth-Hash (3.1.1): NEGOTIATE-Request, dann -Response (Context §6.4, §8.2).
+        // Preauth hash (3.1.1): NEGOTIATE request, then response (Context §6.4, §8.2).
         if (connection.Dialect == SmbDialect.Smb311)
         {
             connection.PreauthHash.Append(segment);
@@ -340,7 +339,7 @@ public sealed partial class Smb2Dispatcher
         if (header.SessionId != 0 && session.State == SessionState.Valid)
             return BuildError(header, NtStatus.AccessDenied);
 
-        // Preauth-Hash: Request einbeziehen (vor evtl. Key-Derivation), Context §8.2.
+        // Preauth hash: include request (before possible key derivation), Context §8.2.
         session.PreauthHash?.Append(segment);
 
         GssResult auth = session.AuthContext!.Accept(request.SecurityBuffer);
@@ -351,7 +350,7 @@ public sealed partial class Smb2Dispatcher
             Smb2Header h = BuildSessionHeader(header, session, NtStatus.MoreProcessingRequired);
             byte[] body = more.ToBody();
 
-            // Zwischen-Response wird mit in den Hash genommen (Context §8.2).
+            // Intermediate response is also included in the hash (Context §8.2).
             if (is311)
             {
                 byte[] full = Concat(h.ToArray(), body);
@@ -366,7 +365,7 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, auth.Status);
         }
 
-        // Erfolg: Identität/Policy übernehmen.
+        // Success: apply identity/policy.
         ApplyIdentity(session, auth);
 
         if (RejectByPolicy(session, out NtStatus rejectStatus))
@@ -400,7 +399,7 @@ public sealed partial class Smb2Dispatcher
         Smb2Header respHeader = BuildSessionHeader(header, session, NtStatus.Success);
         byte[] respBody = response.ToBody();
 
-        // Finale Response: signieren (außer Guest/Anonymous), NICHT mehr in den Hash (Context §8.2/§8.4).
+        // Final response: sign (except guest/anonymous), NOT included in hash anymore (Context §8.2/§8.4).
         bool sign = session.SigningRequired && !session.IsGuest && !session.IsAnonymous;
         return sign
             ? ResponseSegment.Signed(respHeader, respBody, session)
@@ -436,9 +435,9 @@ public sealed partial class Smb2Dispatcher
         session.FullSessionKey = gssSessionKey;
         session.SessionKey = gssSessionKey.Length >= 16 ? gssSessionKey[..16] : Pad16(gssSessionKey);
 
-        // Signing-Pflicht: global oder vom Client verlangt; nie für Guest/Anonymous (Context §8.4).
+        // Signing requirement: global or requested by client; never for guest/anonymous (Context §8.4).
         session.SigningRequired = connection.ShouldSign && !session.IsGuest && !session.IsAnonymous;
-        // Globale Verschlüsselungs-Policy auf Session-Ebene (per-Share-Encryption greift beim TREE_CONNECT).
+        // Global encryption policy at session level (per-share encryption applies at TREE_CONNECT).
         session.EncryptData = _server.Options.RequireEncryption
                               && connection.SupportsEncryption
                               && connection.Dialect.IsSmb3OrLater();
@@ -455,7 +454,7 @@ public sealed partial class Smb2Dispatcher
         }
         else
         {
-            // 2.0.2 / 2.1: kein KDF — Signing nutzt den vollen GSS-Key direkt (Context §8.3).
+            // 2.0.2 / 2.1: no KDF — signing uses the full GSS key directly (Context §8.3).
             session.SigningKey = session.FullSessionKey;
         }
     }
@@ -479,7 +478,7 @@ public sealed partial class Smb2Dispatcher
         if (!_server.Shares.TryGet(request.ShareName, out IShare share))
             return BuildError(header, NtStatus.BadNetworkName);
 
-        // Autorisierungs-Hook (Context §12): Zugriff prüfen und gewährte Zugriffsmaske bestimmen.
+        // Authorization hook (Context §12): check access and determine the granted access mask.
         var accessContext = new ShareAccessContext
         {
             Identity = session.Identity ?? AnonymousIdentity,
@@ -490,9 +489,9 @@ public sealed partial class Smb2Dispatcher
         if (!decision.Allowed)
             return BuildError(header, decision.DenyStatus);
 
-        // Verschlüsselungspflicht des Shares (SMB2_SHAREFLAG_ENCRYPT_DATA, §3.3.5.7): Verlangt der
-        // Share Verschlüsselung, die Connection kann sie aber nicht (Dialekt < 3.0 oder kein Cipher
-        // ausgehandelt) → Zugriff verweigern, statt unverschlüsselt zu liefern.
+        // Share encryption requirement (SMB2_SHAREFLAG_ENCRYPT_DATA, §3.3.5.7): if the share
+        // requires encryption but the connection cannot provide it (dialect < 3.0 or no cipher
+        // negotiated) → deny access instead of serving unencrypted.
         bool encryptTree = share.EncryptData;
         if (encryptTree && !(connection.Dialect.IsSmb3OrLater() && connection.SupportsEncryption))
             return BuildError(header, NtStatus.AccessDenied);
@@ -547,9 +546,9 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        // [AUDIT-2026-06] LOGOFF prüfte zuvor — anders als alle anderen Session-Handler — KEINE
-        // Signatur; ein eingeschleustes LOGOFF konnte eine signaturpflichtige Session abreißen.
-        // Siehe docs/SECURITY_AUDIT.md (Finding M4).
+        // [AUDIT-2026-06] LOGOFF previously — unlike all other session handlers — did NOT verify
+        // the signature; an injected LOGOFF could tear down a session that requires signing.
+        // See docs/SECURITY_AUDIT.md (Finding M4).
         if (!VerifyInboundSignature(session, header, segment))
             return BuildError(header, NtStatus.AccessDenied);
 
@@ -596,16 +595,16 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
-    /// Prüft die Signatur eingehender Nachrichten, wenn die Session Signing verlangt
-    /// (Context §10 Eingangsprüfung). Nicht-signierungspflichtige Sessions passieren.
+    /// Verifies the signature of incoming messages when the session requires signing
+    /// (Context §10 inbound check). Sessions that do not require signing pass through.
     /// </summary>
     private bool VerifyInboundSignature(SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment)
     {
-        // [AUDIT-2026-06] Verschlüsselt empfangene Frames sind durch das AEAD bereits authentifiziert
-        // (§3.1.4.1) und tragen keine Signatur. Früher löschte der Host dafür session.SigningRequired
-        // dauerhaft (Downgrade-Risiko, sobald RejectUnencryptedAccess aus war) — jetzt überspringen wir
-        // nur die Prüfung dieses einen Frames, ohne die Session-Policy zu verändern.
-        // Siehe docs/SECURITY_AUDIT.md (Finding M2).
+        // [AUDIT-2026-06] Frames received encrypted are already authenticated by AEAD
+        // (§3.1.4.1) and carry no signature. Previously the host permanently cleared session.SigningRequired
+        // for this (downgrade risk once RejectUnencryptedAccess was off) — now we only skip
+        // the check for this one frame without changing the session policy.
+        // See docs/SECURITY_AUDIT.md (Finding M2).
         if (_frameWasEncrypted) return true;
         if (!session.SigningRequired) return true;
         if (!header.Flags.HasFlag(Smb2HeaderFlags.Signed)) return false;
@@ -626,7 +625,7 @@ public sealed partial class Smb2Dispatcher
         return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
     }
 
-    /// <summary>Setzt die Segmente zur finalen Nachricht zusammen, patcht NextCommand und signiert.</summary>
+    /// <summary>Assembles segments into the final message, patches NextCommand and signs.</summary>
     private static byte[] AssembleResponse(List<ResponseSegment> segments)
     {
         var writer = new GrowableWriter(256);
@@ -649,7 +648,7 @@ public sealed partial class Smb2Dispatcher
                 Span<byte> segSpan = writer.WrittenSpan.Slice(segStart, padded);
                 Smb2Header h = seg.Header;
                 h.Flags |= Smb2HeaderFlags.Signed;
-                // Flags-Feld im bereits geschriebenen Header aktualisieren (Offset 16).
+                // Update the flags field in the already-written header (offset 16).
                 writer.PatchUInt32(segStart + 16, (uint)h.Flags);
 
                 SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(s.Connection.Dialect, s.Connection.SigningAlgorithmId);
@@ -663,7 +662,7 @@ public sealed partial class Smb2Dispatcher
     private static byte[] Concat(byte[] a, byte[] b) { var r = new byte[a.Length + b.Length]; a.CopyTo(r, 0); b.CopyTo(r, a.Length); return r; }
     private static byte[] Pad16(byte[] input) { var r = new byte[16]; Array.Copy(input, r, Math.Min(16, input.Length)); return r; }
 
-    /// <summary>Eine fertige Antwort-Nachricht (Header + Body) plus Signier-Entscheidung.</summary>
+    /// <summary>A completed response message (header + body) plus signing decision.</summary>
     private readonly struct ResponseSegment
     {
         public Smb2Header Header { get; }

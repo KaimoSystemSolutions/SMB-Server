@@ -6,11 +6,11 @@ using Smb.Server.State;
 namespace Smb.Server;
 
 /// <summary>
-/// Byte-Range-Locking (Context §15, MS-SMB2 §2.2.26/§3.3.5.14) und CANCEL (§3.3.5.16).
-/// Nicht sofort gewährbare Locks ohne <c>FAIL_IMMEDIATELY</c> werden <b>asynchron</b> bedient:
-/// Es geht zuerst eine Interim-Antwort (<c>STATUS_PENDING</c>, ASYNC-Header) raus; die finale
-/// Antwort folgt out-of-band über <see cref="SmbConnection.SendRawAsync"/>, sobald der Bereich
-/// frei wird oder die Operation per CANCEL/Close abgebrochen wird.
+/// Byte-range locking (Context §15, MS-SMB2 §2.2.26/§3.3.5.14) and CANCEL (§3.3.5.16).
+/// Locks that cannot be granted immediately without <c>FAIL_IMMEDIATELY</c> are served
+/// <b>asynchronously</b>: an interim response (<c>STATUS_PENDING</c>, ASYNC header) is sent
+/// first; the final response follows out-of-band via <see cref="SmbConnection.SendRawAsync"/>
+/// once the range becomes free or the operation is cancelled via CANCEL/Close.
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
@@ -25,7 +25,7 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
 
-        // Elemente normalisieren: alle Unlock ODER alle Lock (MS-SMB2 §3.3.5.14.2), sonst INVALID_PARAMETER.
+        // Normalize elements: all unlocks OR all locks (MS-SMB2 §3.3.5.14.2), otherwise INVALID_PARAMETER.
         bool firstUnlock = req.Locks[0].IsUnlock;
         var elements = new LockElement[req.Locks.Count];
         for (int i = 0; i < req.Locks.Count; i++)
@@ -38,7 +38,7 @@ public sealed partial class Smb2Dispatcher
 
         bool failImmediately = req.Locks[0].FailImmediately;
 
-        // AsyncId + Pending-Eintrag vorbereiten; dessen Token steuert ein evtl. Blockieren.
+        // Prepare AsyncId + pending entry; its token controls any potential blocking.
         ulong asyncId = connection.AllocateAsyncId();
         var pending = new PendingAsyncRequest { MessageId = header.MessageId, AsyncId = asyncId, Owner = open };
 
@@ -46,21 +46,21 @@ public sealed partial class Smb2Dispatcher
 
         if (task.IsCompleted)
         {
-            // Synchron entschieden → normale Antwort, kein async-Pfad nötig.
+            // Decided synchronously → normal response, no async path needed.
             pending.Cancel();
             LockOutcome outcome = task.IsCompletedSuccessfully ? task.Result : LockOutcome.Conflict;
             return LockResultSegment(header, session, outcome);
         }
 
-        // [AUDIT-2026-06] Ausstehende async-Operationen je Verbindung deckeln (Ressourcen-Schutz):
-        // sonst kann ein Client unbegrenzt blockierende LOCKs offenhalten. Siehe SECURITY_AUDIT (H1).
+        // [AUDIT-2026-06] Cap outstanding async operations per connection (resource protection):
+        // otherwise a client can keep unlimited blocking LOCKs open. See SECURITY_AUDIT (H1).
         if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
         {
-            pending.Cancel(); // bricht den eben gestarteten Waiter ab
+            pending.Cancel(); // cancels the waiter that was just started
             return BuildError(header, NtStatus.InsufficientResources);
         }
 
-        // Blockierend: Interim-Antwort jetzt, finale Antwort folgt out-of-band.
+        // Blocking: interim response now, final response follows out-of-band.
         connection.PendingRequests[header.MessageId] = pending;
         _ = SendFinalLockResponseAsync(connection, header, session, asyncId, task, pending);
         return InterimResponse(header, session, asyncId);
@@ -69,14 +69,14 @@ public sealed partial class Smb2Dispatcher
     private ResponseSegment? HandleCancel(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
     {
         CancelMessage.ParseRequest(segment, Smb2Header.Size);
-        // CANCEL referenziert die ausstehende Operation über die MessageId und trägt selbst keine
-        // Antwort (§3.3.5.16). Die abgebrochene Operation sendet ihrerseits STATUS_CANCELLED.
+        // CANCEL references the pending operation via MessageId and carries no response itself
+        // (§3.3.5.16). The cancelled operation sends STATUS_CANCELLED on its own.
         if (connection.PendingRequests.TryGetValue(header.MessageId, out PendingAsyncRequest? pending))
             pending.Cancel();
         return null;
     }
 
-    /// <summary>Mappt ein synchron entschiedenes <see cref="LockOutcome"/> auf die Antwort.</summary>
+    /// <summary>Maps a synchronously decided <see cref="LockOutcome"/> to the response segment.</summary>
     private ResponseSegment LockResultSegment(Smb2Header header, SmbSession session, LockOutcome outcome) => outcome switch
     {
         LockOutcome.Granted => MaybeSigned(session, RespHeader(header, session), LockMessage.BuildResponseBody()),
@@ -85,7 +85,7 @@ public sealed partial class Smb2Dispatcher
         _ => BuildError(header, NtStatus.LockNotGranted),
     };
 
-    /// <summary>Interim-Antwort eines blockierenden LOCK: ASYNC-Header, STATUS_PENDING, unsigniert (§3.3.4.1.1).</summary>
+    /// <summary>Interim response for a blocking LOCK: ASYNC header, STATUS_PENDING, unsigned (§3.3.4.1.1).</summary>
     private ResponseSegment InterimResponse(Smb2Header header, SmbSession session, ulong asyncId)
     {
         Smb2Header h = header.CreateResponse(NtStatus.Pending);
@@ -96,7 +96,7 @@ public sealed partial class Smb2Dispatcher
         return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
     }
 
-    /// <summary>Wartet auf das Ergebnis eines blockierenden LOCK und sendet die finale Antwort out-of-band.</summary>
+    /// <summary>Waits for the result of a blocking LOCK and sends the final response out-of-band.</summary>
     private async Task SendFinalLockResponseAsync(
         SmbConnection connection, Smb2Header header, SmbSession session, ulong asyncId,
         Task<LockOutcome> task, PendingAsyncRequest pending)
@@ -119,9 +119,9 @@ public sealed partial class Smb2Dispatcher
         h.Flags |= Smb2HeaderFlags.AsyncCommand;
         h.AsyncId = asyncId;
         h.SessionId = session.SessionId;
-        h.CreditRequestResponse = 0; // Credits wurden bereits mit der Interim-Antwort gewährt.
+        h.CreditRequestResponse = 0; // Credits were already granted with the interim response.
 
-        // Die finale Antwort wird (anders als die Interim-Antwort) signiert, falls die Session signiert.
+        // The final response is signed (if the session signs), unlike the interim response.
         ResponseSegment seg = outcome == LockOutcome.Granted
             ? MaybeSigned(session, h, LockMessage.BuildResponseBody())
             : ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
@@ -131,10 +131,10 @@ public sealed partial class Smb2Dispatcher
         Func<byte[], bool, Task>? sender = connection.SendRawAsync;
         if (sender is null) return;
         try { await sender(bytes, ResponseNeedsEncryption(session, pending.Owner)).ConfigureAwait(false); }
-        catch { /* Connection bereits weg — nichts zu tun */ }
+        catch { /* connection already gone — nothing to do */ }
     }
 
-    /// <summary>Gibt beim CLOSE alle Locks des Open frei und bricht dessen wartende (blockierende) Locks ab.</summary>
+    /// <summary>At CLOSE, releases all locks of the open and cancels its pending (blocking) locks.</summary>
     private void ReleaseLocks(SmbConnection connection, SmbOpen open)
     {
         _server.Options.LockManager.ReleaseOwner(open);

@@ -15,8 +15,8 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// LOCK/CANCEL end-to-end über den Dispatcher: synchroner Grant, READ/WRITE-Konfliktprüfung,
-/// sowie der asynchrone Pfad (Interim STATUS_PENDING + finale out-of-band-Antwort, CANCEL).
+/// LOCK/CANCEL end-to-end via the dispatcher: synchronous grant, READ/WRITE conflict check,
+/// and the asynchronous path (interim STATUS_PENDING + final out-of-band response, CANCEL).
 /// </summary>
 public class LockDispatcherTests : IDisposable
 {
@@ -70,7 +70,7 @@ public class LockDispatcherTests : IDisposable
         var sent = new ConcurrentQueue<byte[]>();
         conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
-        // LOCK ohne FAIL_IMMEDIATELY → der Manager blockiert → Interim-Antwort STATUS_PENDING.
+        // LOCK without FAIL_IMMEDIATELY → the manager blocks → interim response STATUS_PENDING.
         byte[] interim = d.ProcessMessage(conn, TestHelpers.BuildLockRequest(6, sid, tid, p, v,
             [(0, 10, (uint)LockFlags.ExclusiveLock)]));
         Smb2Header ih = Smb2Header.Read(interim);
@@ -78,7 +78,7 @@ public class LockDispatcherTests : IDisposable
         Assert.True(ih.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand));
         Assert.NotEqual(0ul, ih.AsyncId);
 
-        // Gate öffnen → finale Granted-Antwort geht out-of-band an die Senke (gleiche AsyncId).
+        // Open gate → final Granted response goes out-of-band to the sink (same AsyncId).
         gated.Complete(LockOutcome.Granted);
         Smb2Header fh = Smb2Header.Read(await WaitForSend(sent));
         Assert.Equal(NtStatus.Success, fh.Status);
@@ -89,13 +89,13 @@ public class LockDispatcherTests : IDisposable
     [Fact]
     public async Task BlockingLock_OnEncryptedTree_ForcesEncryptedFinalResponse()
     {
-        // ASYNC-Antworten tragen keine TreeId — die Per-Share-Verschlüsselungspflicht muss daher
-        // explizit über den Sendekanal erzwungen werden (sonst ginge die finale Antwort im Klartext).
-        // Erzwingung der Eingangsverschlüsselung hier aus, um den Fluss im Test unverschlüsselt
-        // treiben zu können; geprüft wird allein, dass die ASYNC-Antwort verschlüsselt rausgeht.
+        // ASYNC responses carry no TreeId — the per-share encryption requirement must therefore
+        // be enforced explicitly via the send channel (otherwise the final response would go in plaintext).
+        // Disabling incoming encryption enforcement here so the test flow can run unencrypted;
+        // only the ASYNC response being sent encrypted is verified.
         var gated = new GatedLockManager();
         var (d, conn, sid, tid) = Setup(gated, rejectUnencrypted: false);
-        conn.Sessions[sid].TreeConnects[tid].EncryptData = true; // Tree verlangt Verschlüsselung
+        conn.Sessions[sid].TreeConnects[tid].EncryptData = true; // tree requires encryption
         (ulong p, ulong v) = OpenFile(d, conn, sid, tid, 4);
 
         var sent = new ConcurrentQueue<byte[]>();
@@ -107,7 +107,7 @@ public class LockDispatcherTests : IDisposable
         gated.Complete(LockOutcome.Granted);
         await WaitForSend(sent);
 
-        Assert.True(forcedEncrypt, "Die finale LOCK-Antwort auf einem verschlüsselten Tree muss verschlüsselt gesendet werden.");
+        Assert.True(forcedEncrypt, "The final LOCK response on an encrypted tree must be sent encrypted.");
     }
 
     [Fact]
@@ -124,7 +124,7 @@ public class LockDispatcherTests : IDisposable
             [(0, 10, (uint)LockFlags.ExclusiveLock)]));
         Assert.Equal(NtStatus.Pending, Smb2Header.Read(interim).Status);
 
-        // CANCEL mit derselben MessageId → bricht den wartenden Lock ab (selbst ohne Antwort).
+        // CANCEL with the same MessageId → aborts the waiting lock (no response).
         byte[] cancel = TestHelpers.Concat(TestHelpers.BuildHeader(SmbCommand.Cancel, 6, sid, tid), CancelBody());
         Assert.Empty(d.ProcessMessage(conn, cancel));
 
@@ -185,10 +185,10 @@ public class LockDispatcherTests : IDisposable
             if (queue.TryDequeue(out byte[]? msg)) return msg;
             await Task.Delay(20);
         }
-        throw new Xunit.Sdk.XunitException("Keine out-of-band-Antwort innerhalb des Zeitlimits erhalten.");
+        throw new Xunit.Sdk.XunitException("No out-of-band response received within the time limit.");
     }
 
-    // --- Test-LockManager ---
+    // --- Test lock managers ---
 
     private sealed class DenyAllLockManager : ILockManager
     {
@@ -211,7 +211,7 @@ public class LockDispatcherTests : IDisposable
         public void ReleaseOwner(SmbOpen owner) { }
     }
 
-    // --- Parse-Hilfen ---
+    // --- Parse helpers ---
 
     private static byte[] ExtractSecurityBuffer(byte[] response)
     {

@@ -29,7 +29,7 @@ public class WireTests
         var buffer = new byte[4];
         var w = new SpanWriter(buffer);
         w.WriteUInt32(0x01020304);
-        // Little-Endian: niedrigstwertiges Byte zuerst.
+        // Little-endian: least significant byte first.
         Assert.Equal(new byte[] { 0x04, 0x03, 0x02, 0x01 }, buffer);
     }
 
@@ -53,7 +53,7 @@ public class WireTests
         {
             var r = new SpanReader(new byte[2]);
             r.ReadUInt16();
-            r.ReadByte(); // über das Ende hinaus
+            r.ReadByte(); // past the end
         }
         Assert.Throws<SmbWireFormatException>(ReadTooMuch);
     }
@@ -61,7 +61,7 @@ public class WireTests
     [Fact]
     public void NbssFrame_LengthIsBigEndian()
     {
-        // Länge 0x00ABCDEF → Bytes 0x00, 0xAB, 0xCD, 0xEF nach dem Typbyte.
+        // Length 0x00ABCDEF → bytes 0x00, 0xAB, 0xCD, 0xEF after the type byte.
         var header = new byte[4];
         NbssFrame.WriteHeader(header, 0x00ABCDEF);
         Assert.Equal(NbssFrame.SessionMessageType, header[0]);
@@ -91,8 +91,8 @@ public class WireTests
     {
         var w = new GrowableWriter(4);
         int pos = w.Position;
-        w.WriteUInt16(0);                 // Platzhalter
-        for (int i = 0; i < 100; i++) w.WriteByte((byte)i); // erzwingt Wachstum
+        w.WriteUInt16(0);                 // placeholder
+        for (int i = 0; i < 100; i++) w.WriteByte((byte)i); // forces growth
         w.PatchUInt16(pos, 0xBEEF);
 
         byte[] result = w.ToArray();

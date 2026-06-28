@@ -2,18 +2,18 @@ using Smb.FileSystem;
 
 namespace Smb.Server.Rpc;
 
-/// <summary>Ein für die Enumeration sichtbarer Share (Name, STYPE, Remark).</summary>
+/// <summary>A share visible in enumeration (name, STYPE, remark).</summary>
 public readonly record struct ShareEntry(string Name, uint Type, string Remark);
 
 /// <summary>
-/// Server Service (srvsvc) RPC-Endpoint, soweit für die Share-Enumeration nötig
-/// (MS-SRVS). Unterstützt <c>NetrShareEnum</c> (Opnum 15), Level 1. Bind wird bestätigt.
+/// Server Service (srvsvc) RPC endpoint, as far as needed for share enumeration
+/// (MS-SRVS). Supports <c>NetrShareEnum</c> (Opnum 15), Level 1. Bind is acknowledged.
 /// </summary>
 public sealed class SrvsvcEndpoint : IRpcEndpoint
 {
     private const ushort OpnumNetrShareEnum = 15;
 
-    // STYPE-Werte (MS-SRVS §2.2.2.4).
+    // STYPE values (MS-SRVS §2.2.2.4).
     public const uint StypeDisktree = 0x00000000;
     public const uint StypePrintq = 0x00000001;
     public const uint StypeIpc = 0x00000003;
@@ -23,7 +23,7 @@ public sealed class SrvsvcEndpoint : IRpcEndpoint
 
     public SrvsvcEndpoint(IReadOnlyList<ShareEntry> shares) => _shares = shares;
 
-    /// <summary>Bildet den SMB-Share-Typ auf den SRVSVC-STYPE ab.</summary>
+    /// <summary>Maps the SMB share type to the SRVSVC STYPE.</summary>
     public static uint MapStype(ShareType type) => type switch
     {
         ShareType.Pipe => StypeIpc | StypeSpecial, // IPC$
@@ -54,7 +54,7 @@ public sealed class SrvsvcEndpoint : IRpcEndpoint
         }
     }
 
-    /// <summary>NDR-Stub für NetrShareEnum-Response, Level 1 (SHARE_INFO_1_CONTAINER).</summary>
+    /// <summary>NDR stub for a NetrShareEnum response, Level 1 (SHARE_INFO_1_CONTAINER).</summary>
     private byte[] BuildShareEnumLevel1()
     {
         int count = _shares.Count;
@@ -67,7 +67,7 @@ public sealed class SrvsvcEndpoint : IRpcEndpoint
         n.ReferentId();              // -> SHARE_INFO_1[]
         n.UInt32((uint)count);       // conformant array max_count
 
-        // Inline-Teil je Eintrag: netname-Ptr, type, remark-Ptr.
+        // Inline part per entry: netname-ptr, type, remark-ptr.
         foreach (ShareEntry s in _shares)
         {
             n.ReferentId();          // shi1_netname
@@ -75,7 +75,7 @@ public sealed class SrvsvcEndpoint : IRpcEndpoint
             n.ReferentId();          // shi1_remark
         }
 
-        // Verzögerte Strings je Eintrag (Reihenfolge: netname, remark).
+        // Deferred strings per entry (order: netname, remark).
         foreach (ShareEntry s in _shares)
         {
             n.WideStringNullTerminated(s.Name);

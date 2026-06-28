@@ -3,9 +3,9 @@ using Smb.Protocol.Enums;
 namespace Smb.FileSystem.Local;
 
 /// <summary>
-/// <see cref="IFileStore"/> über ein lokales Verzeichnis. Pfade sind share-relativ
-/// (Backslash-getrennt, kein führender Backslash) und werden gegen ein Ausbrechen aus dem
-/// Wurzelverzeichnis abgesichert (kein <c>..</c>-Escape, Context §13.4). Read/Write/List/Stat.
+/// <see cref="IFileStore"/> backed by a local directory. Paths are share-relative
+/// (backslash-separated, no leading backslash) and are protected against escaping from the
+/// root directory (no <c>..</c> escape, Context §13.4). Read/Write/List/Stat.
 /// </summary>
 public sealed class LocalFileStore : IFileStore
 {
@@ -116,7 +116,7 @@ public sealed class LocalFileStore : IFileStore
         string pattern = string.IsNullOrEmpty(searchPattern) ? "*" : searchPattern;
         var entries = new List<FileEntryInfo>();
 
-        // "." und ".." voranstellen (von Clients erwartet).
+        // Prepend "." and ".." (expected by clients).
         var dirInfo = new DirectoryInfo(h.FullPath);
         entries.Add(ToEntry(dirInfo, "."));
         if (Path.GetFullPath(h.FullPath) != _root)
@@ -173,15 +173,15 @@ public sealed class LocalFileStore : IFileStore
         else File.Create(full).Dispose();
     }
 
-    /// <summary>Löst einen share-relativen Pfad sandboxsicher in einen Vollpfad auf.</summary>
+    /// <summary>Resolves a share-relative path to a full path, sandboxed against directory escape.</summary>
     private bool TryResolve(string relative, out string fullPath)
     {
         fullPath = _root;
         string normalized = (relative ?? string.Empty).Replace('\\', Path.DirectorySeparatorChar).TrimStart(Path.DirectorySeparatorChar);
 
-        // Ungültige Pfadzeichen (z.B. aus @GMT-/Snapshot-Pfaden oder fehlerhaften Clients)
-        // führen sonst zu einer Ausnahme in Path.GetFullPath. Sauber als "nicht auflösbar"
-        // behandeln statt zu werfen (Context §13.4).
+        // Invalid path characters (e.g. from @GMT-/snapshot paths or misbehaving clients)
+        // would otherwise cause an exception in Path.GetFullPath. Handle cleanly as
+        // "unresolvable" instead of throwing (Context §13.4).
         if (normalized.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
             return false;
 
@@ -192,7 +192,7 @@ public sealed class LocalFileStore : IFileStore
             return false;
         }
 
-        // Sandbox: muss innerhalb der Wurzel liegen (kein ..-Ausbruch, Context §13.4).
+        // Sandbox: must stay within root (no .. escape, Context §13.4).
         string rootWithSep = _root.EndsWith(Path.DirectorySeparatorChar) ? _root : _root + Path.DirectorySeparatorChar;
         if (candidate != _root && !candidate.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase))
             return false;
@@ -238,7 +238,7 @@ public sealed class LocalFileStore : IFileStore
     private static long AlignUp(long value, long alignment) => (value + alignment - 1) / alignment * alignment;
 }
 
-/// <summary>Backend-Handle eines lokalen Datei-/Verzeichniseintrags.</summary>
+/// <summary>Backend handle for a local file or directory entry.</summary>
 internal sealed class LocalFileHandle : IFileHandle
 {
     private readonly string _root;

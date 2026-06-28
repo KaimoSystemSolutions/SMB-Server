@@ -9,51 +9,51 @@ using Smb.Server.Oplocks;
 namespace Smb.Server;
 
 /// <summary>
-/// Server-Konfiguration mit sicheren Defaults nach Windows-Server-2025/Win11-24H2-Stand
-/// (Context §20). Bewusst restriktiv: Signing erforderlich, 3.1.1 bevorzugt, Guest/Anonymous
-/// abgelehnt, moderne Cipher/Signing-Präferenz.
+/// Server configuration with secure defaults matching Windows Server 2025/Win11-24H2
+/// (Context §20). Deliberately restrictive: signing required, 3.1.1 preferred, guest/anonymous
+/// rejected, modern cipher/signing preference.
 /// </summary>
 public sealed class SmbServerOptions
 {
-    /// <summary>Servername (für NETNAME-Context / Anzeige).</summary>
+    /// <summary>Server name (for NETNAME context / display).</summary>
     public string ServerName { get; set; } = Environment.MachineName;
 
-    /// <summary>Stabiler Server-GUID (16 Byte). Wird bei Bedarf zufällig erzeugt.</summary>
+    /// <summary>Stable server GUID (16 bytes). Generated randomly if not set.</summary>
     public byte[] ServerGuid { get; set; } = Guid.NewGuid().ToByteArray();
 
-    /// <summary>Höchster vom Server unterstützter Dialekt (Context §6, §20: 3.1.1 bevorzugen).</summary>
+    /// <summary>Highest dialect supported by the server (Context §6, §20: prefer 3.1.1).</summary>
     public SmbDialect MaxDialect { get; set; } = SmbDialect.Smb311;
 
-    /// <summary>Niedrigster akzeptierter Dialekt. SMB1-Dateizugriff bleibt aus (Context §1).</summary>
+    /// <summary>Lowest accepted dialect. SMB1 file access is excluded (Context §1).</summary>
     public SmbDialect MinDialect { get; set; } = SmbDialect.Smb202;
 
-    /// <summary>Signing erzwingen (Context §20: seit 24H2 Default).</summary>
+    /// <summary>Require signing (Context §20: default since 24H2).</summary>
     public bool RequireMessageSigning { get; set; } = true;
 
-    /// <summary>Verschlüsselung global verlangen (zusätzlich per-Share möglich, Context §11).</summary>
+    /// <summary>Require encryption globally (additionally configurable per share, Context §11).</summary>
     public bool RequireEncryption { get; set; }
 
     /// <summary>
-    /// Unverschlüsselte Requests auf eine verschlüsselungspflichtige Session bzw. einen
-    /// verschlüsselungspflichtigen Tree mit <c>STATUS_ACCESS_DENIED</c> ablehnen
-    /// (MS-SMB2 <c>RejectUnencryptedAccess</c>, §3.3.5.2.11). Sicherer Default (an, wie Windows
-    /// seit Server 2022/24H2). Nur abschalten, wenn Clients ohne Encryption zwingend zugreifen müssen.
+    /// Reject unencrypted requests to an encryption-required session or
+    /// encryption-required tree with <c>STATUS_ACCESS_DENIED</c>
+    /// (MS-SMB2 <c>RejectUnencryptedAccess</c>, §3.3.5.2.11). Secure default (on, like Windows
+    /// since Server 2022/24H2). Only disable if clients without encryption must access.
     /// </summary>
     public bool RejectUnencryptedAccess { get; set; } = true;
 
-    /// <summary>Gast-Zugriff ablehnen (Context §8.4, §20).</summary>
+    /// <summary>Reject guest access (Context §8.4, §20).</summary>
     public bool RejectGuestAccess { get; set; } = true;
 
-    /// <summary>Anonymen (NULL-)Zugriff erlauben? Per Default aus (Context §20).</summary>
+    /// <summary>Allow anonymous (NULL) access? Off by default (Context §20).</summary>
     public bool AllowAnonymousAccess { get; set; }
 
-    /// <summary>Cipher-Präferenz (absteigend). Default: AES-128-GCM &gt; AES-256-GCM &gt; AES-128-CCM &gt; AES-256-CCM.</summary>
+    /// <summary>Cipher preference (descending). Default: AES-128-GCM &gt; AES-256-GCM &gt; AES-128-CCM &gt; AES-256-CCM.</summary>
     public IReadOnlyList<SmbCipherId> CipherPreference { get; set; } =
     [
         SmbCipherId.Aes128Gcm, SmbCipherId.Aes256Gcm, SmbCipherId.Aes128Ccm, SmbCipherId.Aes256Ccm,
     ];
 
-    /// <summary>Signing-Präferenz (absteigend). Default: AES-GMAC &gt; AES-CMAC &gt; HMAC-SHA256 (Context §20).</summary>
+    /// <summary>Signing preference (descending). Default: AES-GMAC &gt; AES-CMAC &gt; HMAC-SHA256 (Context §20).</summary>
     public IReadOnlyList<SmbSigningAlgorithmId> SigningPreference { get; set; } =
     [
         SmbSigningAlgorithmId.AesGmac, SmbSigningAlgorithmId.AesCmac, SmbSigningAlgorithmId.HmacSha256,
@@ -63,51 +63,51 @@ public sealed class SmbServerOptions
     public uint MaxReadSize { get; set; } = 8 * 1024 * 1024;
     public uint MaxWriteSize { get; set; } = 8 * 1024 * 1024;
 
-    /// <summary>Maximal pro Antwort gewährte Credits (Cap, Context §7).</summary>
+    /// <summary>Maximum credits granted per response (cap, Context §7).</summary>
     public ushort MaxCreditsPerResponse { get; set; } = 512;
 
     /// <summary>
-    /// [AUDIT-2026-06] Obergrenze gleichzeitig ausstehender asynchroner Operationen je Verbindung
-    /// (blockierende LOCKs, CHANGE_NOTIFY). Schützt vor Ressourcen-Erschöpfung (jede ausstehende
-    /// Operation hält einen <c>PendingRequest</c> und ggf. einen Dateisystem-Watcher). Wird die
-    /// Grenze erreicht, lehnt der Server weitere async-Anforderungen mit
-    /// <c>STATUS_INSUFFICIENT_RESOURCES</c> ab. Siehe docs/SECURITY_AUDIT.md (Finding H1).
+    /// [AUDIT-2026-06] Upper limit of concurrently outstanding asynchronous operations per connection
+    /// (blocking LOCKs, CHANGE_NOTIFY). Protects against resource exhaustion (each outstanding
+    /// operation holds a <c>PendingRequest</c> and potentially a filesystem watcher). When the
+    /// limit is reached the server rejects further async requests with
+    /// <c>STATUS_INSUFFICIENT_RESOURCES</c>. See docs/SECURITY_AUDIT.md (Finding H1).
     /// </summary>
     public int MaxOutstandingRequests { get; set; } = 512;
 
-    /// <summary>SPNEGO-Negotiator (Auth). Pflicht — z.B. NTLM-basiert oder (Test) <see cref="DevSpnegoNegotiator"/>.</summary>
+    /// <summary>SPNEGO negotiator (auth). Required — e.g. NTLM-based or (test) <see cref="DevSpnegoNegotiator"/>.</summary>
     public ISpnegoNegotiator? SpnegoNegotiator { get; set; }
 
-    /// <summary>Bereitgestellte Shares. <c>IPC$</c> wird beim Start sichergestellt (Context §12, §23).</summary>
+    /// <summary>Provided shares. <c>IPC$</c> is ensured at startup (Context §12, §23).</summary>
     public ShareCollection Shares { get; set; } = new();
 
     /// <summary>
-    /// Autorisierungs-Hook für Share-Sichtbarkeit (Enumeration) und -Zugriff (TREE_CONNECT),
-    /// Context §12. Default <see cref="AllowAllSharePolicy"/> (alle sichtbar, Vollzugriff).
-    /// Eigene Policy setzen, um pro User/Gruppe zu filtern und Rechte zu begrenzen.
+    /// Authorization hook for share visibility (enumeration) and access (TREE_CONNECT),
+    /// Context §12. Default <see cref="AllowAllSharePolicy"/> (all visible, full access).
+    /// Set a custom policy to filter per user/group and restrict permissions.
     /// </summary>
     public IShareAccessPolicy ShareAccessPolicy { get; set; } = new AllowAllSharePolicy();
 
     /// <summary>
-    /// Byte-Range-Lock-Verwaltung (SMB2 LOCK, Context §15). Default
-    /// <see cref="InMemoryLockManager"/> (prozesslokal). Eigene Implementierung setzen, um z.B.
-    /// ans Betriebssystem oder einen Cluster zu delegieren.
+    /// Byte-range lock management (SMB2 LOCK, Context §15). Default
+    /// <see cref="InMemoryLockManager"/> (process-local). Set a custom implementation to delegate
+    /// to the OS or a cluster, for example.
     /// </summary>
     public ILockManager LockManager { get; set; } = new InMemoryLockManager();
 
     /// <summary>
-    /// Quelle für Verzeichnis-Änderungen (SMB2 CHANGE_NOTIFY, Context §16). Default
-    /// <see cref="FileSystemDirectoryWatcher"/> (überwacht echte Pfade). Auf
-    /// <see cref="NullDirectoryWatcher"/> setzen, um CHANGE_NOTIFY abzuschalten
-    /// (→ <c>STATUS_NOT_SUPPORTED</c>), oder eine eigene Quelle (inotify, ZFS-Events …) einklinken.
+    /// Source for directory changes (SMB2 CHANGE_NOTIFY, Context §16). Default
+    /// <see cref="FileSystemDirectoryWatcher"/> (monitors real paths). Set to
+    /// <see cref="NullDirectoryWatcher"/> to disable CHANGE_NOTIFY
+    /// (→ <c>STATUS_NOT_SUPPORTED</c>), or hook in a custom source (inotify, ZFS events …).
     /// </summary>
     public IDirectoryWatcher DirectoryWatcher { get; set; } = new FileSystemDirectoryWatcher();
 
     /// <summary>
-    /// Oplock-Verwaltung (SMB2 Oplocks, Context §15). Default <see cref="InMemoryOplockManager"/>
-    /// (prozesslokal). Auf <see cref="NullOplockManager"/> setzen, um Oplocks abzuschalten (CREATE
-    /// gewährt dann stets <c>OplockLevel.None</c>), oder eine eigene Implementierung einklinken, um
-    /// z.B. an einen Cluster-Koordinator zu delegieren.
+    /// Oplock management (SMB2 oplocks, Context §15). Default <see cref="InMemoryOplockManager"/>
+    /// (process-local). Set to <see cref="NullOplockManager"/> to disable oplocks (CREATE
+    /// then always grants <c>OplockLevel.None</c>), or hook in a custom implementation to
+    /// delegate to a cluster coordinator, for example.
     /// </summary>
     public IOplockManager OplockManager { get; set; } = new InMemoryOplockManager();
 
@@ -115,10 +115,10 @@ public sealed class SmbServerOptions
     public void Validate()
     {
         if (ServerGuid is not { Length: 16 })
-            throw new InvalidOperationException("ServerGuid muss 16 Byte sein.");
+            throw new InvalidOperationException("ServerGuid must be 16 bytes.");
         if (MaxDialect < MinDialect)
-            throw new InvalidOperationException("MaxDialect darf nicht kleiner als MinDialect sein.");
+            throw new InvalidOperationException("MaxDialect must not be less than MinDialect.");
         if (SpnegoNegotiator is null)
-            throw new InvalidOperationException("SpnegoNegotiator ist erforderlich (Auth-Provider).");
+            throw new InvalidOperationException("SpnegoNegotiator is required (auth provider).");
     }
 }

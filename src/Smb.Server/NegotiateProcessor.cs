@@ -6,16 +6,16 @@ using Smb.Server.State;
 namespace Smb.Server;
 
 /// <summary>
-/// Verarbeitet SMB2 NEGOTIATE (Context §6): wählt den höchsten gemeinsamen Dialekt, handelt
-/// bei 3.1.1 die Negotiate-Contexts aus (Preauth-Hash, Cipher, Signing-Algorithmus) und baut
-/// die Response. Aktualisiert dabei den Connection-Zustand (Dialekt, Krypto-IDs, SecurityMode).
+/// Processes SMB2 NEGOTIATE (Context §6): selects the highest common dialect, negotiates
+/// negotiate contexts for 3.1.1 (preauth hash, cipher, signing algorithm) and builds
+/// the response. Updates connection state (dialect, crypto IDs, SecurityMode) in the process.
 /// </summary>
 public static class NegotiateProcessor
 {
     /// <summary>
-    /// Wählt den höchsten gemeinsam unterstützten Dialekt aus der Client-Liste im Bereich
-    /// [MinDialect, MaxDialect]. Liefert <see cref="SmbDialect.None"/>, wenn kein gemeinsamer
-    /// Dialekt existiert.
+    /// Selects the highest mutually supported dialect from the client list in the range
+    /// [MinDialect, MaxDialect]. Returns <see cref="SmbDialect.None"/> if no common
+    /// dialect exists.
     /// </summary>
     public static SmbDialect SelectDialect(IReadOnlyList<SmbDialect> clientDialects, SmbServerOptions options)
     {
@@ -31,8 +31,8 @@ public static class NegotiateProcessor
     }
 
     /// <summary>
-    /// Verarbeitet den Negotiate-Request, mutiert <paramref name="connection"/> und baut den
-    /// Response-Body. <paramref name="securityBuffer"/> = SPNEGO NegTokenInit2 (§9).
+    /// Processes the negotiate request, mutates <paramref name="connection"/> and builds the
+    /// response body. <paramref name="securityBuffer"/> = SPNEGO NegTokenInit2 (§9).
     /// </summary>
     public static NegotiateResponse BuildResponse(
         SmbConnection connection,
@@ -42,34 +42,34 @@ public static class NegotiateProcessor
     {
         SmbDialect dialect = SelectDialect(request.Dialects, options);
         if (dialect == SmbDialect.None)
-            throw new InvalidOperationException("Kein gemeinsamer Dialekt mit dem Client.");
+            throw new InvalidOperationException("No common dialect with the client.");
 
         connection.Dialect = dialect;
         connection.ClientGuid = request.ClientGuid;
         connection.ClientCapabilities = request.Capabilities;
         connection.ClientSecurityMode = request.SecurityMode;
 
-        // SecurityMode des Servers: Signing immer angeboten; erforderlich gemäß Policy.
+        // Server SecurityMode: signing always offered; required according to policy.
         var serverSecurityMode = SmbSecurityMode.SigningEnabled;
         if (options.RequireMessageSigning) serverSecurityMode |= SmbSecurityMode.SigningRequired;
         connection.ServerSecurityMode = serverSecurityMode;
         connection.ShouldSign = options.RequireMessageSigning
             || request.SecurityMode.HasFlag(SmbSecurityMode.SigningRequired);
 
-        // Large MTU / Multi-Credit nur, wenn BEIDE Seiten es anbieten (ab 2.1). Ältere/
-        // einfachere Clients (z.B. pysmb) setzen das Capability-Bit nicht und können große
-        // Antwort-Frames nicht empfangen (17-Bit-NBSS-Framing, max. 128 KiB). Ohne Large MTU
-        // werden die Maximalgrößen daher auf 64 KiB gedeckelt (so wie Windows, MS-SMB2 §3.3.5.4).
+        // Large MTU / multi-credit only when BOTH sides offer it (from 2.1 onward). Older/
+        // simpler clients (e.g. pysmb) do not set the capability bit and cannot receive large
+        // response frames (17-bit NBSS framing, max 128 KiB). Without large MTU the maximum
+        // sizes are therefore capped at 64 KiB (like Windows, MS-SMB2 §3.3.5.4).
         bool largeMtu = dialect.SupportsLargeMtu()
                         && request.Capabilities.HasFlag(Smb2Capabilities.LargeMtu);
         connection.SupportsMultiCredit = largeMtu;
 
-        const uint smallBuffer = 0x10000; // 64 KiB Default ohne Large MTU.
+        const uint smallBuffer = 0x10000; // 64 KiB default without large MTU.
         connection.MaxReadSize = largeMtu ? options.MaxReadSize : Math.Min(options.MaxReadSize, smallBuffer);
         connection.MaxWriteSize = largeMtu ? options.MaxWriteSize : Math.Min(options.MaxWriteSize, smallBuffer);
         connection.MaxTransactSize = largeMtu ? options.MaxTransactSize : Math.Min(options.MaxTransactSize, smallBuffer);
 
-        // Capabilities des Servers.
+        // Server capabilities.
         var caps = Smb2Capabilities.None;
         if (largeMtu) caps |= Smb2Capabilities.LargeMtu;
 
@@ -81,7 +81,7 @@ public static class NegotiateProcessor
         }
         else if (dialect is SmbDialect.Smb300 or SmbDialect.Smb302)
         {
-            // Encryption via Capability-Bit (AES-128-CCM ist der einzige Cipher für 3.0/3.0.2).
+            // Encryption via capability bit (AES-128-CCM is the only cipher for 3.0/3.0.2).
             bool clientWantsEncryption = request.Capabilities.HasFlag(Smb2Capabilities.Encryption);
             if (clientWantsEncryption || options.RequireEncryption)
             {
@@ -93,7 +93,7 @@ public static class NegotiateProcessor
         }
         else
         {
-            // 2.0.2 / 2.1: HMAC-SHA256-Signing, keine Verschlüsselung.
+            // 2.0.2 / 2.1: HMAC-SHA256 signing, no encryption.
             connection.SigningAlgorithmId = SmbSigningAlgorithmId.HmacSha256;
         }
 
@@ -121,7 +121,7 @@ public static class NegotiateProcessor
         SmbServerOptions options,
         List<NegotiateContext> responseContexts)
     {
-        // --- PREAUTH_INTEGRITY: Pflicht. Nur SHA-512. Server-Salt zufällig. ---
+        // --- PREAUTH_INTEGRITY: required. SHA-512 only. Server salt random. ---
         connection.PreauthIntegrityHashId = PreauthHashAlgorithm.Sha512;
         responseContexts.Add(new PreauthIntegrityContext
         {
@@ -129,7 +129,7 @@ public static class NegotiateProcessor
             Salt = RandomNumberGenerator.GetBytes(32),
         });
 
-        // --- ENCRYPTION: einen Cipher gemäß Server-Präferenz aus der Client-Liste wählen. ---
+        // --- ENCRYPTION: choose a cipher from the client list according to server preference. ---
         EncryptionContext? clientEnc = request.NegotiateContexts.OfType<EncryptionContext>().FirstOrDefault();
         if (clientEnc is not null)
         {
@@ -142,7 +142,7 @@ public static class NegotiateProcessor
             }
         }
 
-        // --- SIGNING: einen Algorithmus gemäß Server-Präferenz wählen; Default AES-CMAC. ---
+        // --- SIGNING: choose an algorithm according to server preference; default AES-CMAC. ---
         SigningContext? clientSign = request.NegotiateContexts.OfType<SigningContext>().FirstOrDefault();
         if (clientSign is not null)
         {
@@ -152,7 +152,7 @@ public static class NegotiateProcessor
         }
         else
         {
-            connection.SigningAlgorithmId = SmbSigningAlgorithmId.AesCmac; // Default ohne Context.
+            connection.SigningAlgorithmId = SmbSigningAlgorithmId.AesCmac; // Default without context.
         }
     }
 
@@ -167,7 +167,7 @@ public static class NegotiateProcessor
     {
         foreach (SmbSigningAlgorithmId pref in serverPref)
             if (clientList.Contains(pref)) return pref;
-        // Fallback: erster vom Client genannter, sonst AES-CMAC.
+        // Fallback: first mentioned by client, otherwise AES-CMAC.
         return clientList.Count > 0 ? clientList[0] : SmbSigningAlgorithmId.AesCmac;
     }
 

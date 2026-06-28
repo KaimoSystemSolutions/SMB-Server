@@ -7,8 +7,8 @@ using Xunit;
 namespace Smb.Tests;
 
 /// <summary>
-/// Kernlogik der Byte-Range-Lock-Verwaltung (<see cref="InMemoryLockManager"/>): Konflikte,
-/// shared/exclusive, asynchrones Warten blockierender Locks und deren Abbruch.
+/// Core logic of byte-range lock management (<see cref="InMemoryLockManager"/>): conflicts,
+/// shared/exclusive, asynchronous waiting of blocking locks, and their cancellation.
 /// </summary>
 public class LockManagerTests
 {
@@ -40,10 +40,10 @@ public class LockManagerTests
 
         Assert.Equal(LockOutcome.Granted, await mgr.ApplyAsync(a, [Lock(0, 10, true)], failImmediately: true, default));
 
-        Assert.False(mgr.IsRangeAccessible(b, 5, 2, forWrite: false)); // anderer Open: kein Read
-        Assert.False(mgr.IsRangeAccessible(b, 5, 2, forWrite: true));  // anderer Open: kein Write
-        Assert.True(mgr.IsRangeAccessible(b, 20, 5, forWrite: true));  // außerhalb: frei
-        Assert.True(mgr.IsRangeAccessible(a, 5, 2, forWrite: true));   // eigener Open: nie blockiert
+        Assert.False(mgr.IsRangeAccessible(b, 5, 2, forWrite: false)); // other open: no read
+        Assert.False(mgr.IsRangeAccessible(b, 5, 2, forWrite: true));  // other open: no write
+        Assert.True(mgr.IsRangeAccessible(b, 20, 5, forWrite: true));  // outside range: free
+        Assert.True(mgr.IsRangeAccessible(a, 5, 2, forWrite: true));   // own open: never blocked
     }
 
     [Fact]
@@ -53,8 +53,8 @@ public class LockManagerTests
         SmbOpen a = MakeOpen("file"), b = MakeOpen("file");
         await mgr.ApplyAsync(a, [Lock(0, 10, false)], failImmediately: true, default);
 
-        Assert.True(mgr.IsRangeAccessible(b, 0, 10, forWrite: false));  // Read erlaubt
-        Assert.False(mgr.IsRangeAccessible(b, 0, 10, forWrite: true));  // Write blockiert
+        Assert.True(mgr.IsRangeAccessible(b, 0, 10, forWrite: false));  // read allowed
+        Assert.False(mgr.IsRangeAccessible(b, 0, 10, forWrite: true));  // write blocked
     }
 
     [Fact]
@@ -75,7 +75,7 @@ public class LockManagerTests
         await mgr.ApplyAsync(a, [Lock(0, 10, true)], failImmediately: true, default);
 
         Task<LockOutcome> blocking = mgr.ApplyAsync(b, [Lock(0, 10, true)], failImmediately: false, default);
-        Assert.False(blocking.IsCompleted); // wartet, weil a den Bereich hält
+        Assert.False(blocking.IsCompleted); // waiting because a holds the range
 
         Assert.Equal(LockOutcome.Granted, await mgr.ApplyAsync(a, [Unlock(0, 10)], failImmediately: true, default));
         Assert.Equal(LockOutcome.Granted, await blocking.WaitAsync(TimeSpan.FromSeconds(5)));
@@ -104,7 +104,7 @@ public class LockManagerTests
         await mgr.ApplyAsync(a, [Lock(0, 10, true)], failImmediately: true, default);
         Task<LockOutcome> blocking = mgr.ApplyAsync(b, [Lock(0, 10, true)], failImmediately: false, default);
 
-        mgr.ReleaseOwner(a); // Close von a → b wird gewährt
+        mgr.ReleaseOwner(a); // close of a → b is granted
         Assert.Equal(LockOutcome.Granted, await blocking.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
