@@ -4,6 +4,18 @@
   <PropertyGroup>
     <RootNamespace>Smb.Server</RootNamespace>
     <AssemblyName>Smb.Server</AssemblyName>
+    <SignAssembly>False</SignAssembly>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Title>SMB-Server</Title>
+    <Version>$(VersionPrefix)</Version>
+    <Authors>kaimoSystem</Authors>
+    <Company>$(Authors), KaimoSystemSolutions</Company>
+    <Description>This is a library explicitly designed for implemting your own SMB-Server. What </Description>
+    <PackageProjectUrl>https://github.com/KaimoSystemSolutions/SMB-Server/</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/KaimoSystemSolutions/SMB-Server/</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>smb; smbserver</PackageTags>
+    <PackageReleaseNotes>Intial Release</PackageReleaseNotes>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />
