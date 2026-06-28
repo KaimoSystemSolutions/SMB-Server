@@ -39,10 +39,14 @@ public sealed class Share : IShare
     };
 }
 
-/// <summary>Registry of a server's published shares (Context §19, <c>ShareList</c>).</summary>
+/// <summary>
+/// Registry of a server's published shares (Context §19, <c>ShareList</c>). Thread-safe so shares
+/// can be added/removed at runtime while connections are served.
+/// </summary>
 public sealed class ShareCollection
 {
-    private readonly Dictionary<string, IShare> _shares = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IShare> _shares =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public ShareCollection Add(IShare share)
     {
@@ -50,9 +54,13 @@ public sealed class ShareCollection
         return this;
     }
 
+    /// <summary>Removes a share by name (runtime reconfiguration). Returns false if it was not present.</summary>
+    public bool Remove(string name) => _shares.TryRemove(name, out _);
+
     public bool TryGet(string name, out IShare share) => _shares.TryGetValue(name, out share!);
 
     public bool Contains(string name) => _shares.ContainsKey(name);
 
-    public IReadOnlyCollection<IShare> All => _shares.Values;
+    /// <summary>Snapshot of the currently published shares (safe to enumerate under concurrent mutation).</summary>
+    public IReadOnlyCollection<IShare> All => _shares.Values.ToArray();
 }

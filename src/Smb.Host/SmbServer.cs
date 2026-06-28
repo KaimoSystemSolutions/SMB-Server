@@ -42,6 +42,22 @@ public sealed class SmbServer : IAsyncDisposable
     /// <summary>Server state (shares, sessions) — for tests/diagnostics.</summary>
     public SmbServerState State => _state;
 
+    /// <summary>Currently published shares (snapshot); reflects runtime add/remove.</summary>
+    public IReadOnlyCollection<IShare> Shares => _state.Shares.All;
+
+    /// <summary>
+    /// Adds (or replaces) a share at runtime. New TREE_CONNECTs see it immediately; existing tree
+    /// connections are unaffected. No restart required.
+    /// </summary>
+    public void AddShare(IShare share) => _state.Shares.Add(share);
+
+    /// <summary>
+    /// Removes a share at runtime. New TREE_CONNECTs to it are refused (<c>STATUS_BAD_NETWORK_NAME</c>);
+    /// existing tree connections keep working until the client disconnects. Returns false if it was
+    /// not present.
+    /// </summary>
+    public bool RemoveShare(string name) => _state.Shares.Remove(name);
+
     /// <summary>Starts the listener and the accept loop (Context §3.3.3: open listener on 445).</summary>
     public Task StartAsync(CancellationToken ct = default)
     {

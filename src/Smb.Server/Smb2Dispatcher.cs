@@ -125,6 +125,10 @@ public sealed partial class Smb2Dispatcher
             if (!ValidateSequence(connection, header))
                 return BuildError(header, NtStatus.InvalidParameter);
 
+            // Make the authenticated caller available to a per-user IFileStore backend (ambient,
+            // valid for this command only; reset in the finally below).
+            SetAmbientCaller(connection, header);
+
             return header.Command switch
             {
                 SmbCommand.Negotiate => HandleNegotiate(connection, header, segment),
@@ -162,6 +166,24 @@ public sealed partial class Smb2Dispatcher
             _log?.Invoke($"[error] {header.Command} mid={header.MessageId} → {ex.GetType().Name}: {ex.Message}");
             return BuildError(header, MapException(ex));
         }
+        finally
+        {
+            // Identity is ambient for one command only — never leak it to the next request on this flow.
+            SmbCaller.Current = null;
+        }
+    }
+
+    /// <summary>
+    /// Publishes the session's authenticated identity as the ambient <see cref="SmbCaller"/> for the
+    /// duration of this command, so a per-user <see cref="IFileStore"/> backend can resolve the user.
+    /// No session yet (e.g. NEGOTIATE/SESSION_SETUP) → cleared.
+    /// </summary>
+    private static void SetAmbientCaller(SmbConnection connection, Smb2Header header)
+    {
+        SmbCaller.Current =
+            connection.Sessions.TryGetValue(header.SessionId, out SmbSession? session) && session.Identity is { } id
+                ? new CallerInfo(id.DomainName, id.UserName)
+                : null;
     }
 
     /// <summary>

@@ -109,7 +109,17 @@ public sealed partial class Smb2Dispatcher
         IFileHandle handle = result.Value!;
         open.LocalOpen = handle;
         if (request.Options.HasFlag(CreateOptions.DeleteOnClose))
-            store.SetDeleteOnClose(handle, true);
+        {
+            // DELETE_ON_CLOSE may require the Delete permission (enforced by the backend). Honor a
+            // denial here instead of silently dropping it: roll the open back and fail the CREATE.
+            NtStatus delStatus = store.SetDeleteOnClose(handle, true);
+            if (delStatus != NtStatus.Success)
+            {
+                handle.Dispose();
+                _server.Options.ShareModeManager.Close(shareKey, open);
+                return BuildError(header, delStatus);
+            }
+        }
 
         session.Opens[open.Key] = open;
         Interlocked.Increment(ref tree.OpenCount);
@@ -392,8 +402,7 @@ public sealed partial class Smb2Dispatcher
         byte[]? buffer = req.InfoType switch
         {
             InfoType.File => FsccStructures.BuildFileInformation(stat, (FileInformationClass)req.FileInfoClass),
-            InfoType.FileSystem => FsccStructures.BuildFileSystemInformation(
-                (FsInformationClass)req.FileInfoClass, "SHARE", 0x12345678),
+            InfoType.FileSystem => BuildFsInfo(session, header.TreeId, (FsInformationClass)req.FileInfoClass),
             _ => null,
         };
 
@@ -524,6 +533,22 @@ public sealed partial class Smb2Dispatcher
             open.LocalOpen?.Dispose();
         }
         session.Opens.Clear();
+    }
+
+    /// <summary>
+    /// Builds a FileSystem-class QUERY_INFO buffer. Uses the backend's real volume label/serial/free
+    /// space when its <see cref="IFileStore"/> implements <see cref="IVolumeInfoProvider"/>, otherwise
+    /// generic placeholders.
+    /// </summary>
+    private byte[]? BuildFsInfo(SmbSession session, uint treeId, FsInformationClass infoClass)
+    {
+        if (TryGetFileStore(session, treeId, out IFileStore store, out _) && store is IVolumeInfoProvider vip)
+        {
+            VolumeInfo vi = vip.GetVolumeInfo();
+            return FsccStructures.BuildFileSystemInformation(
+                infoClass, vi.Label, vi.SerialNumber, vi.TotalBytes, vi.AvailableBytes);
+        }
+        return FsccStructures.BuildFileSystemInformation(infoClass, "SHARE", 0x12345678);
     }
 
     private static FsccFileStat ToStat(FileEntryInfo info) => new()

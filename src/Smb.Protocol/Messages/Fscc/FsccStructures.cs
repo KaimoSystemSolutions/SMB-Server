@@ -252,12 +252,14 @@ public static class FsccStructures
     //  QUERY_INFO: FileSystemInformation (InfoType FILESYSTEM)
     // ---------------------------------------------------------------------
 
-    public static byte[]? BuildFileSystemInformation(FsInformationClass infoClass, string volumeLabel, uint serialNumber)
+    public static byte[]? BuildFileSystemInformation(
+        FsInformationClass infoClass, string volumeLabel, uint serialNumber,
+        long totalBytes = -1, long availableBytes = -1)
         => infoClass switch
         {
             FsInformationClass.FileFsVolumeInformation => FsVolume(volumeLabel, serialNumber),
-            FsInformationClass.FileFsSizeInformation => FsSize(),
-            FsInformationClass.FileFsFullSizeInformation => FsFullSize(),
+            FsInformationClass.FileFsSizeInformation => FsSize(totalBytes, availableBytes),
+            FsInformationClass.FileFsFullSizeInformation => FsFullSize(totalBytes, availableBytes),
             FsInformationClass.FileFsDeviceInformation => FsDevice(),
             FsInformationClass.FileFsAttributeInformation => FsAttribute(),
             _ => null,
@@ -276,26 +278,34 @@ public static class FsccStructures
         return w.ToArray();
     }
 
-    private static byte[] FsSize()
+    // BytesPerSector(512) * SectorsPerAllocationUnit(8) = 4096-byte cluster. Bytes are converted to
+    // allocation units; negative input keeps the historical placeholder (≈4 GiB total / 2 GiB free).
+    private const long BytesPerSector = 512, SectorsPerUnit = 8, BytesPerUnit = BytesPerSector * SectorsPerUnit;
+
+    private static byte[] FsSize(long totalBytes = -1, long availableBytes = -1)
     {
+        long totalUnits = totalBytes >= 0 ? totalBytes / BytesPerUnit : 1L << 20;
+        long availUnits = availableBytes >= 0 ? availableBytes / BytesPerUnit : 1L << 19;
         var b = new byte[24];
         var w = new SpanWriter(b);
-        w.WriteInt64(1 << 20);  // TotalAllocationUnits (placeholder)
-        w.WriteInt64(1 << 19);  // AvailableAllocationUnits
-        w.WriteUInt32(8);       // SectorsPerAllocationUnit
-        w.WriteUInt32(512);     // BytesPerSector
+        w.WriteInt64(totalUnits);            // TotalAllocationUnits
+        w.WriteInt64(availUnits);            // AvailableAllocationUnits
+        w.WriteUInt32((uint)SectorsPerUnit); // SectorsPerAllocationUnit
+        w.WriteUInt32((uint)BytesPerSector); // BytesPerSector
         return b;
     }
 
-    private static byte[] FsFullSize()
+    private static byte[] FsFullSize(long totalBytes = -1, long availableBytes = -1)
     {
+        long totalUnits = totalBytes >= 0 ? totalBytes / BytesPerUnit : 1L << 20;
+        long availUnits = availableBytes >= 0 ? availableBytes / BytesPerUnit : 1L << 19;
         var b = new byte[32];
         var w = new SpanWriter(b);
-        w.WriteInt64(1 << 20);  // TotalAllocationUnits
-        w.WriteInt64(1 << 19);  // CallerAvailableAllocationUnits
-        w.WriteInt64(1 << 19);  // ActualAvailableAllocationUnits
-        w.WriteUInt32(8);       // SectorsPerAllocationUnit
-        w.WriteUInt32(512);     // BytesPerSector
+        w.WriteInt64(totalUnits);            // TotalAllocationUnits
+        w.WriteInt64(availUnits);            // CallerAvailableAllocationUnits
+        w.WriteInt64(availUnits);            // ActualAvailableAllocationUnits
+        w.WriteUInt32((uint)SectorsPerUnit); // SectorsPerAllocationUnit
+        w.WriteUInt32((uint)BytesPerSector); // BytesPerSector
         return b;
     }
 
