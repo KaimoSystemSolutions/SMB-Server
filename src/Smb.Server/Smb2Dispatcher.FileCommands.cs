@@ -5,6 +5,7 @@ using Smb.Protocol.Messages;
 using Smb.Protocol.Messages.Fscc;
 using Smb.Server.Oplocks;
 using Smb.Server.Rpc;
+using Smb.Server.Sharing;
 using Smb.Server.State;
 
 namespace Smb.Server;
@@ -78,15 +79,7 @@ public sealed partial class Smb2Dispatcher
         bool dirRequired = request.Options.HasFlag(CreateOptions.DirectoryFile);
         bool nonDirRequired = request.Options.HasFlag(CreateOptions.NonDirectoryFile);
 
-        FileStoreResult<IFileHandle> result = store.Create(
-            request.Name, access, disposition, dirRequired, nonDirRequired, out CreateOutcome outcome);
-        if (!result.IsSuccess)
-            return BuildError(header, result.Status);
-
-        IFileHandle handle = result.Value!;
-        if (request.Options.HasFlag(CreateOptions.DeleteOnClose))
-            store.SetDeleteOnClose(handle, true);
-
+        // Allocate the open up front so the share-mode reservation can be keyed to it.
         ulong volatileId = connection.AllocateFileId();
         var open = new SmbOpen
         {
@@ -94,10 +87,30 @@ public sealed partial class Smb2Dispatcher
             VolatileFileId = volatileId,
             Session = session,
             TreeConnect = tree,
-            LocalOpen = handle,
             GrantedAccess = grantedAccess,
             PathName = request.Name,
         };
+
+        // [O5] Sharing-violation check BEFORE the backend acts, so a conflict causes no side effects
+        // (e.g. truncation). Keyed on the share-scoped logical path; released at CLOSE/teardown.
+        string shareKey = ShareModeKey(tree, request.Name);
+        if (!_server.Options.ShareModeManager.TryOpen(shareKey, open, access, MapShare(request.ShareAccess)))
+            return BuildError(header, NtStatus.SharingViolation);
+        open.ShareModeKey = shareKey;
+
+        FileStoreResult<IFileHandle> result = store.Create(
+            request.Name, access, disposition, dirRequired, nonDirRequired, out CreateOutcome outcome);
+        if (!result.IsSuccess)
+        {
+            _server.Options.ShareModeManager.Close(shareKey, open);
+            return BuildError(header, result.Status);
+        }
+
+        IFileHandle handle = result.Value!;
+        open.LocalOpen = handle;
+        if (request.Options.HasFlag(CreateOptions.DeleteOnClose))
+            store.SetDeleteOnClose(handle, true);
+
         session.Opens[open.Key] = open;
         Interlocked.Increment(ref tree.OpenCount);
 
@@ -233,6 +246,7 @@ public sealed partial class Smb2Dispatcher
         session.Opens.TryRemove(open.Key, out _);
         ReleaseLocks(connection, open);
         _server.Options.OplockManager.ReleaseOwner(open);
+        if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
         open.LocalOpen?.Dispose();
 
         byte[] body = info is null
@@ -321,30 +335,44 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
+        // SL_RESTART_SCAN → re-snapshot from the top (Context §14, MS-SMB2 §3.3.5.18).
         if ((req.Flags & QueryDirectoryMessage.FlagRestartScan) != 0)
-            open.DirectoryEnumStarted = false;
+        {
+            open.DirectoryListing = null;
+            open.DirectoryCursor = 0;
+        }
 
-        // Second query without restart → end (Context §14).
-        if (open.DirectoryEnumStarted)
-            return BuildError(header, NtStatus.NoMoreFiles);
+        // First call of a scan: snapshot the listing once. The search pattern applies to this scan
+        // only; later (continuation) calls page through the snapshot regardless of any pattern sent.
+        if (open.DirectoryListing is null)
+        {
+            FileStoreResult<IReadOnlyList<FileEntryInfo>> listing = store.QueryDirectory(open.LocalOpen, req.SearchPattern);
+            if (!listing.IsSuccess)
+                return BuildError(header, listing.Status);
+            if (listing.Value!.Count == 0)
+                return BuildError(header, NtStatus.NoSuchFile);
+            open.DirectoryListing = listing.Value;
+            open.DirectoryCursor = 0;
+        }
 
-        FileStoreResult<IReadOnlyList<FileEntryInfo>> listing = store.QueryDirectory(open.LocalOpen, req.SearchPattern);
-        if (!listing.IsSuccess)
-            return BuildError(header, listing.Status);
+        IReadOnlyList<FileEntryInfo> all = open.DirectoryListing;
+        if (open.DirectoryCursor >= all.Count)
+            return BuildError(header, NtStatus.NoMoreFiles); // fully enumerated
 
-        IReadOnlyList<FileEntryInfo> entries = listing.Value!;
-        if (entries.Count == 0)
-            return BuildError(header, NtStatus.NoSuchFile);
+        // Map only as many entries as could plausibly fit the client's buffer (bounds the work for
+        // huge directories); SL_RETURN_SINGLE_ENTRY caps at one. The builder enforces the exact budget.
+        bool single = (req.Flags & QueryDirectoryMessage.FlagReturnSingleEntry) != 0;
+        int remaining = all.Count - open.DirectoryCursor;
+        int cap = single ? 1 : Math.Min(remaining, (int)(req.OutputBufferLength / 12) + 2);
+        var page = new List<FsccFileStat>(cap);
+        for (int i = 0; i < cap; i++)
+            page.Add(ToStat(all[open.DirectoryCursor + i]));
 
-        var stats = new List<FsccFileStat>(entries.Count);
-        foreach (FileEntryInfo e in entries)
-            stats.Add(ToStat(e, (ulong)(uint)e.Name.GetHashCode()));
+        byte[] buffer = FsccStructures.BuildDirectoryListing(page, req.InfoClass, (int)req.OutputBufferLength, out int wrote);
+        if (wrote == 0)
+            return BuildError(header, NtStatus.InfoLengthMismatch); // not even one entry fits the buffer
 
-        byte[] buffer = FsccStructures.BuildDirectoryListing(stats, req.InfoClass);
-        if (buffer.Length > req.OutputBufferLength)
-            return BuildError(header, NtStatus.InvalidParameter); // buffer too small (simplified phase-1 variant)
-
-        open.DirectoryEnumStarted = true;
+        open.DirectoryCursor += wrote;
         return MaybeSigned(session, RespHeader(header, session), QueryDirectoryMessage.BuildResponseBody(buffer));
     }
 
@@ -359,7 +387,7 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
-        FsccFileStat stat = ToStat(open.LocalOpen.GetInfo(), open.VolatileFileId);
+        FsccFileStat stat = ToStat(open.LocalOpen.GetInfo());
 
         byte[]? buffer = req.InfoType switch
         {
@@ -459,7 +487,46 @@ public sealed partial class Smb2Dispatcher
         return intent;
     }
 
-    private static FsccFileStat ToStat(FileEntryInfo info, ulong indexNumber) => new()
+    private static FileShareMode MapShare(uint shareAccess)
+    {
+        FileShareMode m = FileShareMode.None;
+        if ((shareAccess & 0x1) != 0) m |= FileShareMode.Read;   // FILE_SHARE_READ
+        if ((shareAccess & 0x2) != 0) m |= FileShareMode.Write;  // FILE_SHARE_WRITE
+        if ((shareAccess & 0x4) != 0) m |= FileShareMode.Delete; // FILE_SHARE_DELETE
+        return m;
+    }
+
+    /// <summary>Share-scoped, case-folded logical path key for the share-mode table (O5).</summary>
+    private static string ShareModeKey(SmbTreeConnect tree, string name)
+        => tree.Share.Name + "\0" + name.Replace('\\', '/').Trim('/').ToLowerInvariant();
+
+    /// <summary>
+    /// Releases all server-side state of every open on a connection at teardown (Context §3.3.7.1):
+    /// byte-range locks, oplocks, share-mode reservations and the backend handle (persistent OS file
+    /// handle, O5). Without this, an abrupt disconnect would leak handles and keep files "open".
+    /// </summary>
+    public void OnConnectionClosed(SmbConnection connection)
+    {
+        foreach (SmbSession session in connection.Sessions.Values)
+        {
+            CloseSessionOpens(session);
+            _server.SessionGlobalList.TryRemove(session.SessionId, out _);
+        }
+    }
+
+    private void CloseSessionOpens(SmbSession session)
+    {
+        foreach (SmbOpen open in session.Opens.Values)
+        {
+            _server.Options.LockManager.ReleaseOwner(open);
+            _server.Options.OplockManager.ReleaseOwner(open);
+            if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
+            open.LocalOpen?.Dispose();
+        }
+        session.Opens.Clear();
+    }
+
+    private static FsccFileStat ToStat(FileEntryInfo info) => new()
     {
         Name = info.Name,
         FileAttributes = (uint)info.Attributes,
@@ -470,6 +537,6 @@ public sealed partial class Smb2Dispatcher
         LastWriteTime = info.LastWriteTime,
         ChangeTime = info.ChangeTime,
         IsDirectory = info.IsDirectory,
-        IndexNumber = (long)indexNumber,
+        IndexNumber = info.IndexNumber, // stable backend FileId (O2), no longer Name.GetHashCode()
     };
 }

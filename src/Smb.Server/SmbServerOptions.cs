@@ -5,6 +5,7 @@ using Smb.Server.Authorization;
 using Smb.Server.Locking;
 using Smb.Server.Notification;
 using Smb.Server.Oplocks;
+using Smb.Server.Sharing;
 
 namespace Smb.Server;
 
@@ -110,6 +111,13 @@ public sealed class SmbServerOptions
     /// delegate to a cluster coordinator, for example.
     /// </summary>
     public IOplockManager OplockManager { get; set; } = new InMemoryOplockManager();
+
+    /// <summary>
+    /// Share-mode / sharing-violation management (CREATE ShareAccess, Context §13). Default
+    /// <see cref="InMemoryShareModeManager"/> (process-local, portable). Set a custom implementation
+    /// to delegate to a cluster/cross-protocol coordinator (e.g. TrueNAS SMB+NFS).
+    /// </summary>
+    public IShareModeManager ShareModeManager { get; set; } = new InMemoryShareModeManager();
 
     /// <summary>Validiert die Konfiguration und wirft bei Fehlkonfiguration.</summary>
     public void Validate()

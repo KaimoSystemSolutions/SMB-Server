@@ -106,8 +106,8 @@ ISpnegoNegotiator  ──>  IGssMechanism (NTLM heute, Kerberos später)
 
 > **Sicherheits-Audit:** Stand und offene Punkte siehe [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md)
 > (behobene Findings sind im Code mit `[AUDIT-2026-06]` markiert und durch `AuditFixTests` abgesichert).
-> Noch offen u.a.: NTLM-MIC-Verifikation (O1), QUERY_DIRECTORY-Paging (O2). ⚠️ AES-256-Key-Derivation
-> (M3) vor Kerberos-Einsatz gegen eine echte Windows-Interop-Aufzeichnung gegenprüfen.
+> Noch offen u.a.: NTLM-MIC-Verifikation (O1), 3.1.1-Negotiate-Validierung (O3), Credit-Buchhaltung (O6).
+> ⚠️ AES-256-Key-Derivation (M3) vor Kerberos-Einsatz gegen eine echte Windows-Interop-Aufzeichnung gegenprüfen.
 
 ## Verifikation
 
@@ -117,7 +117,11 @@ Build & Tests:
 dotnet test
 ```
 
-Die Suite (131 Tests) deckt u.a. ab:
+**CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) baut und testet bei jedem Push/PR auf
+Linux **und** Windows (Gate — ein roter Build oder Test blockiert). Liegt die Git-Wurzel oberhalb von
+`SmbServer/`, den `.github`-Ordner entsprechend eine Ebene höher schieben.
+
+Die Suite (150 Tests) deckt u.a. ab:
 
 - **Offizielle Krypto-Vektoren:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5),
   NTOWFv2 (MS-NLMP §4.2-Beispiel).
@@ -137,6 +141,13 @@ Die Suite (131 Tests) deckt u.a. ab:
   Freigabe beim CLOSE; Lease-Break-Acknowledgment (noch) → `STATUS_NOT_SUPPORTED`.
 - Audit-Fixes (`AuditFixTests`): LOGOFF-Signaturpflicht, MessageId-Sequenzfenster (Replay/Out-of-Window
   abgelehnt), MaximalAccess-Durchsetzung beim CREATE, Obergrenze ausstehender async-Operationen.
+- Pfad-Sandbox (`SymlinkSandboxTests`): Symlink/Reparse-Point innerhalb des Shares, der nach außen
+  zeigt, wird verweigert (Datei **und** Verzeichnis); normaler In-Root-Zugriff bleibt erlaubt (H4).
+- QUERY_DIRECTORY-Paging + stabile FileId (`QueryDirectoryPagingTests`, O2): großes Verzeichnis über
+  mehrere Seiten, Single-Entry, Buffer zu klein → `INFO_LENGTH_MISMATCH`.
+- Share-Modes / Persistentes Handle (`ShareModeManagerTests`, `LocalFileStoreHandleTests`,
+  `QueryDirectoryPagingTests`, O5): Sharing-Violation bei unverträglichem Zweit-Open + Freigabe nach
+  CLOSE; Read/Write/DeleteOnClose/Rename-while-open über ein dauerhaftes OS-Handle; stabile FileId.
 
 ## Roadmap
 

@@ -1,6 +1,6 @@
 # Sicherheits-/Normkonformitäts-Audit — Smb.Server
 
-**Audit-Stand:** 2026-06-26 · **Code-Marker:** `[AUDIT-2026-06]` (grepbar) · **Suite:** 131 Tests grün
+**Audit-Stand:** 2026-06-28 · **Code-Marker:** `[AUDIT-2026-06]` (grepbar) · **Suite:** 150 Tests grün
 
 Dieses Dokument ist das nachprüfbare Ledger des Audits. Jedes Finding hat eine stabile ID
 (`H#` = hoch, `M#` = mittel, `L#` = niedrig, `O#` = offen/bewusst zurückgestellt). Behobene Findings
@@ -57,6 +57,58 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # die Fix-Regressionstes
 - **Dateien:** `Smb2Dispatcher.FileCommands.cs` (`HandleCreate`).
 - **Re-Verifikation:** `AuditFixTests.Create_WriteAccess_DeniedWhenPolicyGrantsReadOnly`,
   `…_AllowedWhenPolicyGrantsReadWrite`.
+
+### H4 — Symlink-Sandbox-Escape im LocalFileStore
+- **Risiko:** `LocalFileStore.TryResolve` prüfte nur die String-Kanonisierung (`Path.GetFullPath` +
+  Prefix-Check). `GetFullPath` **folgt keinen Symlinks** — ein Symlink *innerhalb* des Shares, der nach
+  außen zeigt, bestand den Prefix-Check und wurde beim Öffnen vom OS verfolgt → Lesen/Schreiben
+  außerhalb der Share-Wurzel. Besonders kritisch unter Unix/ZFS (TrueNAS), wo unprivilegierte Symlinks
+  Standard sind. (Korrigiert die frühere Zusage „Pfad-Traversal-Schutz … keine Lücke", die nur `..`/
+  Slashes/Drive-relative abdeckte, nicht Symlinks.)
+- **Fix:** Zweites Gate `IsWithinRealRoot` nach dem String-Check: `TryResolveRealPath` löst den realen
+  Pfad auf, indem es an **jeder existierenden Komponente** dem Reparse-Point/Symlink folgt (manuelles
+  `realpath` über `FileSystemInfo.ResolveLinkTarget(returnFinalTarget: true)`), und prüft die
+  Containment gegen die ebenfalls aufgelöste Wurzel `_realRoot`. Fail-closed: unauflösbar (zyklisch/
+  defekt/Fehler) → `null` → Zugriff verweigert. Nicht-existierende Endsegmente (anzulegende Datei)
+  enthalten keinen Link und werden unverändert angehängt.
+- **Dateien:** `LocalFileStore.cs` (`TryResolve`, `IsWithinRealRoot`, `TryResolveRealPath`, `_realRoot`).
+- **Re-Verifikation:** `SymlinkSandboxTests` (Escape über Verzeichnis- **und** Datei-Symlink verweigert;
+  normaler In-Root-Zugriff und Zugriff unter symlink-verlinkter Wurzel weiterhin erlaubt). Linux-CI
+  testet mit echten Symlinks; auf Windows ohne Developer Mode greift ein Junction-Fallback.
+
+### O2 — QUERY_DIRECTORY ohne Paging + instabile FileId (behoben)
+- **Risiko:** Das gesamte Listing wurde in einen Buffer serialisiert; passte es nicht in die
+  `OutputBufferLength` des Clients → `INVALID_PARAMETER` statt Paging → **große Verzeichnisse nicht
+  listbar**. Zusätzlich `Name.GetHashCode()` als FileId/IndexNumber (prozess-randomisiert, kollisionsanfällig).
+- **Fix:** `FsccStructures.BuildDirectoryListing(…, maxBytes, out written)` füllt budgetgenau; der
+  Dispatcher snapshotted das Listing beim Scan-Start (`SmbOpen.DirectoryListing`/`DirectoryCursor`) und
+  liefert es **seitenweise** über mehrere QUERY_DIRECTORY-Aufrufe (RESTART_SCAN/SINGLE_ENTRY beachtet;
+  leerer Folgeabruf → `NO_MORE_FILES`; passt nicht mal ein Eintrag → `INFO_LENGTH_MISMATCH`). Stabile
+  FileId: neues `FileEntryInfo.IndexNumber`, vom Backend gesetzt (`LocalFileStore` → `PathId`, FNV-1a
+  über den vollen Pfad statt randomisiertem Hash).
+- **Dateien:** `FsccStructures.cs`, `Smb2Dispatcher.FileCommands.cs` (`HandleQueryDirectory`, `ToStat`),
+  `SmbOpen.cs`, `FileSystemTypes.cs`, `LocalFileStore.cs` (`PathId`), `NtStatus.cs` (`InfoLengthMismatch`).
+- **Re-Verifikation:** `QueryDirectoryPagingTests` (Paging über mehrere Seiten, Single-Entry, Buffer zu
+  klein → INFO_LENGTH_MISMATCH); `LocalFileStoreHandleTests.FileId_IsStableAcrossCalls_AndDistinctPerFile`.
+
+### O5 — LocalFileStore ohne OS-Handle + ShareAccess nicht durchgesetzt (behoben)
+- **Risiko:** Jeder READ/WRITE öffnete einen frischen `FileStream`; das `IFileHandle` hielt kein echtes
+  OS-Handle. Die CREATE-`ShareAccess`-Sharing-Modes wurden **gar nicht** durchgesetzt → zwei Clients
+  bekamen „exklusiv" gleichzeitig → **stille Datenkorruption** (Office/DB-artige Apps). Zudem leakten
+  Handles bei abruptem Disconnect (Opens wurden nie geschlossen).
+- **Fix:** (1) `LocalFileHandle` hält **ein** persistentes `FileStream` je Open (READ/WRITE/Flush/SetEOF/
+  Rd-while-open via `FileShare.Delete`). (2) Neue Naht `IShareModeManager` (Default `InMemoryShareModeManager`)
+  setzt die Windows-Sharing-Regel **symmetrisch** und **portabel** durch — vor dem Backend-Create (kein
+  Seiteneffekt bei Konflikt) → `SHARING_VIOLATION`; bewusst in-process statt OS-`FileShare`, da Unix/ZFS
+  (TrueNAS) Letzteres nicht erzwingt. (3) `Smb2Dispatcher.OnConnectionClosed` + Logoff schließen jetzt
+  alle Opens (Handle/Lock/Oplock/Share-Mode), kein Leak mehr.
+- **Dateien:** `LocalFileStore.cs`, `Sharing/IShareModeManager.cs`, `Sharing/InMemoryShareModeManager.cs`,
+  `SmbServerOptions.cs`, `SmbServerBuilder.cs`, `Smb2Dispatcher.FileCommands.cs` (`HandleCreate`/`HandleClose`/
+  `OnConnectionClosed`), `Smb2Dispatcher.cs` (Logoff), `SmbConnectionHandler.cs` (Teardown), `SmbOpen.cs`.
+- **Re-Verifikation:** `ShareModeManagerTests` (Kompatibilitäts-Matrix), `LocalFileStoreHandleTests`
+  (Roundtrip/DeleteOnClose/Rename-while-open), `QueryDirectoryPagingTests` (SHARING_VIOLATION + Freigabe nach CLOSE).
+- **Restpunkt:** OS-`FileShare` wird permissiv geöffnet (`ReadWrite|Delete`); die Sharing-Semantik liegt
+  bewusst im `IShareModeManager` (cluster-/cross-protocol-fähig über eine eigene Implementierung).
 
 ### M1 — AEAD-Nonce zufällig statt Zähler
 - **Risiko:** MS-SMB2 §3.3.4.1.4 verlangt einen je `EncryptionKey` eindeutigen, monoton steigenden
@@ -115,10 +167,8 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # die Fix-Regressionstes
 | ID | Thema | Risiko | Empfehlung |
 |----|-------|--------|------------|
 | **O1** | **NTLM-MIC nicht verifiziert** (`NtlmCryptography.ComputeMic` existiert, wird serverseitig nie aufgerufen) | Kein NTLM-Downgrade-Schutz (Manipulation der NEGOTIATE-Flags unentdeckt) | MIC im `NtlmServerMechanism.HandleAuthenticate` gegen die drei Nachrichten prüfen, sofern `MsvAvFlags` ihn ankündigt. War bereits im README als offen vermerkt. |
-| **O2** | **QUERY_DIRECTORY** liefert alles in einem Buffer; passt es nicht, `INVALID_PARAMETER` statt Paging. Zusätzlich `Name.GetHashCode()` als FileId/IndexNumber (prozess-randomisiert, kollisionsanfällig) | Große Verzeichnisse nicht listbar; instabile FileIds | Mehrfach-Abruf über fortgesetzte Enumeration; stabile FileId aus dem Backend (z.B. NTFS-FileId/Inode). |
 | **O3** | **3.1.1-NEGOTIATE** validiert nicht, ob der Client einen PreauthIntegrity-Context (mit SHA-512) gesendet hat | §3.3.5.4 verlangt sonst Fehlschlag | Vorhandensein + Algorithmus prüfen, sonst `INVALID_PARAMETER`. |
 | **O4** | **SESSION_SETUP vor NEGOTIATE** wird nicht abgewiesen | Robustheit/undefinierter Zustand | In `HandleSessionSetup` `connection.NegotiateDone` prüfen. |
-| **O5** | **LocalFileStore** öffnet pro Read/Write einen frischen `FileStream`; `IFileHandle` hält kein echtes OS-Handle | CREATE-Share-Modes/Sperren werden nicht OS-seitig durchgesetzt; Performance | Persistentes OS-Handle je Open; ShareAccess auf OS-FileShare abbilden. |
 | **O6** | **Credit-Buchhaltung** ist eine konstante Fenstergröße, keine exakte, mengenbasierte Erweiterung (siehe H2) | Geringe Genauigkeit ggü. Spec; für Single-Connection unkritisch | Bitmap-genaues Sequenzfenster + dynamische Credit-Erweiterung. |
 | **O7** | **Kein Direkttest** der AEAD-Nonce-Monotonie (siehe M1) | Test-Lücke | Nonce-Zähler über eine test-sichtbare Schnittstelle prüfbar machen. |
 
@@ -129,8 +179,8 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # die Fix-Regressionstes
 - **Krypto-Kern** gegen offizielle Vektoren verifiziert: AES-CMAC (RFC 4493), MD4 (RFC 1320),
   NTOWFv2 (MS-NLMP §4.2.2); Sign/Verify + Tamper für alle drei Algorithmen.
 - **Preauth-Integrity-Reihenfolge** (Request/Zwischenantwort einbeziehen, finale Antwort nicht) korrekt.
-- **Pfad-Traversal-Schutz** (`LocalFileStore.TryResolve`): Kanonisierung + Prefix-Check — solide,
-  keine Lücke (auch `..`, Forward-Slashes, Drive-relative Pfade landen am finalen Gate).
+- **Pfad-Traversal-Schutz** (`LocalFileStore.TryResolve`): Kanonisierung + Prefix-Check (`..`,
+  Forward-Slashes, Drive-relative Pfade) **und** symlink-aufgelöste Real-Path-Containment (siehe H4).
 - **Byte-Range-Lock-Manager**: overflow-sicheres Overlap (`UInt128`), atomare Multi-Locks,
   race-sicherer `NotifyOnce` bei CHANGE_NOTIFY.
 - **Compound-Signierung** pro Segment (inkl. Padding) korrekt.

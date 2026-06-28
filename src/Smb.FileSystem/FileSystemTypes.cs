@@ -44,6 +44,13 @@ public sealed class FileEntryInfo
     public long LastWriteTime { get; init; }
     public long ChangeTime { get; init; }
 
+    /// <summary>
+    /// Stable, backend-assigned file identifier (FileId/IndexNumber, MS-FSCC §2.4.20/§2.4.22).
+    /// Used for FileId*DirectoryInformation and FileInternalInformation. Must be stable for a given
+    /// file (not process-randomized) so clients can de-duplicate/track entries; 0 = unknown.
+    /// </summary>
+    public long IndexNumber { get; init; }
+
     public bool IsDirectory => Attributes.HasFlag(SmbFileAttributes.Directory);
 }
 

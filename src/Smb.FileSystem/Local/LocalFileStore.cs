@@ -10,12 +10,17 @@ namespace Smb.FileSystem.Local;
 public sealed class LocalFileStore : IFileStore
 {
     private readonly string _root;
+    private readonly string _realRoot;
     private readonly bool _readOnly;
 
     public LocalFileStore(string rootDirectory, bool readOnly = true)
     {
         _root = Path.GetFullPath(rootDirectory);
         Directory.CreateDirectory(_root);
+        // Real (symlink-resolved) root for the sandbox check below. The root itself may
+        // legitimately live under a symlink (e.g. /mnt/tank/... on ZFS), so both sides of
+        // the containment check must be resolved consistently.
+        _realRoot = TryResolveRealPath(_root) ?? _root;
         _readOnly = readOnly;
     }
 
@@ -43,54 +48,99 @@ public sealed class LocalFileStore : IFileStore
         if (nonDirectoryRequired && exists && isDir)
             return FileStoreResult<IFileHandle>.Fail(NtStatus.FileIsADirectory);
 
+        string relative = full == _root ? string.Empty : path;
+
+        // Directory open/create — no file stream is held.
+        if (directoryRequired || (exists && isDir))
+            return CreateDirectoryHandle(full, relative, disposition, exists, out createAction);
+
+        // Regular file: open ONE persistent OS handle for the lifetime of the SMB open (instead of
+        // re-opening per READ/WRITE — O5). FileShare here is permissive; cross-open sharing semantics
+        // (CREATE ShareAccess) are enforced server-side by the IShareModeManager, which also works on
+        // Unix where OS FileShare is advisory only.
+        return CreateFileHandle(full, relative, access, disposition, exists, out createAction);
+    }
+
+    private FileStoreResult<IFileHandle> CreateDirectoryHandle(
+        string full, string relative, CreateDispositionIntent disposition, bool exists, out CreateOutcome createAction)
+    {
+        createAction = CreateOutcome.Opened;
         switch (disposition)
         {
             case CreateDispositionIntent.Open:
-                if (!exists) return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
-                createAction = CreateOutcome.Opened;
-                break;
-
-            case CreateDispositionIntent.Create:
-                if (exists) return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameCollision);
-                CreateNew(full, directoryRequired);
-                createAction = CreateOutcome.Created;
-                break;
-
-            case CreateDispositionIntent.OpenIf:
-                if (!exists) { CreateNew(full, directoryRequired); createAction = CreateOutcome.Created; }
-                else createAction = CreateOutcome.Opened;
-                break;
-
             case CreateDispositionIntent.Overwrite:
                 if (!exists) return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
-                if (isFile) File.WriteAllBytes(full, []);
-                createAction = CreateOutcome.Overwritten;
+                createAction = disposition == CreateDispositionIntent.Overwrite ? CreateOutcome.Overwritten : CreateOutcome.Opened;
                 break;
-
-            case CreateDispositionIntent.OverwriteIf:
-            case CreateDispositionIntent.Supersede:
-                if (exists && isFile) File.WriteAllBytes(full, []);
-                else if (!exists) CreateNew(full, directoryRequired);
-                createAction = exists ? CreateOutcome.Overwritten : CreateOutcome.Created;
+            case CreateDispositionIntent.Create:
+                if (exists) return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameCollision);
+                Directory.CreateDirectory(full);
+                createAction = CreateOutcome.Created;
+                break;
+            default: // OpenIf / OverwriteIf / Supersede
+                if (!exists) { Directory.CreateDirectory(full); createAction = CreateOutcome.Created; }
+                else createAction = disposition == CreateDispositionIntent.OpenIf ? CreateOutcome.Opened : CreateOutcome.Overwritten;
                 break;
         }
-
-        return FileStoreResult<IFileHandle>.Ok(new LocalFileHandle(full, Path.GetFullPath(full) == _root ? string.Empty : path, _root));
+        return FileStoreResult<IFileHandle>.Ok(new LocalFileHandle(full, relative, _root, stream: null, isDirectory: true));
     }
+
+    private FileStoreResult<IFileHandle> CreateFileHandle(
+        string full, string relative, FileAccessIntent access, CreateDispositionIntent disposition, bool exists, out CreateOutcome createAction)
+    {
+        createAction = CreateOutcome.Opened;
+
+        // Pre-checks mirror the NTFS dispositions so we return a clean status before touching the file.
+        if (disposition is CreateDispositionIntent.Open or CreateDispositionIntent.Overwrite && !exists)
+            return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
+        if (disposition == CreateDispositionIntent.Create && exists)
+            return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameCollision);
+
+        FileMode mode = disposition switch
+        {
+            CreateDispositionIntent.Open => FileMode.Open,
+            CreateDispositionIntent.Create => FileMode.CreateNew,
+            CreateDispositionIntent.OpenIf => FileMode.OpenOrCreate,
+            CreateDispositionIntent.Overwrite => FileMode.Truncate,
+            CreateDispositionIntent.OverwriteIf => FileMode.Create,
+            CreateDispositionIntent.Supersede => FileMode.Create,
+            _ => FileMode.Open,
+        };
+
+        // Any disposition other than a plain Open creates or truncates → needs write access.
+        bool needWrite = access.HasFlag(FileAccessIntent.Write) || disposition != CreateDispositionIntent.Open;
+        FileAccess fileAccess = needWrite && !_readOnly ? FileAccess.ReadWrite : FileAccess.Read;
+        const FileShare share = FileShare.ReadWrite | FileShare.Delete;
+
+        try
+        {
+            var stream = new FileStream(full, mode, fileAccess, share);
+            createAction = disposition switch
+            {
+                CreateDispositionIntent.Create => CreateOutcome.Created,
+                CreateDispositionIntent.Overwrite => CreateOutcome.Overwritten,
+                CreateDispositionIntent.OpenIf => exists ? CreateOutcome.Opened : CreateOutcome.Created,
+                CreateDispositionIntent.OverwriteIf => exists ? CreateOutcome.Overwritten : CreateOutcome.Created,
+                CreateDispositionIntent.Supersede => exists ? CreateOutcome.Superseded : CreateOutcome.Created,
+                _ => CreateOutcome.Opened,
+            };
+            return FileStoreResult<IFileHandle>.Ok(new LocalFileHandle(full, relative, _root, stream, isDirectory: false));
+        }
+        catch (FileNotFoundException) { return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound); }
+        catch (DirectoryNotFoundException) { return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectPathNotFound); }
+        catch (UnauthorizedAccessException) { return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); }
+        catch (IOException ex) when (IsSharingViolation(ex)) { return FileStoreResult<IFileHandle>.Fail(NtStatus.SharingViolation); }
+        catch (IOException) when (mode == FileMode.CreateNew) { return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameCollision); }
+        catch (IOException) { return FileStoreResult<IFileHandle>.Fail(NtStatus.InvalidParameter); }
+    }
+
+    private static bool IsSharingViolation(IOException ex) => (ex.HResult & 0xFFFF) == 32; // ERROR_SHARING_VIOLATION
 
     public FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer)
     {
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
-        try
-        {
-            using var fs = new FileStream(h.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            if (offset >= fs.Length) return FileStoreResult<int>.Ok(0); // EOF: 0 bytes read (handler maps to STATUS_END_OF_FILE)
-            fs.Seek(offset, SeekOrigin.Begin);
-            int read = fs.Read(buffer);
-            return FileStoreResult<int>.Ok(read);
-        }
-        catch (IOException) { return FileStoreResult<int>.Fail(NtStatus.InvalidParameter); }
+        return h.ReadAt(offset, buffer); // EOF → Ok(0) (handler maps to STATUS_END_OF_FILE)
     }
 
     public FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data)
@@ -98,14 +148,7 @@ public sealed class LocalFileStore : IFileStore
         if (_readOnly) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
-        try
-        {
-            using var fs = new FileStream(h.FullPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite);
-            fs.Seek(offset, SeekOrigin.Begin);
-            fs.Write(data);
-            return FileStoreResult<int>.Ok(data.Length);
-        }
-        catch (IOException) { return FileStoreResult<int>.Fail(NtStatus.DiskFull); }
+        return h.WriteAt(offset, data);
     }
 
     public FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern)
@@ -138,9 +181,7 @@ public sealed class LocalFileStore : IFileStore
     public NtStatus SetEndOfFile(IFileHandle handle, long length)
     {
         if (_readOnly) return NtStatus.AccessDenied;
-        var h = (LocalFileHandle)handle;
-        try { using var fs = new FileStream(h.FullPath, FileMode.Open, FileAccess.Write); fs.SetLength(length); return NtStatus.Success; }
-        catch (IOException) { return NtStatus.InvalidParameter; }
+        return ((LocalFileHandle)handle).SetLength(length);
     }
 
     public NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists)
@@ -151,8 +192,11 @@ public sealed class LocalFileStore : IFileStore
         try
         {
             if (File.Exists(dest) && !replaceIfExists) return NtStatus.ObjectNameCollision;
+            // The open stream was created with FileShare.Delete, so the file can be renamed while
+            // open; afterwards the handle must point at the new location for GetInfo/DeleteOnClose.
             if (h.IsDirectory) Directory.Move(h.FullPath, dest);
             else File.Move(h.FullPath, dest, replaceIfExists);
+            h.Relocate(dest, dest == _root ? string.Empty : newPath);
             return NtStatus.Success;
         }
         catch (IOException) { return NtStatus.AccessDenied; }
@@ -165,13 +209,7 @@ public sealed class LocalFileStore : IFileStore
         return NtStatus.Success;
     }
 
-    public NtStatus Flush(IFileHandle handle) => NtStatus.Success;
-
-    private void CreateNew(string full, bool directory)
-    {
-        if (directory) Directory.CreateDirectory(full);
-        else File.Create(full).Dispose();
-    }
+    public NtStatus Flush(IFileHandle handle) => ((LocalFileHandle)handle).FlushStream();
 
     /// <summary>Resolves a share-relative path to a full path, sandboxed against directory escape.</summary>
     private bool TryResolve(string relative, out string fullPath)
@@ -192,13 +230,73 @@ public sealed class LocalFileStore : IFileStore
             return false;
         }
 
-        // Sandbox: must stay within root (no .. escape, Context §13.4).
+        // Sandbox (string level): must stay within root (no .. escape, Context §13.4).
         string rootWithSep = _root.EndsWith(Path.DirectorySeparatorChar) ? _root : _root + Path.DirectorySeparatorChar;
         if (candidate != _root && !candidate.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase))
             return false;
 
+        // [AUDIT-2026-06] Sandbox (real path): Path.GetFullPath above only canonicalizes the string
+        // ("..", slashes, drive-relative) — it does NOT follow symbolic links. A symlink placed
+        // inside the share that points outside would pass the string check above and then be
+        // followed by the OS on open → sandbox escape (critical on Unix/ZFS such as TrueNAS).
+        // Resolve the real path (following links at every existing component) and re-check
+        // containment. See docs/SECURITY_AUDIT.md (Finding H4).
+        if (!IsWithinRealRoot(candidate))
+            return false;
+
         fullPath = candidate;
         return true;
+    }
+
+    /// <summary>True if the symlink-resolved real path of <paramref name="candidate"/> stays within the (resolved) root.</summary>
+    private bool IsWithinRealRoot(string candidate)
+    {
+        string? real = TryResolveRealPath(candidate);
+        if (real is null) return false; // unresolvable (cyclic/broken link or error) → deny, never fail open
+        if (string.Equals(real, _realRoot, StringComparison.OrdinalIgnoreCase)) return true;
+        string sep = _realRoot.EndsWith(Path.DirectorySeparatorChar) ? _realRoot : _realRoot + Path.DirectorySeparatorChar;
+        return real.StartsWith(sep, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Resolves an existing filesystem path to its real location, following symbolic links at
+    /// <b>every</b> path component (a manual realpath — .NET has no built-in). Trailing segments
+    /// that do not exist yet (e.g. a file about to be created) cannot contain a link and are
+    /// appended verbatim. Returns <c>null</c> on any error so the caller fails closed.
+    /// </summary>
+    private static string? TryResolveRealPath(string path)
+    {
+        try
+        {
+            string full = Path.GetFullPath(path);
+            string root = Path.GetPathRoot(full) ?? string.Empty;
+            if (string.IsNullOrEmpty(root)) return full;
+
+            string current = root;
+            foreach (string seg in full[root.Length..].Split(
+                         new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                         StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, seg);
+
+                FileSystemInfo? info =
+                    Directory.Exists(current) ? new DirectoryInfo(current) :
+                    File.Exists(current) ? new FileInfo(current) : null;
+                if (info is null) continue; // non-existing segment: nothing to resolve, keep appending
+
+                FileSystemInfo? target = info.ResolveLinkTarget(returnFinalTarget: true);
+                if (target is not null)
+                {
+                    string parent = Path.GetDirectoryName(current) ?? current;
+                    current = Path.GetFullPath(Path.Combine(parent, target.FullName));
+                }
+            }
+            return Path.GetFullPath(current);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static FileEntryInfo ToEntry(FileSystemInfo info, string name)
@@ -215,6 +313,7 @@ public sealed class LocalFileStore : IFileStore
             LastAccessTime = SafeFileTime(info.LastAccessTimeUtc),
             LastWriteTime = SafeFileTime(info.LastWriteTimeUtc),
             ChangeTime = SafeFileTime(info.LastWriteTimeUtc),
+            IndexNumber = PathId.Of(info.FullName),
         };
     }
 
@@ -238,50 +337,140 @@ public sealed class LocalFileStore : IFileStore
     private static long AlignUp(long value, long alignment) => (value + alignment - 1) / alignment * alignment;
 }
 
-/// <summary>Backend handle for a local file or directory entry.</summary>
+/// <summary>
+/// Backend handle for a local file or directory entry. For files it owns ONE persistent
+/// <see cref="FileStream"/> for the lifetime of the SMB open (O5) — READ/WRITE/flush/truncate go
+/// through it instead of re-opening per request. Directories carry no stream.
+/// </summary>
 internal sealed class LocalFileHandle : IFileHandle
 {
     private readonly string _root;
+    private readonly FileStream? _stream;
+    private readonly bool _isDirectory;
+    private readonly object _io = new();
 
-    public LocalFileHandle(string fullPath, string relativePath, string root)
+    public LocalFileHandle(string fullPath, string relativePath, string root, FileStream? stream, bool isDirectory)
     {
         FullPath = fullPath;
         Path = relativePath;
         _root = root;
+        _stream = stream;
+        _isDirectory = isDirectory;
     }
 
-    public string FullPath { get; }
-    public string Path { get; }
+    public string FullPath { get; private set; }
+    public string Path { get; private set; }
     public bool DeleteOnClose { get; set; }
-    public bool IsDirectory => Directory.Exists(FullPath);
+    public bool IsDirectory => _isDirectory;
     public string? PhysicalPath => FullPath;
+
+    public FileStoreResult<int> ReadAt(long offset, Span<byte> buffer)
+    {
+        if (_stream is null) return FileStoreResult<int>.Fail(NtStatus.InvalidParameter);
+        lock (_io)
+        {
+            try
+            {
+                if (offset >= _stream.Length) return FileStoreResult<int>.Ok(0);
+                _stream.Seek(offset, SeekOrigin.Begin);
+                return FileStoreResult<int>.Ok(_stream.Read(buffer));
+            }
+            catch (IOException) { return FileStoreResult<int>.Fail(NtStatus.InvalidParameter); }
+        }
+    }
+
+    public FileStoreResult<int> WriteAt(long offset, ReadOnlySpan<byte> data)
+    {
+        if (_stream is null || !_stream.CanWrite) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
+        lock (_io)
+        {
+            try
+            {
+                _stream.Seek(offset, SeekOrigin.Begin);
+                _stream.Write(data);
+                return FileStoreResult<int>.Ok(data.Length);
+            }
+            catch (IOException) { return FileStoreResult<int>.Fail(NtStatus.DiskFull); }
+        }
+    }
+
+    public NtStatus SetLength(long length)
+    {
+        if (_stream is null || !_stream.CanWrite) return NtStatus.AccessDenied;
+        lock (_io)
+        {
+            try { _stream.SetLength(length); return NtStatus.Success; }
+            catch (IOException) { return NtStatus.InvalidParameter; }
+        }
+    }
+
+    public NtStatus FlushStream()
+    {
+        lock (_io)
+        {
+            try { _stream?.Flush(flushToDisk: true); return NtStatus.Success; }
+            catch (IOException) { return NtStatus.InvalidParameter; }
+        }
+    }
+
+    /// <summary>Updates the path after a rename so GetInfo/DeleteOnClose target the new location.</summary>
+    public void Relocate(string newFull, string newRelative)
+    {
+        FullPath = newFull;
+        Path = newRelative;
+    }
 
     public FileEntryInfo GetInfo()
     {
-        FileSystemInfo info = IsDirectory ? new DirectoryInfo(FullPath) : new FileInfo(FullPath);
-        bool isDir = IsDirectory;
-        long size = isDir ? 0 : ((FileInfo)info).Length;
-        return new FileEntryInfo
-        {
-            Name = System.IO.Path.GetFileName(FullPath),
-            Attributes = isDir ? SmbFileAttributes.Directory : SmbFileAttributes.Normal,
-            EndOfFile = size,
-            AllocationSize = isDir ? 0 : (size + 4095) / 4096 * 4096,
-            CreationTime = Safe(info.CreationTimeUtc),
-            LastAccessTime = Safe(info.LastAccessTimeUtc),
-            LastWriteTime = Safe(info.LastWriteTimeUtc),
-            ChangeTime = Safe(info.LastWriteTimeUtc),
-        };
+        if (_isDirectory)
+            return Build(new DirectoryInfo(FullPath), 0, isDir: true);
+
+        var fi = new FileInfo(FullPath);
+        long size;
+        lock (_io) { size = _stream is not null ? _stream.Length : (fi.Exists ? fi.Length : 0); }
+        return Build(fi, size, isDir: false);
     }
+
+    private FileEntryInfo Build(FileSystemInfo info, long size, bool isDir) => new()
+    {
+        Name = System.IO.Path.GetFileName(FullPath),
+        Attributes = isDir ? SmbFileAttributes.Directory : SmbFileAttributes.Normal,
+        EndOfFile = size,
+        AllocationSize = isDir ? 0 : (size + 4095) / 4096 * 4096,
+        CreationTime = Safe(info.CreationTimeUtc),
+        LastAccessTime = Safe(info.LastAccessTimeUtc),
+        LastWriteTime = Safe(info.LastWriteTimeUtc),
+        ChangeTime = Safe(info.LastWriteTimeUtc),
+        IndexNumber = PathId.Of(FullPath),
+    };
 
     private static long Safe(DateTime utc) { try { return utc.ToFileTimeUtc(); } catch { return 0; } }
 
     public void Dispose()
     {
+        _stream?.Dispose(); // release the OS handle first so DeleteOnClose can remove the file
         if (DeleteOnClose)
         {
-            try { if (IsDirectory) Directory.Delete(FullPath, true); else File.Delete(FullPath); }
+            try { if (_isDirectory) Directory.Delete(FullPath, true); else File.Delete(FullPath); }
             catch { /* best effort */ }
         }
+    }
+}
+
+/// <summary>
+/// Stable, process-independent 64-bit id derived from a file's full path (FNV-1a). Replaces
+/// <c>string.GetHashCode()</c> (which .NET randomizes per process) for FileId/IndexNumber, so a
+/// client sees a stable identifier across requests/reconnects (O2). Not a real inode, but stable
+/// and collision-resistant within a share.
+/// </summary>
+internal static class PathId
+{
+    public static long Of(string fullPath)
+    {
+        const ulong offsetBasis = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        ulong h = offsetBasis;
+        foreach (char c in fullPath) { h ^= c; h *= prime; }
+        return (long)(h & 0x7FFFFFFFFFFFFFFFUL); // keep positive
     }
 }

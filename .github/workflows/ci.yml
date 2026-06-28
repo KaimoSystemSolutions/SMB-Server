@@ -1,0 +1,46 @@
+name: CI
+
+# Build-and-test gate. Runs on every push and pull request so a broken build or a failing
+# test cannot land unnoticed (see docs/SECURITY_AUDIT.md — the suite guards the security fixes).
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the deployment target (TrueNAS/ZFS) and the only host where the symlink
+        # sandbox tests run unprivileged; Windows is the primary dev OS — keep both green.
+        os: [ ubuntu-latest, windows-latest ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The solution uses the .slnx format (needs the .NET 9.0.200+/10 SDK), while the projects
+      # target net8.0 (needs the .NET 8 runtime to execute the tests). Install both.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore Smb.Server.slnx
+
+      - name: Build (Release)
+        run: dotnet build Smb.Server.slnx --configuration Release --no-restore
+
+      - name: Test (Release)
+        run: dotnet test Smb.Server.slnx --configuration Release --no-build --verbosity normal

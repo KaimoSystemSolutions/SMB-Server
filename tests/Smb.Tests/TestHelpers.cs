@@ -164,7 +164,8 @@ internal static class TestHelpers
     /// sets the RequestedOplockLevel byte (0=None, 1=LevelII, 8=Exclusive, 9=Batch).</summary>
     public static byte[] BuildCreateRequest(ulong messageId, ulong sessionId, uint treeId, string name,
         uint desiredAccess, uint disposition, uint options, byte[]? signingKey = null,
-        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac, byte requestedOplockLevel = 0)
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac, byte requestedOplockLevel = 0,
+        uint shareAccess = 0x00000007)
     {
         byte[] nameBytes = System.Text.Encoding.Unicode.GetBytes(name);
         var body = new GrowableWriter(64 + nameBytes.Length);
@@ -176,7 +177,7 @@ internal static class TestHelpers
         body.WriteUInt64(0);               // Reserved
         body.WriteUInt32(desiredAccess);
         body.WriteUInt32(0);               // FileAttributes
-        body.WriteUInt32(0x00000007);      // ShareAccess = READ|WRITE|DELETE
+        body.WriteUInt32(shareAccess);     // ShareAccess (default READ|WRITE|DELETE)
         body.WriteUInt32(disposition);
         body.WriteUInt32(options);
         int nameOffPos = body.Position;

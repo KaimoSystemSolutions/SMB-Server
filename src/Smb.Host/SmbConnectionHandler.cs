@@ -77,6 +77,7 @@ internal sealed class SmbConnectionHandler
         {
             connection.SendRawAsync = null;
             connection.CancelAllPending();            // cancel pending LOCKs etc.
+            _dispatcher.OnConnectionClosed(connection); // release opens: handles/locks/oplocks/share-modes (O5)
             _server.Connections.TryRemove(connection.ConnectionId, out _);
             _writeLock.Dispose();
             client.Dispose();

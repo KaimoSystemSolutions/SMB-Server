@@ -8,6 +8,7 @@ using Smb.Server;
 using Smb.Server.Authorization;
 using Smb.Server.Locking;
 using Smb.Server.Notification;
+using Smb.Server.Sharing;
 
 namespace Smb.Host;
 
@@ -151,6 +152,17 @@ public sealed class SmbServerBuilder
     public SmbServerBuilder UseDirectoryWatcher(IDirectoryWatcher watcher)
     {
         _options.DirectoryWatcher = watcher;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets share-mode (sharing-violation) management for CREATE ShareAccess (Context §13). Default
+    /// is process-local (<see cref="InMemoryShareModeManager"/>); a custom <see cref="IShareModeManager"/>
+    /// can delegate to a cluster/cross-protocol coordinator (e.g. TrueNAS SMB+NFS).
+    /// </summary>
+    public SmbServerBuilder UseShareModeManager(IShareModeManager manager)
+    {
+        _options.ShareModeManager = manager;
         return this;
     }
 

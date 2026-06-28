@@ -552,6 +552,7 @@ public sealed partial class Smb2Dispatcher
         if (!VerifyInboundSignature(session, header, segment))
             return BuildError(header, NtStatus.AccessDenied);
 
+        CloseSessionOpens(session); // release handles/locks/oplocks/share-modes of this session (O5)
         connection.Sessions.TryRemove(session.SessionId, out _);
         _server.SessionGlobalList.TryRemove(session.SessionId, out _);
         session.State = SessionState.Expired;

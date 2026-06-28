@@ -30,8 +30,18 @@ public sealed class SmbOpen
     /// </summary>
     public OplockLevel OplockLevel { get; set; } = OplockLevel.None;
 
-    /// <summary>Has this (directory) open already been enumerated via QUERY_DIRECTORY? (Context §14)</summary>
-    public bool DirectoryEnumStarted { get; set; }
+    /// <summary>
+    /// Snapshot of the directory listing taken at the start of a QUERY_DIRECTORY scan (Context §14).
+    /// Served in pages across multiple QUERY_DIRECTORY calls; reset on SL_RESTART_SCAN. <c>null</c>
+    /// until the first query (O2).
+    /// </summary>
+    public IReadOnlyList<FileEntryInfo>? DirectoryListing { get; set; }
+
+    /// <summary>Index of the next entry to return from <see cref="DirectoryListing"/> (paging cursor).</summary>
+    public int DirectoryCursor { get; set; }
+
+    /// <summary>Share-mode reservation key (share + path) for release at CLOSE/teardown (O5). Null = none.</summary>
+    public string? ShareModeKey { get; set; }
 
     /// <summary>For named-pipe opens (IPC$, e.g. \PIPE\srvsvc): the DCERPC pipe state. Otherwise null.</summary>
     public RpcPipe? Pipe { get; set; }

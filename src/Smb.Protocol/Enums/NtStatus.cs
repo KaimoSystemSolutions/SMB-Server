@@ -16,6 +16,7 @@ public enum NtStatus : uint
     MoreProcessingRequired = 0xC0000016,
     InvalidParameter = 0xC000000D,
     InvalidInfoClass = 0xC0000003,
+    InfoLengthMismatch = 0xC0000004,
     EndOfFile = 0xC0000011,
     NoSuchFile = 0xC000000F,
     AccessDenied = 0xC0000022,

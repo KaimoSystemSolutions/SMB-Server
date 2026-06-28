@@ -115,7 +115,7 @@ public class ChangeNotifyTests : IDisposable
             SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
             RequireMessageSigning = false,
         };
-        if (withWatcher) options.DirectoryWatcher = new LocalDirectoryWatcher();
+        options.DirectoryWatcher = withWatcher ? new FileSystemDirectoryWatcher() : new NullDirectoryWatcher();
         options.Shares.Add(Share.CreateIpc());
         options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: false) });
 

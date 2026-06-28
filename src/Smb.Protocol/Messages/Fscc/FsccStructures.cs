@@ -31,19 +31,43 @@ public static class FsccStructures
     // ---------------------------------------------------------------------
 
     /// <summary>
-    /// Serializes a list of entries in the given directory-info class. Entries are 8-byte aligned
+    /// Serializes <b>all</b> entries in the given directory-info class. Entries are 8-byte aligned
     /// and chained via <c>NextEntryOffset</c>; the last one has <c>NextEntryOffset=0</c> (Context §14).
     /// </summary>
     public static byte[] BuildDirectoryListing(IReadOnlyList<FsccFileStat> entries, FileInformationClass infoClass)
+        => BuildDirectoryListing(entries, infoClass, int.MaxValue, out _);
+
+    /// <summary>
+    /// Serializes as many leading entries as fit into <paramref name="maxBytes"/> (the client's
+    /// OutputBufferLength) and reports how many were written via <paramref name="written"/> — the
+    /// basis for paged QUERY_DIRECTORY (O2). Every entry except the last is padded to 8 bytes; an
+    /// entry is only accepted if the running total (counting it as the unpadded last) still fits.
+    /// <paramref name="written"/> = 0 means not even one entry fit (caller → STATUS_INFO_LENGTH_MISMATCH).
+    /// </summary>
+    public static byte[] BuildDirectoryListing(
+        IReadOnlyList<FsccFileStat> entries, FileInformationClass infoClass, int maxBytes, out int written)
     {
-        var w = new GrowableWriter(256);
-        for (int i = 0; i < entries.Count; i++)
+        var serialized = new List<byte[]>(entries.Count);
+        int runningPadded = 0;
+        foreach (FsccFileStat e in entries)
+        {
+            byte[] eb = SerializeEntry(e, infoClass);
+            if (serialized.Count > 0 && runningPadded + eb.Length > maxBytes) break;
+            if (serialized.Count == 0 && eb.Length > maxBytes) break; // first entry alone too big
+            serialized.Add(eb);
+            runningPadded += Align8(eb.Length);
+        }
+
+        written = serialized.Count;
+        if (written == 0) return [];
+
+        var w = new GrowableWriter(runningPadded);
+        for (int i = 0; i < serialized.Count; i++)
         {
             int entryStart = w.Position;
-            WriteDirectoryEntry(w, entries[i], infoClass);
+            w.WriteBytes(serialized[i]);
 
-            // Align to 8 bytes (except for the last entry).
-            bool last = i == entries.Count - 1;
+            bool last = i == serialized.Count - 1;
             if (!last)
             {
                 int padded = Align8(w.Position - entryStart);
@@ -56,6 +80,14 @@ public static class FsccStructures
                 w.PatchUInt32(entryStart, 0);
             }
         }
+        return w.ToArray();
+    }
+
+    /// <summary>Serializes a single directory entry (NextEntryOffset placeholder = 0 at its start).</summary>
+    private static byte[] SerializeEntry(FsccFileStat e, FileInformationClass infoClass)
+    {
+        var w = new GrowableWriter(128);
+        WriteDirectoryEntry(w, e, infoClass);
         return w.ToArray();
     }
 
