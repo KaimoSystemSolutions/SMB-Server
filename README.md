@@ -1,4 +1,4 @@
-# Smb.Server
+# SMB-Server
 
 **An SMB 2/3 server library - written in C# (.NET 8)**
 
