@@ -3,7 +3,24 @@
   <PropertyGroup>
     <RootNamespace>Smb.Host</RootNamespace>
     <AssemblyName>Smb.Host</AssemblyName>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <PackageId>SMB-Server</PackageId>
+    <Title>SMB-Server</Title>
+    <Authors>kaimoSystem</Authors>
+    <Company>$(Authors), kaimoSystemSolutions</Company>
+    <Product>SMB-Server</Product>
+    <PackageProjectUrl>https://github.com/KaimoSystemSolutions/SMB-Server</PackageProjectUrl>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/KaimoSystemSolutions/SMB-Server</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>Initial Release</PackageReleaseNotes>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Server\Smb.Server.csproj" />
   </ItemGroup>
