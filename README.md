@@ -1,119 +1,23 @@
 # Smb.Server
 
-**An SMB 2/3 server library for .NET 8 — written in pure C#.**
+**An SMB 2/3 server library - written in C# (.NET 8)**
 
-Embed a full SMB file server directly into your .NET application: Windows, macOS and Linux clients
-can connect via `\\your-server\share` without Samba or the Windows service. The library is
-implemented against the official Microsoft Open Specifications (MS-SMB2, MS-FSCC, MS-NLMP …) and is
-fully test-driven.
+This is a library specifically build, for implementing / creating your own SMB Fileserver.
+The library was created based on the official Microsoft Specifications (MS-ERREF, MS-FSCC, MS-NLMP, MS-SMB2, ...)
 
 [![CI](https://github.com/KaimoSystemSolutions/SMB-Library/actions/workflows/ci.yml/badge.svg)](https://github.com/KaimoSystemSolutions/SMB-Library/actions/workflows/ci.yml)
-
-> **Maturity:** a correct, fully tested foundation (SMB 2/3 negotiate, real NTLMv2 login,
-> signing/encryption, file I/O over pluggable backends). Usable in production with your own auth
-> provider; some advanced features (Kerberos, leases, multichannel) are still open — see the
-> [Roadmap](#roadmap) at the bottom.
 
 ## What it does
 
 - 📁 **File shares** with full NTFS semantics (read, write, rename, delete, locking).
-- 🔐 **Secure by default** — signing required, optional per-share encryption, guest/anonymous rejected.
+- 🔐 **Secure by default** - signing required, optional per-share encryption, guest/anonymous rejected.
 - 🔑 **Real login** via NTLMv2; the user source (local, LDAP/AD …) is freely pluggable.
-- 🧩 **Modular** — plug in your own file backend, auth, lock manager or directory watcher.
-- 🖥️ **Cross-platform** — tested on Windows and Linux (deployment target e.g. TrueNAS/ZFS).
+- 🧩 **Modular** - plug in your own file backend, auth, lock manager or directory watcher.
 
 ## Installation
 
-The library ships as several NuGet packages. To get started you only need the host package — it
-pulls in the rest (`Smb.Server`, `Smb.FileSystem`, `Smb.Auth`, `Smb.Protocol`, `Smb.Crypto`)
-automatically:
-
-```bash
-dotnet add package Smb.Host
-```
-
-## Quick start
-
-```csharp
-using System.Net;
-using Smb.FileSystem;
-using Smb.Host;
-
-await using var server = SmbServerBuilder.Create()
-    .WithEndpoint(IPAddress.Any, 445)        // port is free to choose (445 may be taken by the OS)
-    .WithServerName("MYSERVER")
-    .RequireSigning(true)                    // secure default
-    .UseDevAuthentication()                  // DEV/TEST ONLY — see note below
-    .AddShare(new Share { Name = "Data", Type = ShareType.Disk /*, FileStore = … */ })
-    .WithLogger(Console.WriteLine)
-    .Build();
-
-await server.StartAsync();
-Console.WriteLine($"Listening on {server.Endpoint}");
-Console.ReadLine();
-await server.StopAsync();
-```
-
-> ⚠️ `UseDevAuthentication()` accepts **any** login anonymously and is meant for testing/development only.
-
-### With real login and a file backend
-
-This wires up real NTLM login and serves a folder as a share:
-
-```csharp
-using Smb.Auth;
-
-var users = new InMemoryIdentityBackend().AddUser("WORKGROUP", "demo", "demo123");
-
-await using var server = SmbServerBuilder.Create()
-    .WithEndpoint(IPAddress.Any, 445)
-    .UseAuthentication(new NtlmSpnegoNegotiator(users,
-        new NtlmServerOptions { NetbiosDomainName = "WORKGROUP" }))
-    .AddShare(new Share { Name = "Files", Type = ShareType.Disk,
-                          FileStore = new LocalFileStore(@"C:\data\share", readOnly: true) })
-    .Build();
-
-await server.StartAsync();
-```
-
-Instead of `InMemoryIdentityBackend` you can plug in any user source (LDAP, AD, a database …) — see
-[Modular authentication](#modular-authentication).
-
-## Example project
-
-A runnable example lives under [`examples/Smb.Sample.Server`](examples/Smb.Sample.Server/Program.cs):
-real **NTLM login** + a folder-based share. It starts the server, runs a TCP self-test
-(log in → list directory → read file) and stays running.
-
-```bash
-dotnet run --project examples/Smb.Sample.Server
-# Login: WORKGROUP\demo / demo123
-```
-
-## Security
-
-The library is secure out of the box — you don't have to switch security on first:
-
-- **Signing required** by default; SMB 3.1.1 preferred with preauth integrity (SHA-512).
-- **Per-share encryption** enforceable (`Share.EncryptData`); unencrypted access is rejected.
-- **Guest/anonymous** rejected by default, **SMB1 file access** off.
-- Crypto exclusively via the .NET BCL (`System.Security.Cryptography`).
-
-For the details, algorithm preferences and the security-audit status see
-[Security defaults & audit](#security-defaults--audit).
-
-## Contributing
-
-Build and tests run with a single command:
-
-```bash
-dotnet test
-```
-
-Every push and pull request is built and tested on **Linux and Windows** via
-[GitHub Actions](.github/workflows/ci.yml) — a red build blocks.
-
----
+The library is available via download of the source files or as nuget package.
+URL is coming...
 
 # For developers & background
 
@@ -122,7 +26,7 @@ it for normal use of the library.
 
 ## Architecture
 
-Strict *Parse ↔ State ↔ Effect* layering — each layer its own project, no cycles:
+Strict *Parse ↔ State ↔ Effect* layering - each layer its own project, no cycles:
 
 | Project | Contents |
 |---|---|
@@ -138,7 +42,7 @@ Foundation and fact-check: [`SMB2-3_Server_Context.md`](../SMB2-3_Server_Context
 ### Modular authentication
 
 SESSION_SETUP talks **only** to `ISpnegoNegotiator`. New mechanisms = register a new `IGssMechanism`;
-new identity source (e.g. LDAP/AD) = a new `IIdentityBackend` — **without touching** the protocol or
+new identity source (e.g. LDAP/AD) = a new `IIdentityBackend` - **without touching** the protocol or
 server layer.
 
 ```
