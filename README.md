@@ -1,6 +1,6 @@
 # SMB-Server
 
-**An SMB 2/3 server library - written in C# (.NET 8)**
+**A SMB 2/3 server library - written in C# (.NET 8)**
 
 This is a library specifically build, for implementing / creating your own SMB Fileserver.
 The library was created based on the official Microsoft Specifications (MS-ERREF, MS-FSCC, MS-NLMP, MS-SMB2, ...)

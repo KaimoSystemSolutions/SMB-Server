@@ -13,8 +13,10 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/KaimoSystemSolutions/SMB-Server</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>Initial Release</PackageReleaseNotes>
+    <PackageReleaseNotes>Updated minor bugs</PackageReleaseNotes>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <Version>1.0.1</Version>
+    <Description>A SMB 2/3 server library</Description>
   </PropertyGroup>
   <ItemGroup>
     <None Include="..\..\LICENSE">
