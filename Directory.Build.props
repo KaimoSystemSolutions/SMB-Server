@@ -21,6 +21,10 @@
        Die vier Dependency-Pakete (Protocol/Crypto/Auth/FileSystem) müssen mit dieser
        Version mitveröffentlicht werden, sonst scheitert der Restore beim Konsumenten. -->
   <PropertyGroup>
+    <!-- Single-Package-Modell: standardmäßig packt KEIN Projekt. Nur Smb.Host
+         (PackageId=SMB-Server) setzt IsPackable=true und bettet die übrigen
+         Smb.*-DLLs ein. Verhindert versehentliche Streupakete beim Build/Pack. -->
+    <IsPackable>false</IsPackable>
     <Version>1.0.0</Version>
     <Authors>kaimoSystem</Authors>
     <Company>kaimoSystem, KaimoSystemSolutions</Company>

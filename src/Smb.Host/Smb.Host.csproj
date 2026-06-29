@@ -3,6 +3,7 @@
   <PropertyGroup>
     <RootNamespace>Smb.Host</RootNamespace>
     <AssemblyName>Smb.Host</AssemblyName>
+    <IsPackable>true</IsPackable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <PackageId>SMB-Server</PackageId>
     <Title>SMB-Server</Title>
@@ -15,8 +16,13 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>Updated minor bugs</PackageReleaseNotes>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Description>A SMB 2/3 server library</Description>
+
+    <!-- Single-Package-Build: alle referenzierten Smb.*-DLLs in dieses eine Paket
+         einbetten, statt sie als externe NuGet-Dependencies zu verlangen.
+         Siehe Target 'IncludeReferencedProjectsInPackage' unten. -->
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeReferencedProjectsInPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
   <ItemGroup>
     <None Include="..\..\LICENSE">
@@ -29,6 +35,17 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Smb.Server\Smb.Server.csproj" />
+    <!-- PrivateAssets="all": NICHT als Paket-Dependency in die Nuspec schreiben –
+         die DLL wird stattdessen unten direkt ins Paket kopiert. -->
+    <ProjectReference Include="..\Smb.Server\Smb.Server.csproj" PrivateAssets="all" />
   </ItemGroup>
+
+  <!-- Sammelt die DLLs aller (auch transitiver) ProjectReferences und legt sie
+       mit ins lib/-Verzeichnis des Pakets. So enthält SMB-Server.nupkg
+       Smb.Host + Smb.Server + Smb.Protocol/Crypto/Auth/FileSystem in einer Datei. -->
+  <Target Name="IncludeReferencedProjectsInPackage" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths->WithMetadataValue('ReferenceSourceTarget','ProjectReference'))" />
+    </ItemGroup>
+  </Target>
 </Project>
