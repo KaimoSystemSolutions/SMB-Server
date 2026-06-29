@@ -15,4 +15,19 @@
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
+
+  <!-- Gemeinsame NuGet-Paket-Metadaten + EINE zentrale Version für alle Smb.*-Pakete.
+       Version hier zentral pflegen; per `dotnet pack -p:Version=x.y.z` überschreibbar.
+       Die vier Dependency-Pakete (Protocol/Crypto/Auth/FileSystem) müssen mit dieser
+       Version mitveröffentlicht werden, sonst scheitert der Restore beim Konsumenten. -->
+  <PropertyGroup>
+    <Version>1.0.0</Version>
+    <Authors>kaimoSystem</Authors>
+    <Company>kaimoSystem, KaimoSystemSolutions</Company>
+    <PackageProjectUrl>https://github.com/KaimoSystemSolutions/SMB-Server</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/KaimoSystemSolutions/SMB-Server</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>smb; smbserver; smb2; smb3</PackageTags>
+    <PackageReleaseNotes>Initial Release</PackageReleaseNotes>
+  </PropertyGroup>
 </Project>

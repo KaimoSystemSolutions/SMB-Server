@@ -4,6 +4,7 @@
   <PropertyGroup>
     <RootNamespace>Smb.Auth</RootNamespace>
     <AssemblyName>Smb.Auth</AssemblyName>
+    <Description>GSS/SPNEGO-Abstraktion für SMB (IGssMechanism, ISpnegoNegotiator, IIdentityBackend). NTLM heute, Kerberos/LDAP austauschbar – ohne Eingriff in die SMB-Schicht. Teil der Smb.*-Server-Bibliothek.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />

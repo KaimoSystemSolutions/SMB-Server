@@ -3,6 +3,7 @@
   <PropertyGroup>
     <RootNamespace>Smb.FileSystem</RootNamespace>
     <AssemblyName>Smb.FileSystem</AssemblyName>
+    <Description>IShare/IFileStore-Abstraktion der Smb.*-Server-Bibliothek: bildet NTFS-Semantik auf ein beliebiges Backend ab. Teil der Smb.*-Server-Bibliothek.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />

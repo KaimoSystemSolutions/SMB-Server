@@ -5,6 +5,7 @@
   <PropertyGroup>
     <RootNamespace>Smb.Crypto</RootNamespace>
     <AssemblyName>Smb.Crypto</AssemblyName>
+    <Description>SMB-2/3-Kryptografie: Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD (AES-CCM/GCM), SP800-108-KDF und SHA-512-Preauth-Hash – ausschließlich über die .NET-BCL. Teil der Smb.*-Server-Bibliothek.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />

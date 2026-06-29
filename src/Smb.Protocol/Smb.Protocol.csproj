@@ -4,5 +4,6 @@
   <PropertyGroup>
     <RootNamespace>Smb.Protocol</RootNamespace>
     <AssemblyName>Smb.Protocol</AssemblyName>
+    <Description>Reine SMB-2/3-Wire-Typen (Header, Requests, Responses, Enums, Negotiate-Contexts) ohne I/O oder State. Span&lt;byte&gt;-basiert, Little-Endian. Basis-Paket der Smb.*-Server-Bibliothek.</Description>
   </PropertyGroup>
 </Project>

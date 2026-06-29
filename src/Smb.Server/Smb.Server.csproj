@@ -6,16 +6,8 @@
     <AssemblyName>Smb.Server</AssemblyName>
     <SignAssembly>False</SignAssembly>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Title>SMB-Server</Title>
-    <Version>$(VersionPrefix)</Version>
-    <Authors>kaimoSystem</Authors>
-    <Company>$(Authors), KaimoSystemSolutions</Company>
-    <Description>This is a library explicitly designed for implemting your own SMB-Server. What </Description>
-    <PackageProjectUrl>https://github.com/KaimoSystemSolutions/SMB-Server/</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/KaimoSystemSolutions/SMB-Server/</RepositoryUrl>
-    <RepositoryType>git</RepositoryType>
-    <PackageTags>smb; smbserver</PackageTags>
-    <PackageReleaseNotes>Intial Release</PackageReleaseNotes>
+    <Title>Smb.Server</Title>
+    <Description>Zustandsmodell und Command-Dispatcher einer modularen SMB-2/3-Server-Bibliothek: Connection/Session/TreeConnect/Open, Sequenz-, Credit- und Negotiate-Logik. Kern zum Bau eines eigenen SMB-Servers.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />
