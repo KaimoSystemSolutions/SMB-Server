@@ -243,6 +243,31 @@ public class LeaseModelTests
         Assert.Equal(key, g.Breaks[0].Key);
     }
 
+    // --- NullLeaseManager (leasing disabled) ---
+
+    [Fact]
+    public void NullLeaseManager_NeverGrantsALease_AndReportsNoBreaks()
+    {
+        var mgr = new NullLeaseManager();
+        SmbOpen open = OpenFor("nolease");
+        LeaseKey key = LeaseKey.From(Fill(0x55, 16));
+
+        LeaseGrant grant = mgr.RequestLease(open, LeaseReq(key, LeaseState.ReadWriteHandle));
+
+        Assert.Equal(LeaseState.None, grant.GrantedState);
+        Assert.Empty(grant.Breaks);
+    }
+
+    [Fact]
+    public void NullLeaseManager_AcknowledgeReturnsNone_AndReleaseIsNoOp()
+    {
+        var mgr = new NullLeaseManager();
+        LeaseKey key = LeaseKey.From(Fill(0x55, 16));
+
+        Assert.Equal(LeaseState.None, mgr.Acknowledge(key, LeaseState.Read));
+        mgr.ReleaseOwner(OpenFor("nolease"));   // must not throw
+    }
+
     // --- helpers ---
 
     private static LeaseRequest LeaseReq(LeaseKey key, LeaseState state, bool v2 = false, ushort epoch = 0) => new()
