@@ -1,11 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <!-- Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD (AES-CCM/GCM),
-       SP800-108 KDF, SHA-512 Preauth-Hash. Krypto ausschließlich über die .NET-BCL
-       (System.Security.Cryptography) — keine Eigenbau-Primitive (Context §20). -->
+       SP800-108 KDF, SHA-512 preauth hash. Crypto exclusively via the .NET BCL
+       (System.Security.Cryptography) — no custom primitives (Context §20). -->
   <PropertyGroup>
     <RootNamespace>Smb.Crypto</RootNamespace>
     <AssemblyName>Smb.Crypto</AssemblyName>
-    <Description>SMB-2/3-Kryptografie: Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD (AES-CCM/GCM), SP800-108-KDF und SHA-512-Preauth-Hash – ausschließlich über die .NET-BCL. Teil der Smb.*-Server-Bibliothek.</Description>
+    <Description>SMB 2/3 cryptography: signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD (AES-CCM/GCM), SP800-108 KDF and SHA-512 preauth hash — using only the .NET BCL. Part of the Smb.* server library.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />

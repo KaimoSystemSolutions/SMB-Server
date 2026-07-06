@@ -36,12 +36,10 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
         Directory.CreateDirectory(_versionRoot);
     }
 
-    public FileStoreResult<IFileHandle> Create(
+    public async ValueTask<FileStoreResult<FileCreateResult>> CreateAsync(
         string path, FileAccessIntent access, CreateDispositionIntent disposition,
-        bool directoryRequired, bool nonDirectoryRequired, out CreateOutcome createAction)
+        bool directoryRequired, bool nonDirectoryRequired, CancellationToken cancellationToken = default)
     {
-        createAction = CreateOutcome.Opened;
-
         // (1) @GMT snapshot access → serve read-only from the external version store.
         //     The lib's token parser (GmtToken) can be reused but doesn't have to be.
         if (GmtToken.TrySplitSnapshotPath(path, out DateTime snapAt, out string realPath))
@@ -50,55 +48,64 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
                 || disposition is CreateDispositionIntent.Create or CreateDispositionIntent.Overwrite
                     or CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
             if (wantsWrite)
-                return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); // snapshots are read-only.
+                return FileStoreResult<FileCreateResult>.Fail(NtStatus.AccessDenied); // snapshots are read-only.
 
             if (!TryResolveSnapshot(realPath, snapAt, out byte[] bytes, out FileEntryInfo info))
-                return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
+                return FileStoreResult<FileCreateResult>.Fail(NtStatus.ObjectNameNotFound);
 
-            return FileStoreResult<IFileHandle>.Ok(new ReadOnlyBlobHandle(realPath, bytes, info));
+            return FileStoreResult<FileCreateResult>.Ok(
+                new FileCreateResult(new ReadOnlyBlobHandle(realPath, bytes, info), CreateOutcome.Opened));
         }
 
         // (2) Before each overwrite, save the current version, then delegate to the backend.
         if (disposition is CreateDispositionIntent.Overwrite or CreateDispositionIntent.OverwriteIf
             or CreateDispositionIntent.Supersede)
-            CaptureVersion(path);
+            await CaptureVersionAsync(path, cancellationToken);
 
-        return _inner.Create(path, access, disposition, directoryRequired, nonDirectoryRequired, out createAction);
+        return await _inner.CreateAsync(path, access, disposition, directoryRequired, nonDirectoryRequired, cancellationToken);
     }
 
-    public FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer)
-        => handle is ReadOnlyBlobHandle b ? b.Read(offset, buffer) : _inner.Read(handle, offset, buffer);
+    public ValueTask<FileStoreResult<int>> ReadAsync(
+        IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
+        => handle is ReadOnlyBlobHandle b
+            ? new(b.Read(offset, buffer.Span))
+            : _inner.ReadAsync(handle, offset, buffer, cancellationToken);
 
-    public FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data)
+    public ValueTask<FileStoreResult<int>> WriteAsync(
+        IFileHandle handle, long offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         => handle is ReadOnlyBlobHandle
-            ? FileStoreResult<int>.Fail(NtStatus.AccessDenied)
-            : _inner.Write(handle, offset, data);
+            ? new(FileStoreResult<int>.Fail(NtStatus.AccessDenied))
+            : _inner.WriteAsync(handle, offset, data, cancellationToken);
 
-    public FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern)
+    public ValueTask<FileStoreResult<IReadOnlyList<FileEntryInfo>>> QueryDirectoryAsync(
+        IFileHandle handle, string searchPattern, CancellationToken cancellationToken = default)
         => handle is ReadOnlyBlobHandle
-            ? FileStoreResult<IReadOnlyList<FileEntryInfo>>.Fail(NtStatus.InvalidParameter)
-            : _inner.QueryDirectory(handle, searchPattern);
+            ? new(FileStoreResult<IReadOnlyList<FileEntryInfo>>.Fail(NtStatus.InvalidParameter))
+            : _inner.QueryDirectoryAsync(handle, searchPattern, cancellationToken);
 
-    public NtStatus SetEndOfFile(IFileHandle handle, long length)
-        => handle is ReadOnlyBlobHandle ? NtStatus.AccessDenied : _inner.SetEndOfFile(handle, length);
+    public ValueTask<NtStatus> SetEndOfFileAsync(
+        IFileHandle handle, long length, CancellationToken cancellationToken = default)
+        => handle is ReadOnlyBlobHandle ? new(NtStatus.AccessDenied) : _inner.SetEndOfFileAsync(handle, length, cancellationToken);
 
-    public NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists)
-        => handle is ReadOnlyBlobHandle ? NtStatus.AccessDenied : _inner.Rename(handle, newPath, replaceIfExists);
+    public ValueTask<NtStatus> RenameAsync(
+        IFileHandle handle, string newPath, bool replaceIfExists, CancellationToken cancellationToken = default)
+        => handle is ReadOnlyBlobHandle ? new(NtStatus.AccessDenied) : _inner.RenameAsync(handle, newPath, replaceIfExists, cancellationToken);
 
-    public NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
+    public async ValueTask<NtStatus> SetDeleteOnCloseAsync(
+        IFileHandle handle, bool delete, CancellationToken cancellationToken = default)
     {
         if (handle is ReadOnlyBlobHandle)
             return delete ? NtStatus.AccessDenied : NtStatus.Success;
 
         // Also capture the last version before deletion (analogous to overwriting).
         if (delete && !handle.IsDirectory && !string.IsNullOrEmpty(handle.Path))
-            CaptureVersion(handle.Path);
+            await CaptureVersionAsync(handle.Path, cancellationToken);
 
-        return _inner.SetDeleteOnClose(handle, delete);
+        return await _inner.SetDeleteOnCloseAsync(handle, delete, cancellationToken);
     }
 
-    public NtStatus Flush(IFileHandle handle)
-        => handle is ReadOnlyBlobHandle ? NtStatus.Success : _inner.Flush(handle);
+    public ValueTask<NtStatus> FlushAsync(IFileHandle handle, CancellationToken cancellationToken = default)
+        => handle is ReadOnlyBlobHandle ? new(NtStatus.Success) : _inner.FlushAsync(handle, cancellationToken);
 
     // ── ISnapshotStore: feeds FSCTL_SRV_ENUMERATE_SNAPSHOTS from YOUR system ──
 
@@ -121,15 +128,16 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
 
     // ── Internal: persistent version store (one .blob file per version) ──
 
-    private void CaptureVersion(string path)
+    private async ValueTask CaptureVersionAsync(string path, CancellationToken cancellationToken)
     {
-        if (!TryReadAll(path, out byte[] content))
+        (bool ok, byte[] content) = await TryReadAllAsync(path, cancellationToken);
+        if (!ok)
             return; // file does not yet exist → nothing to save.
 
         string dir = VersionDir(path);
         Directory.CreateDirectory(dir);
         string blob = System.IO.Path.Combine(dir, DateTime.UtcNow.Ticks + ".blob");
-        File.WriteAllBytes(blob, content);
+        await File.WriteAllBytesAsync(blob, content, cancellationToken);
         _log?.Invoke($"Version of '{path}' saved ({content.Length} bytes) → {System.IO.Path.GetFileName(blob)}");
     }
 
@@ -176,38 +184,37 @@ public sealed class DemoExternalVersionStore : IFileStore, ISnapshotStore
         return true;
     }
 
-    private bool TryReadAll(string path, out byte[] content)
+    private async ValueTask<(bool Ok, byte[] Content)> TryReadAllAsync(string path, CancellationToken cancellationToken)
     {
-        content = [];
-        FileStoreResult<IFileHandle> opened = _inner.Create(
+        FileStoreResult<FileCreateResult> opened = await _inner.CreateAsync(
             path, FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true, cancellationToken);
         if (!opened.IsSuccess)
-            return false;
+            return (false, []);
 
-        IFileHandle handle = opened.Value!;
+        IFileHandle handle = opened.Value.Handle;
         try
         {
             if (handle.IsDirectory)
-                return false;
+                return (false, []);
 
-            long size = handle.GetInfo().EndOfFile;
+            long size = (await handle.GetInfoAsync(cancellationToken)).EndOfFile;
             var buffer = new byte[size];
             int total = 0;
             while (total < size)
             {
-                FileStoreResult<int> read = _inner.Read(handle, total, buffer.AsSpan(total));
+                FileStoreResult<int> read = await _inner.ReadAsync(handle, total, buffer.AsMemory(total), cancellationToken);
                 if (!read.IsSuccess || read.Value == 0)
                     break;
                 total += read.Value;
             }
 
-            content = total == size ? buffer : buffer[..total];
-            return true;
+            byte[] content = total == size ? buffer : buffer[..total];
+            return (true, content);
         }
         finally
         {
-            handle.Dispose();
+            await handle.DisposeAsync();
         }
     }
 

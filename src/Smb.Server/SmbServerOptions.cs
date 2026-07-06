@@ -76,6 +76,15 @@ public sealed class SmbServerOptions
     /// </summary>
     public int MaxOutstandingRequests { get; set; } = 512;
 
+    /// <summary>
+    /// Maximum concurrently processed READ/WRITE frames per connection (docs/ASYNC_IO_ROADMAP.md, A4).
+    /// SMB2 clients pipeline multiple file I/Os via credits; from 2 onwards their backend accesses overlap —
+    /// responses may go out-of-order (allowed; matched via MessageId, §3.3.4.1).
+    /// All other commands act as a barrier (pending I/Os are drained first) and remain
+    /// strictly sequential. <c>1</c> = legacy fully sequential behavior.
+    /// </summary>
+    public int MaxConcurrentFileOpsPerConnection { get; set; } = 8;
+
     /// <summary>SPNEGO negotiator (auth). Required — e.g. NTLM-based or (test) <see cref="DevSpnegoNegotiator"/>.</summary>
     public ISpnegoNegotiator? SpnegoNegotiator { get; set; }
 
@@ -119,7 +128,7 @@ public sealed class SmbServerOptions
     /// </summary>
     public IShareModeManager ShareModeManager { get; set; } = new InMemoryShareModeManager();
 
-    /// <summary>Validiert die Konfiguration und wirft bei Fehlkonfiguration.</summary>
+    /// <summary>Validates the configuration and throws on misconfiguration.</summary>
     public void Validate()
     {
         if (ServerGuid is not { Length: 16 })

@@ -14,6 +14,7 @@ public interface IRpcEndpoint
 public sealed class RpcPipe
 {
     private readonly IRpcEndpoint _endpoint;
+    private readonly object _gate = new();
     private byte[] _output = [];
 
     public RpcPipe(IRpcEndpoint endpoint) => _endpoint = endpoint;
@@ -21,15 +22,21 @@ public sealed class RpcPipe
     /// <summary>Processes an incoming PDU and returns the response PDU (also buffered for READ).</summary>
     public byte[] Transceive(ReadOnlySpan<byte> requestPdu)
     {
-        _output = _endpoint.HandlePdu(requestPdu);
-        return _output;
+        // Locked because READ/WRITE frames (including on pipe opens) may be processed concurrently
+        // (docs/ASYNC_IO_ROADMAP.md, A4). The endpoint itself is stateless per PDU.
+        byte[] output = _endpoint.HandlePdu(requestPdu);
+        lock (_gate) _output = output;
+        return output;
     }
 
     /// <summary>Returns the last buffered response (for the WRITE→READ pattern) and clears the buffer.</summary>
     public byte[] TakeOutput()
     {
-        byte[] o = _output;
-        _output = [];
-        return o;
+        lock (_gate)
+        {
+            byte[] o = _output;
+            _output = [];
+            return o;
+        }
     }
 }

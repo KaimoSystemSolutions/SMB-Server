@@ -1,3 +1,4 @@
+using Microsoft.Win32.SafeHandles;
 using Smb.Protocol.Enums;
 
 namespace Smb.FileSystem.Local;
@@ -6,8 +7,9 @@ namespace Smb.FileSystem.Local;
 /// <see cref="IFileStore"/> backed by a local directory. Paths are share-relative
 /// (backslash-separated, no leading backslash) and are protected against escaping from the
 /// root directory (no <c>..</c> escape, Context §13.4). Read/Write/List/Stat.
+/// Synchronously attached via <see cref="SyncFileStore"/>.
 /// </summary>
-public sealed class LocalFileStore : IFileStore
+public sealed class LocalFileStore : SyncFileStore
 {
     private readonly string _root;
     private readonly string _realRoot;
@@ -24,7 +26,7 @@ public sealed class LocalFileStore : IFileStore
         _readOnly = readOnly;
     }
 
-    public FileStoreResult<IFileHandle> Create(
+    protected override FileStoreResult<IFileHandle> Create(
         string path, FileAccessIntent access, CreateDispositionIntent disposition,
         bool directoryRequired, bool nonDirectoryRequired, out CreateOutcome createAction)
     {
@@ -136,14 +138,37 @@ public sealed class LocalFileStore : IFileStore
 
     private static bool IsSharingViolation(IOException ex) => (ex.HResult & 0xFFFF) == 32; // ERROR_SHARING_VIOLATION
 
-    public FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer)
+    protected override FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer)
     {
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
         return h.ReadAt(offset, buffer); // EOF → Ok(0) (handler maps to STATUS_END_OF_FILE)
     }
 
-    public FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data)
+    /// <summary>
+    /// True async file I/O (overlapped I/O via <see cref="FileOptions.Asynchronous"/> +
+    /// <see cref="RandomAccess"/>) instead of the sync fallback from the base class — READ does not
+    /// block a thread-pool thread (docs/ASYNC_IO_ROADMAP.md, A5). Semantics identical to
+    /// synchronous <see cref="Read"/> (EOF → 0 bytes; IOException → InvalidParameter).
+    /// </summary>
+    public override async ValueTask<FileStoreResult<int>> ReadAsync(
+        IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        var h = (LocalFileHandle)handle;
+        if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
+        try
+        {
+            using SafeFileHandle file = File.OpenHandle(
+                h.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.Asynchronous);
+            if (offset >= RandomAccess.GetLength(file))
+                return FileStoreResult<int>.Ok(0); // EOF (handler maps to STATUS_END_OF_FILE)
+            int read = await RandomAccess.ReadAsync(file, buffer, offset, cancellationToken).ConfigureAwait(false);
+            return FileStoreResult<int>.Ok(read);
+        }
+        catch (IOException) { return FileStoreResult<int>.Fail(NtStatus.InvalidParameter); }
+    }
+
+    protected override FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data)
     {
         if (_readOnly) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
         var h = (LocalFileHandle)handle;
@@ -151,7 +176,24 @@ public sealed class LocalFileStore : IFileStore
         return h.WriteAt(offset, data);
     }
 
-    public FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern)
+    /// <summary>True async write — counterpart to <see cref="ReadAsync"/> (A5). Semantics like <see cref="Write"/>.</summary>
+    public override async ValueTask<FileStoreResult<int>> WriteAsync(
+        IFileHandle handle, long offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        if (_readOnly) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
+        var h = (LocalFileHandle)handle;
+        if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
+        try
+        {
+            using SafeFileHandle file = File.OpenHandle(
+                h.FullPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite, FileOptions.Asynchronous);
+            await RandomAccess.WriteAsync(file, data, offset, cancellationToken).ConfigureAwait(false);
+            return FileStoreResult<int>.Ok(data.Length);
+        }
+        catch (IOException) { return FileStoreResult<int>.Fail(NtStatus.DiskFull); }
+    }
+
+    protected override FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern)
     {
         var h = (LocalFileHandle)handle;
         if (!h.IsDirectory) return FileStoreResult<IReadOnlyList<FileEntryInfo>>.Fail(NtStatus.InvalidParameter);
@@ -178,13 +220,13 @@ public sealed class LocalFileStore : IFileStore
         return FileStoreResult<IReadOnlyList<FileEntryInfo>>.Ok(entries);
     }
 
-    public NtStatus SetEndOfFile(IFileHandle handle, long length)
+    protected override NtStatus SetEndOfFile(IFileHandle handle, long length)
     {
         if (_readOnly) return NtStatus.AccessDenied;
         return ((LocalFileHandle)handle).SetLength(length);
     }
 
-    public NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists)
+    protected override NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists)
     {
         if (_readOnly) return NtStatus.AccessDenied;
         var h = (LocalFileHandle)handle;
@@ -202,14 +244,14 @@ public sealed class LocalFileStore : IFileStore
         catch (IOException) { return NtStatus.AccessDenied; }
     }
 
-    public NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
+    protected override NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
     {
         if (_readOnly && delete) return NtStatus.AccessDenied;
         ((LocalFileHandle)handle).DeleteOnClose = delete;
         return NtStatus.Success;
     }
 
-    public NtStatus Flush(IFileHandle handle) => ((LocalFileHandle)handle).FlushStream();
+    protected override NtStatus Flush(IFileHandle handle) => ((LocalFileHandle)handle).FlushStream();
 
     /// <summary>Resolves a share-relative path to a full path, sandboxed against directory escape.</summary>
     private bool TryResolve(string relative, out string fullPath)

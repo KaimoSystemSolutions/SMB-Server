@@ -16,7 +16,8 @@ namespace Smb.FileSystem.Versioning;
 /// </list>
 /// The history is kept in memory (per store instance) and is limited to <c>maxVersionsPerFile</c>
 /// entries per file. It is suitable for tests/dev; a persistent snapshot provider can replace this
-/// class later.
+/// class later. As a decorator it forwards the async contract 1:1 to the inner store — an async
+/// backend keeps its asynchrony, a sync backend completes synchronously.
 /// </summary>
 public sealed class VersioningFileStore : IFileStore, ISnapshotStore
 {
@@ -33,12 +34,10 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
         _maxVersionsPerFile = Math.Max(1, maxVersionsPerFile);
     }
 
-    public FileStoreResult<IFileHandle> Create(
+    public async ValueTask<FileStoreResult<FileCreateResult>> CreateAsync(
         string path, FileAccessIntent access, CreateDispositionIntent disposition,
-        bool directoryRequired, bool nonDirectoryRequired, out CreateOutcome createAction)
+        bool directoryRequired, bool nonDirectoryRequired, CancellationToken cancellationToken = default)
     {
-        createAction = CreateOutcome.Opened;
-
         // 1) Snapshot access: leading @GMT segment → serve the previous version read-only.
         if (GmtToken.TrySplitSnapshotPath(path, out DateTime snapAt, out string realPath))
         {
@@ -46,56 +45,72 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
                 || disposition is CreateDispositionIntent.Create or CreateDispositionIntent.Overwrite
                     or CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
             if (wantsWrite)
-                return FileStoreResult<IFileHandle>.Fail(NtStatus.AccessDenied); // snapshots are read-only.
+                return FileStoreResult<FileCreateResult>.Fail(NtStatus.AccessDenied); // snapshots are read-only.
 
             if (!TryResolveSnapshot(realPath, snapAt, out byte[] content, out FileEntryInfo info))
-                return FileStoreResult<IFileHandle>.Fail(NtStatus.ObjectNameNotFound);
+                return FileStoreResult<FileCreateResult>.Fail(NtStatus.ObjectNameNotFound);
 
-            return FileStoreResult<IFileHandle>.Ok(new SnapshotFileHandle(realPath, content, info));
+            return FileStoreResult<FileCreateResult>.Ok(
+                new FileCreateResult(new SnapshotFileHandle(realPath, content, info), CreateOutcome.Opened));
         }
 
         // 2) Normal path: capture the current version before an overwrite.
         bool overwrites = disposition is CreateDispositionIntent.Overwrite
             or CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
         if (overwrites)
-            CaptureCurrentVersion(path);
+            await CaptureCurrentVersionAsync(path, cancellationToken).ConfigureAwait(false);
 
-        return _inner.Create(path, access, disposition, directoryRequired, nonDirectoryRequired, out createAction);
+        return await _inner.CreateAsync(
+            path, access, disposition, directoryRequired, nonDirectoryRequired, cancellationToken).ConfigureAwait(false);
     }
 
-    public FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer)
-        => handle is SnapshotFileHandle s ? s.Read(offset, buffer) : _inner.Read(handle, offset, buffer);
+    public ValueTask<FileStoreResult<int>> ReadAsync(
+        IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
+        => handle is SnapshotFileHandle s
+            ? new(s.Read(offset, buffer.Span))
+            : _inner.ReadAsync(handle, offset, buffer, cancellationToken);
 
-    public FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data)
+    public ValueTask<FileStoreResult<int>> WriteAsync(
+        IFileHandle handle, long offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         => handle is SnapshotFileHandle
-            ? FileStoreResult<int>.Fail(NtStatus.AccessDenied)
-            : _inner.Write(handle, offset, data);
+            ? new(FileStoreResult<int>.Fail(NtStatus.AccessDenied))
+            : _inner.WriteAsync(handle, offset, data, cancellationToken);
 
-    public FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern)
+    public ValueTask<FileStoreResult<IReadOnlyList<FileEntryInfo>>> QueryDirectoryAsync(
+        IFileHandle handle, string searchPattern, CancellationToken cancellationToken = default)
         => handle is SnapshotFileHandle
-            ? FileStoreResult<IReadOnlyList<FileEntryInfo>>.Fail(NtStatus.InvalidParameter)
-            : _inner.QueryDirectory(handle, searchPattern);
+            ? new(FileStoreResult<IReadOnlyList<FileEntryInfo>>.Fail(NtStatus.InvalidParameter))
+            : _inner.QueryDirectoryAsync(handle, searchPattern, cancellationToken);
 
-    public NtStatus SetEndOfFile(IFileHandle handle, long length)
-        => handle is SnapshotFileHandle ? NtStatus.AccessDenied : _inner.SetEndOfFile(handle, length);
+    public ValueTask<NtStatus> SetEndOfFileAsync(
+        IFileHandle handle, long length, CancellationToken cancellationToken = default)
+        => handle is SnapshotFileHandle
+            ? new(NtStatus.AccessDenied)
+            : _inner.SetEndOfFileAsync(handle, length, cancellationToken);
 
-    public NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists)
-        => handle is SnapshotFileHandle ? NtStatus.AccessDenied : _inner.Rename(handle, newPath, replaceIfExists);
+    public ValueTask<NtStatus> RenameAsync(
+        IFileHandle handle, string newPath, bool replaceIfExists, CancellationToken cancellationToken = default)
+        => handle is SnapshotFileHandle
+            ? new(NtStatus.AccessDenied)
+            : _inner.RenameAsync(handle, newPath, replaceIfExists, cancellationToken);
 
-    public NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
+    public async ValueTask<NtStatus> SetDeleteOnCloseAsync(
+        IFileHandle handle, bool delete, CancellationToken cancellationToken = default)
     {
         if (handle is SnapshotFileHandle)
             return delete ? NtStatus.AccessDenied : NtStatus.Success;
 
         // Capture the last version before deletion (the file still exists here).
         if (delete && !handle.IsDirectory && !string.IsNullOrEmpty(handle.Path))
-            CaptureCurrentVersion(handle.Path);
+            await CaptureCurrentVersionAsync(handle.Path, cancellationToken).ConfigureAwait(false);
 
-        return _inner.SetDeleteOnClose(handle, delete);
+        return await _inner.SetDeleteOnCloseAsync(handle, delete, cancellationToken).ConfigureAwait(false);
     }
 
-    public NtStatus Flush(IFileHandle handle)
-        => handle is SnapshotFileHandle ? NtStatus.Success : _inner.Flush(handle);
+    public ValueTask<NtStatus> FlushAsync(IFileHandle handle, CancellationToken cancellationToken = default)
+        => handle is SnapshotFileHandle
+            ? new(NtStatus.Success)
+            : _inner.FlushAsync(handle, cancellationToken);
 
     // --- ISnapshotStore ---
 
@@ -118,56 +133,56 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
     // --- Internal ---
 
     /// <summary>Reads the current content of an existing file and stores it as a version.</summary>
-    private void CaptureCurrentVersion(string path)
+    private async ValueTask CaptureCurrentVersionAsync(string path, CancellationToken cancellationToken)
     {
-        if (!TryReadAll(path, out byte[] content, out FileEntryInfo info))
+        (bool ok, byte[] content, FileEntryInfo? info) = await TryReadAllAsync(path, cancellationToken).ConfigureAwait(false);
+        if (!ok)
             return; // file does not exist (yet) or is a directory → nothing to capture.
 
         FileHistory history = _history.GetOrAdd(Normalize(path), _ => new FileHistory());
-        history.Add(new FileVersion(DateTime.UtcNow, content, info), _maxVersionsPerFile);
+        history.Add(new FileVersion(DateTime.UtcNow, content, info!), _maxVersionsPerFile);
     }
 
     /// <summary>Opens the file read-only via the backend and reads it fully into memory.</summary>
-    private bool TryReadAll(string path, out byte[] content, out FileEntryInfo info)
+    private async ValueTask<(bool Ok, byte[] Content, FileEntryInfo? Info)> TryReadAllAsync(
+        string path, CancellationToken cancellationToken)
     {
-        content = [];
-        info = null!;
-
-        FileStoreResult<IFileHandle> opened = _inner.Create(
+        FileStoreResult<FileCreateResult> opened = await _inner.CreateAsync(
             path, FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true, cancellationToken).ConfigureAwait(false);
         if (!opened.IsSuccess)
-            return false;
+            return (false, [], null);
 
-        IFileHandle handle = opened.Value!;
+        IFileHandle handle = opened.Value.Handle;
         try
         {
             if (handle.IsDirectory)
-                return false;
+                return (false, [], null);
 
-            info = handle.GetInfo();
+            FileEntryInfo info = await handle.GetInfoAsync(cancellationToken).ConfigureAwait(false);
             long size = info.EndOfFile;
             if (size < 0 || size > MaxCaptureBytes)
-                return false;
+                return (false, [], null);
 
             var buffer = new byte[size];
             int total = 0;
             while (total < size)
             {
-                FileStoreResult<int> read = _inner.Read(handle, total, buffer.AsSpan(total));
+                FileStoreResult<int> read = await _inner.ReadAsync(
+                    handle, total, buffer.AsMemory(total), cancellationToken).ConfigureAwait(false);
                 if (!read.IsSuccess)
-                    return false;
+                    return (false, [], null);
                 if (read.Value == 0)
                     break;
                 total += read.Value;
             }
 
-            content = total == size ? buffer : buffer[..total];
-            return true;
+            byte[] content = total == size ? buffer : buffer[..total];
+            return (true, content, info);
         }
         finally
         {
-            handle.Dispose();
+            await handle.DisposeAsync().ConfigureAwait(false);
         }
     }
 

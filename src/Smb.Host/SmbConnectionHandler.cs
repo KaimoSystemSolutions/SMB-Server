@@ -16,6 +16,13 @@ namespace Smb.Host;
 /// NBSS-framed) response back. Write operations are serialized via
 /// <see cref="_writeLock"/> — so asynchronously pending operations (e.g. blocking
 /// LOCKs) can send their final response out-of-band without interleaving with read responses.
+/// <para>
+/// Concurrent file I/O (docs/ASYNC_IO_ROADMAP.md, A4): individual READ/WRITE frames are —
+/// capped via <see cref="SmbServerOptions.MaxConcurrentFileOpsPerConnection"/> — processed
+/// concurrently; their responses may go out-of-order via the serialized writer.
+/// Every other frame acts as a barrier: all outstanding I/Os are drained first, then it is
+/// processed sequentially as before (state changes remain ordered).
+/// </para>
 /// </summary>
 internal sealed class SmbConnectionHandler
 {
@@ -24,11 +31,18 @@ internal sealed class SmbConnectionHandler
     private readonly Action<string>? _log;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
+    /// <summary>Cap for concurrent READ/WRITE frames; <c>null</c> = feature off (option ≤ 1).</summary>
+    private readonly SemaphoreSlim? _ioGate;
+    private readonly List<Task> _inflight = [];
+
     public SmbConnectionHandler(SmbServerState server, Action<string>? log)
     {
         _server = server;
         _dispatcher = new Smb2Dispatcher(server, log);
         _log = log;
+
+        int maxOps = server.Options.MaxConcurrentFileOpsPerConnection;
+        _ioGate = maxOps > 1 ? new SemaphoreSlim(maxOps, maxOps) : null;
     }
 
     public async Task RunAsync(TcpClient client, CancellationToken ct)
@@ -57,11 +71,33 @@ internal sealed class SmbConnectionHandler
                 var payload = new byte[length];
                 if (!await TryReadExactAsync(stream, payload, ct)) break;
 
-                // 3. Process (decrypt → dispatch). Empty response = nothing to send (e.g. CANCEL).
-                byte[] response = ProcessFrame(connection, payload);
+                // 3. Decrypt (if transform frame). null = discard (unknown session, auth tag error).
+                (ReadOnlyMemory<byte> Message, bool Encrypted)? decoded = DecryptFrame(connection, payload);
+                if (decoded is null) continue;
+                (ReadOnlyMemory<byte> message, bool transportEncrypted) = decoded.Value;
+
+                // 4. Single READ/WRITE? → execute concurrently (A4); the response goes
+                //    out-of-band via the serialized writer. TryBeginConcurrentFrame
+                //    consumes the sequence window here in the read loop (arrival order!).
+                if (_ioGate is not null
+                    && _dispatcher.TryBeginConcurrentFrame(connection, message, transportEncrypted, out Smb2Dispatcher.PreparedFrame prepared))
+                {
+                    await _ioGate.WaitAsync(ct).ConfigureAwait(false); // cap: waits until a slot is free
+                    lock (_inflight)
+                    {
+                        _inflight.RemoveAll(t => t.IsCompleted);
+                        _inflight.Add(RunConcurrentFrameAsync(stream, connection, prepared, ct));
+                    }
+                    continue;
+                }
+
+                // 5. Barrier: drain all concurrent I/Os, then process sequentially.
+                //    Empty response = nothing to send (e.g. CANCEL).
+                await DrainInflightAsync().ConfigureAwait(false);
+                byte[] response = await _dispatcher.ProcessMessageAsync(connection, message, transportEncrypted).ConfigureAwait(false);
                 if (response.Length == 0) continue;
 
-                // 4. Encrypt (if necessary), NBSS-frame, write back in serialized fashion.
+                // 6. Encrypt (if needed), NBSS-frame, write back in serialized fashion.
                 await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct);
             }
         }
@@ -77,51 +113,94 @@ internal sealed class SmbConnectionHandler
         {
             connection.SendRawAsync = null;
             connection.CancelAllPending();            // cancel pending LOCKs etc.
+            await DrainInflightAsync().ConfigureAwait(false); // drain running I/Os (before writeLock dispose!)
             _dispatcher.OnConnectionClosed(connection); // release opens: handles/locks/oplocks/share-modes (O5)
             _server.Connections.TryRemove(connection.ConnectionId, out _);
             _writeLock.Dispose();
+            _ioGate?.Dispose();
             client.Dispose();
         }
     }
 
-    /// <summary>Decrypts (if transform frame) and dispatches. Returns the raw SMB2 response (empty = nothing to send).</summary>
-    private byte[] ProcessFrame(SmbConnection connection, byte[] payload)
+    /// <summary>
+    /// Executes a prepared READ/WRITE frame and sends the response. Errors stay in the
+    /// task (connection drops are handled by the read loop itself); the I/O slot is always released.
+    /// </summary>
+    private async Task RunConcurrentFrameAsync(NetworkStream stream, SmbConnection connection,
+        Smb2Dispatcher.PreparedFrame frame, CancellationToken ct)
     {
-        ReadOnlySpan<byte> message = payload;
-        bool transportEncrypted = false;
-
-        // Transform frame? → decrypt (Context §11, §19.1 step 1).
-        if (SmbProtocolIds.IsTransform(payload))
+        try
         {
-            TransformHeader th = TransformHeader.Read(payload);
-            if (!_server.SessionGlobalList.TryGetValue(th.SessionId, out SmbSession? session))
-                return []; // unknown session → discard.
+            byte[] response = await _dispatcher.ExecutePreparedFrameAsync(connection, frame).ConfigureAwait(false);
+            if (response.Length != 0)
+                await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or SocketException or ObjectDisposedException)
+        {
+            // Connection drop is normal — the read loop runs into the same error in parallel.
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"[conn {connection.ConnectionId:N}] Error in concurrent frame: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _ioGate!.Release();
+        }
+    }
 
-            try
-            {
-                message = Smb2Transform.Decrypt(connection.CipherId, session.DecryptionKey, payload);
-            }
-            catch
-            {
-                return []; // Auth tag error → discard.
-            }
+    /// <summary>Barrier: drains all concurrent READ/WRITE frames for this connection.</summary>
+    private async Task DrainInflightAsync()
+    {
+        Task[] pending;
+        lock (_inflight)
+        {
+            _inflight.RemoveAll(t => t.IsCompleted);
+            if (_inflight.Count == 0) return;
+            pending = [.. _inflight];
+        }
+        await Task.WhenAll(pending).ConfigureAwait(false); // tasks catch their own errors
+        lock (_inflight) _inflight.RemoveAll(t => t.IsCompleted);
+    }
 
-            transportEncrypted = true;
+    /// <summary>
+    /// Decrypts a frame (if transform header). Returns the SMB2 plaintext message
+    /// plus encrypted flag — or <c>null</c> if the frame should be discarded (unknown
+    /// session, auth tag error).
+    /// </summary>
+    private (ReadOnlyMemory<byte> Message, bool Encrypted)? DecryptFrame(SmbConnection connection, byte[] payload)
+    {
+        // Transform frame? → decrypt (Context §11, §19.1 step 1).
+        if (!SmbProtocolIds.IsTransform(payload))
+            return (payload, false);
 
-            // The client has enabled encryption (e.g. smbprotocol with the default
-            // require_encryption=True). From now on we also encrypt the responses for this session
-            // (§3.3.4.1.4: if the request was encrypted, the response MUST be encrypted too).
-            //
-            // [AUDIT-2026-06] A successfully decrypted message is already authenticated by AEAD
-            // and is not additionally signed (§3.1.4.1). This is now handled PER FRAME
-            // in the dispatcher (VerifyInboundSignature skips encrypted frames).
-            // Previously session.SigningRequired was permanently cleared here — a downgrade as soon as a
-            // later plaintext frame arrived (e.g. RejectUnencryptedAccess=false). No longer.
-            // See docs/SECURITY_AUDIT.md (Finding M2).
-            session.EncryptData = true;
+        TransformHeader th = TransformHeader.Read(payload);
+        if (!_server.SessionGlobalList.TryGetValue(th.SessionId, out SmbSession? session))
+            return null; // unknown session → discard.
+
+        byte[] message;
+        try
+        {
+            message = Smb2Transform.Decrypt(connection.CipherId, session.DecryptionKey, payload);
+        }
+        catch
+        {
+            return null; // auth tag error → discard.
         }
 
-        return _dispatcher.ProcessMessage(connection, message, transportEncrypted);
+        // The client has enabled encryption (e.g. smbprotocol with the default
+        // require_encryption=True). From now on we also encrypt the responses for this session
+        // (§3.3.4.1.4: if the request was encrypted, the response MUST be encrypted too).
+        //
+        // [AUDIT-2026-06] A successfully decrypted message is already authenticated by AEAD
+        // and is not additionally signed (§3.1.4.1). This is now handled PER FRAME
+        // in the dispatcher (VerifyInboundSignature skips encrypted frames).
+        // Previously session.SigningRequired was permanently cleared here — a downgrade as soon as a
+        // later plaintext frame arrived (e.g. RejectUnencryptedAccess=false). No longer.
+        // See docs/SECURITY_AUDIT.md (Finding M2).
+        session.EncryptData = true;
+
+        return (message, true);
     }
 
     /// <summary>Encrypts the response if needed, frames it as NBSS and writes it in serialized fashion.</summary>

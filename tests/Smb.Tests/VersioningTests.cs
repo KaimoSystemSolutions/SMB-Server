@@ -166,25 +166,25 @@ public class VersioningTests : IDisposable
 
     private static NtStatus Write(IFileStore store, string path, string content)
     {
-        FileStoreResult<IFileHandle> r = store.Create(
+        FileStoreResult<FileCreateResult> r = store.CreateAsync(
             path, FileAccessIntent.ReadWrite, CreateDispositionIntent.OverwriteIf,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true).AsTask().GetAwaiter().GetResult();
         if (!r.IsSuccess) return r.Status;
-        IFileHandle h = r.Value!;
+        IFileHandle h = r.Value.Handle;
         try
         {
-            return store.Write(h, 0, Encoding.UTF8.GetBytes(content)).Status;
+            return store.WriteAsync(h, 0, Encoding.UTF8.GetBytes(content)).AsTask().GetAwaiter().GetResult().Status;
         }
         finally { h.Dispose(); }
     }
 
     private static (NtStatus status, byte[] data) ReadAll(IFileStore store, string path)
     {
-        FileStoreResult<IFileHandle> r = store.Create(
+        FileStoreResult<FileCreateResult> r = store.CreateAsync(
             path, FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true).AsTask().GetAwaiter().GetResult();
         if (!r.IsSuccess) return (r.Status, []);
-        IFileHandle h = r.Value!;
+        IFileHandle h = r.Value.Handle;
         try
         {
             using var ms = new MemoryStream();
@@ -192,7 +192,7 @@ public class VersioningTests : IDisposable
             long off = 0;
             while (true)
             {
-                FileStoreResult<int> rr = store.Read(h, off, buf);
+                FileStoreResult<int> rr = store.ReadAsync(h, off, buf).AsTask().GetAwaiter().GetResult();
                 if (!rr.IsSuccess) return (rr.Status, []);
                 if (rr.Value == 0) break;
                 ms.Write(buf, 0, rr.Value);

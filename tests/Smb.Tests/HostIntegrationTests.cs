@@ -35,7 +35,7 @@ public class HostIntegrationTests
         await stream.WriteAsync(framed);
         await stream.FlushAsync();
 
-        // Antwort lesen.
+        // Read the response.
         var prefix = new byte[4];
         await stream.ReadExactlyAsync(prefix);
         int length = NbssFrame.ReadLength(prefix);

@@ -1,17 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Lauffähiges Beispiel: zeigt Konfiguration, Auth-Provider und Autorisierungs-Hooks. -->
+  <!-- Runnable example: demonstrates configuration, auth providers and authorization hooks. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>Smb.Sample.Server</RootNamespace>
     <AssemblyName>Smb.Sample.Server</AssemblyName>
-    <!-- Beispielcode braucht keine XML-Doku. -->
+    <!-- Sample code does not need XML documentation. -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Smb.Host\Smb.Host.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Server\Smb.Server.csproj" />
+    <ProjectReference Include="..\..\src\Smb.FileSystem\Smb.FileSystem.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Protocol\Smb.Protocol.csproj" />
   </ItemGroup>
 
-  <!-- Den 'shared'-Ordner neben die Binärdatei kopieren, damit der relative Share-Pfad existiert. -->
+  <!-- Copy the 'shared' folder next to the binary so the relative share path exists. -->
   <ItemGroup>
     <Content Include="shared\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

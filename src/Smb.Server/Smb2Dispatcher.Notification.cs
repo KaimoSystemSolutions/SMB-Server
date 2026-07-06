@@ -13,11 +13,11 @@ namespace Smb.Server;
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
-    private ResponseSegment HandleChangeNotify(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleChangeNotify(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         ChangeNotifyMessage.Request req = ChangeNotifyMessage.ParseRequest(segment, Smb2Header.Size);

@@ -1,5 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Transport (TCP-445-Listener), Hosting, Konfiguration (Context §2, §3). -->
+  <!-- Transport (TCP-445 listener), hosting, configuration (Context §2, §3). -->
   <PropertyGroup>
     <RootNamespace>Smb.Host</RootNamespace>
     <AssemblyName>Smb.Host</AssemblyName>
@@ -19,9 +19,9 @@
     <Version>1.0.2</Version>
     <Description>A SMB 2/3 server library</Description>
 
-    <!-- Single-Package-Build: alle referenzierten Smb.*-DLLs in dieses eine Paket
-         einbetten, statt sie als externe NuGet-Dependencies zu verlangen.
-         Siehe Target 'IncludeReferencedProjectsInPackage' unten. -->
+    <!-- Single-package build: embed all referenced Smb.* DLLs into this one package
+         instead of requiring them as external NuGet dependencies.
+         See target 'IncludeReferencedProjectsInPackage' below. -->
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeReferencedProjectsInPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
   <ItemGroup>
@@ -35,14 +35,14 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <!-- PrivateAssets="all": NICHT als Paket-Dependency in die Nuspec schreiben –
-         die DLL wird stattdessen unten direkt ins Paket kopiert. -->
+    <!-- PrivateAssets="all": do NOT write as a package dependency into the nuspec —
+         the DLL is instead copied directly into the package below. -->
     <ProjectReference Include="..\Smb.Server\Smb.Server.csproj" PrivateAssets="all" />
   </ItemGroup>
 
-  <!-- Sammelt die DLLs aller (auch transitiver) ProjectReferences und legt sie
-       mit ins lib/-Verzeichnis des Pakets. So enthält SMB-Server.nupkg
-       Smb.Host + Smb.Server + Smb.Protocol/Crypto/Auth/FileSystem in einer Datei. -->
+  <!-- Collects the DLLs of all (including transitive) ProjectReferences and places them
+       into the lib/ directory of the package. This way SMB-Server.nupkg contains
+       Smb.Host + Smb.Server + Smb.Protocol/Crypto/Auth/FileSystem in a single file. -->
   <Target Name="IncludeReferencedProjectsInPackage" DependsOnTargets="ResolveReferences">
     <ItemGroup>
       <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths->WithMetadataValue('ReferenceSourceTarget','ProjectReference'))" />

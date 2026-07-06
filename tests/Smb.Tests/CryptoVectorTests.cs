@@ -3,7 +3,7 @@ using Xunit;
 
 namespace Smb.Tests;
 
-/// <summary>Bekannte-Antwort-Tests (KAT) gegen offizielle RFC-Vektoren (Context §22).</summary>
+/// <summary>Known-answer tests (KAT) against official RFC vectors (Context §22).</summary>
 public class CryptoVectorTests
 {
     private static byte[] Hex(string hex)
@@ -61,7 +61,7 @@ public class CryptoVectorTests
     public void NtHash_OfEmptyPassword_IsWellKnownValue()
         => Assert.Equal(Hex("31d6cfe0d16ae931b73c59d7e0c089c0"), NtlmCryptography.NtHash(""));
 
-    // --- NTOWFv2: MS-NLMP §4.2.2 Beispiel (User/Domain/Password). ---
+    // --- NTOWFv2: MS-NLMP §4.2.2 example (User/Domain/Password). ---
 
     [Fact]
     public void NtowfV2_MsNlmpExample()

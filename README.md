@@ -9,10 +9,10 @@ The library was created based on the official Microsoft Specifications (MS-ERREF
 
 ## What it does
 
-- 📁 **File shares** with full NTFS semantics (read, write, rename, delete, locking).
-- 🔐 **Secure by default** - signing required, optional per-share encryption, guest/anonymous rejected.
-- 🔑 **Real login** via NTLMv2; the user source (local, LDAP/AD …) is freely pluggable.
-- 🧩 **Modular** - plug in your own file backend, auth, lock manager or directory watcher.
+- :file_folder: **File shares** with full NTFS semantics (read, write, rename, delete, locking).
+- :closed_lock_with_key: **Secure by default** - signing required, optional per-share encryption, guest/anonymous rejected.
+- :key: **Real login** via NTLMv2; the user source (local, LDAP/AD …) is freely pluggable.
+- :jigsaw: **Modular** - plug in your own file backend, auth, lock manager or directory watcher.
 
 ## Installation
 
@@ -37,7 +37,7 @@ Strict *Parse ↔ State ↔ Effect* layering - each layer its own project, no cy
 | **Smb.Protocol** | Pure wire types: NBSS framing, SMB2 header (sync/async), enums, Negotiate/SessionSetup/TreeConnect/Echo, transform header. Span-based, little-endian. No I/O, no state. |
 | **Smb.Crypto** | Signing (HMAC-SHA256 / AES-CMAC / AES-GMAC), AEAD transform (AES-CCM/GCM 128/256), SP800-108 KDF, SMB 3 key derivation, SHA-512 preauth hash, MD4 + NTLMv2 crypto. |
 | **Smb.Auth** | GSS/SPNEGO abstraction: `IGssMechanism`, `ISpnegoNegotiator`, `IIdentityBackend`. SPNEGO token encoding (ASN.1 DER), OIDs, in-memory backend, dev negotiator. |
-| **Smb.FileSystem** | `IShare` / `IFileStore` backend abstraction (NTFS semantics over any backend). |
+| **Smb.FileSystem** | `IShare` / `IFileStore` backend abstraction (NTFS semantics over any backend). Async-first (`ValueTask`/`Memory`); purely synchronous backends attach via `SyncFileStore` (see `docs/ASYNC_IO_ROADMAP.md`). |
 | **Smb.Server** | State model (Connection/Session/TreeConnect/Open), credit logic, negotiate processor, command dispatcher (receive pipeline). |
 | **Smb.Host** | TCP listener (default 445), per-connection read loop, NBSS/transform handling, fluent builder. |
 

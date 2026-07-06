@@ -14,11 +14,11 @@ namespace Smb.Server;
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
-    private ResponseSegment HandleLock(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleLock(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         LockMessage.Request req = LockMessage.ParseRequest(segment, Smb2Header.Size);

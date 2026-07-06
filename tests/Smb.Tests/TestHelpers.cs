@@ -5,10 +5,10 @@ using Smb.Protocol.Wire;
 
 namespace Smb.Tests;
 
-/// <summary>Hilfsfunktionen zum Bauen von Test-Nachrichten (Request-Seite, die die Lib selbst nicht serialisiert).</summary>
+/// <summary>Helper functions for building test messages (request side, which the lib itself does not serialize).</summary>
 internal static class TestHelpers
 {
-    /// <summary>Baut einen 64-Byte-SMB2-SYNC-Request-Header.</summary>
+    /// <summary>Builds a 64-byte SMB2 SYNC request header.</summary>
     public static byte[] BuildHeader(SmbCommand command, ulong messageId, ulong sessionId = 0,
         uint treeId = 0, Smb2HeaderFlags flags = Smb2HeaderFlags.None, ushort creditRequest = 1)
     {
@@ -25,7 +25,7 @@ internal static class TestHelpers
         return header.ToArray();
     }
 
-    /// <summary>Baut einen kompletten NEGOTIATE-Request (Header + Body), optional mit 3.1.1-Contexts.</summary>
+    /// <summary>Builds a complete NEGOTIATE request (header + body), optionally with 3.1.1 contexts.</summary>
     public static byte[] BuildNegotiateRequest(
         IReadOnlyList<SmbDialect> dialects,
         SmbSecurityMode securityMode = SmbSecurityMode.SigningEnabled,
@@ -65,7 +65,7 @@ internal static class TestHelpers
 
         if (contexts.Count > 0)
         {
-            // 8-Byte-Alignment relativ zum Nachrichtenbeginn (Header = 64, also Body-Pos + 64).
+            // 8-byte alignment relative to message start (Header = 64, so Body-Pos + 64).
             PadToAbs8(body);
             int ctxStartAbs = Smb2Header.Size + body.Position;
             body.PatchUInt32(negCtxOffsetPos, (uint)ctxStartAbs);

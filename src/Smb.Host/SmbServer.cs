@@ -12,7 +12,7 @@ namespace Smb.Host;
 /// <code>
 /// await using var server = SmbServerBuilder.Create()
 ///     .WithEndpoint(IPAddress.Any, 445)
-///     .UseDevAuthentication()        // nur Test/Dev; in Produktion echten Negotiator setzen
+///     .UseDevAuthentication()        // test/dev only; use a real negotiator in production
 ///     .AddShare(new Share { Name = "Data", FileStore = myStore })
 ///     .Build();
 /// await server.StartAsync();

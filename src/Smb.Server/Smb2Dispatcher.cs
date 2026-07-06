@@ -30,14 +30,6 @@ public sealed partial class Smb2Dispatcher
 
     private readonly Action<string>? _log;
 
-    /// <summary>
-    /// [AUDIT-2026-06] Did the currently processed frame arrive via a TRANSFORM header (encrypted)?
-    /// Set per <see cref="ProcessMessage"/> call. Since ProcessMessage runs sequentially per connection dispatcher,
-    /// this field is unambiguous within one call. Controls skipping of the
-    /// inbound signature check (AEAD already authenticates, §3.1.4.1).
-    /// </summary>
-    private bool _frameWasEncrypted;
-
     public Smb2Dispatcher(SmbServerState server, Action<string>? logger = null)
     {
         _server = server;
@@ -45,19 +37,26 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
+    /// Synchronous convenience wrapper around <see cref="ProcessMessageAsync"/> — for tests and
+    /// hosts without an async path. With purely synchronous backends (<see cref="SyncFileStore"/>)
+    /// the ValueTask chain completes synchronously anyway.
+    /// </summary>
+    public byte[] ProcessMessage(SmbConnection connection, ReadOnlySpan<byte> message, bool transportEncrypted = false)
+        => ProcessMessageAsync(connection, message.ToArray(), transportEncrypted).AsTask().GetAwaiter().GetResult();
+
+    /// <summary>
     /// Processes an incoming message (one or more SMB2 messages chained via NextCommand).
     /// Returns the assembled response. <paramref name="transportEncrypted"/>
     /// indicates whether the message arrived via a TRANSFORM frame (encrypted) (§11).
     /// </summary>
-    public byte[] ProcessMessage(SmbConnection connection, ReadOnlySpan<byte> message, bool transportEncrypted = false)
+    public async ValueTask<byte[]> ProcessMessageAsync(SmbConnection connection, ReadOnlyMemory<byte> message, bool transportEncrypted = false)
     {
         // SMB1 Multi-Protocol-Negotiate (§6.1): legacy clients (e.g. impacket) first send an
         // SMB1 SMB_COM_NEGOTIATE (ProtocolId FF 53 4D 42). Respond with an SMB2 NEGOTIATE response
         // with DialectRevision 0x02FF (wildcard); the real SMB2 NEGOTIATE follows after.
-        if (SmbProtocolIds.IsSmb1(message) && message.Length > 4 && message[4] == 0x72 /* SMB_COM_NEGOTIATE */)
+        if (SmbProtocolIds.IsSmb1(message.Span) && message.Length > 4 && message.Span[4] == 0x72 /* SMB_COM_NEGOTIATE */)
             return BuildSmb1WildcardNegotiateResponse();
 
-        _frameWasEncrypted = transportEncrypted; // [AUDIT-2026-06] applies to all segments of this frame.
 
         var segments = new List<ResponseSegment>();
         int offset = 0;
@@ -69,12 +68,13 @@ public sealed partial class Smb2Dispatcher
             Smb2Header header;
             try
             {
-                header = Smb2Header.Read(message[offset..]);
+                header = Smb2Header.Read(message.Span[offset..]);
             }
             catch (SmbWireFormatException ex)
             {
                 // Malformed header → generic error response (Context §19.1 step 6).
-                _log?.Invoke($"[parse] invalid header → INVALID_PARAMETER: {ex.Message}; Bytes: {Hex(message[offset..])}");
+                _log?.Invoke($"[parse] invalid header → INVALID_PARAMETER: {ex.Message}; Bytes: {Hex(message.Span[offset..])}");
+
                 segments.Add(BuildError(new Smb2Header { Command = SmbCommand.Negotiate }, NtStatus.InvalidParameter));
                 break;
             }
@@ -83,7 +83,7 @@ public sealed partial class Smb2Dispatcher
             int segmentLength = header.NextCommand != 0
                 ? (int)header.NextCommand
                 : message.Length - offset;
-            ReadOnlySpan<byte> segment = message.Slice(offset, segmentLength);
+            ReadOnlyMemory<byte> segment = message.Slice(offset, segmentLength);
 
             // Related operation inherits SessionId/TreeId from the predecessor (Context §7).
             if (header.Flags.HasFlag(Smb2HeaderFlags.RelatedOperations))
@@ -98,8 +98,9 @@ public sealed partial class Smb2Dispatcher
             }
 
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} tid={header.TreeId} len={segment.Length} charge={header.CreditCharge}");
-            ResponseSegment? response = DispatchOne(connection, header, segment, transportEncrypted);
+            ResponseSegment? response = await DispatchOneAsync(connection, header, segment, transportEncrypted).ConfigureAwait(false);
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");
+
             if (response is { } seg) segments.Add(seg);
 
             if (header.NextCommand == 0) break;
@@ -109,21 +110,31 @@ public sealed partial class Smb2Dispatcher
         return AssembleResponse(segments);
     }
 
-    private ResponseSegment? DispatchOne(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool transportEncrypted)
+    /// <summary>
+    /// Processes a single segment. <paramref name="frameEncrypted"/> is passed as a parameter
+    /// (not an instance field), so frames on the same connection can be processed concurrently
+    /// without corrupting each other's encryption state.
+    /// </summary>
+    private async ValueTask<ResponseSegment?> DispatchOneAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted, bool preValidated = false)
     {
         try
         {
-            // Check encryption requirement before the command is processed at all
-            // (§3.3.5.2.11): if the session globally or the addressed tree requires
-            // encryption and the request arrived unencrypted → reject.
-            if (!transportEncrypted && RequiresEncryptedTransport(connection, header))
-                return BuildError(header, NtStatus.AccessDenied);
+            // preValidated: TryBeginConcurrentFrame already checked encryption requirement and
+            // sequence window in the read loop (A4) — do not double-consume.
+            if (!preValidated)
+            {
+                // Check encryption requirement before the command is processed at all
+                // (§3.3.5.2.11): if the session globally or the addressed tree requires
+                // encryption and the request arrived unencrypted → reject.
+                if (!frameEncrypted && RequiresEncryptedTransport(connection, header))
+                    return BuildError(header, NtStatus.AccessDenied);
 
-            // [AUDIT-2026-06] Validate MessageId against the sequence/credit window (§3.3.5.2.3).
-            // Previously dead code (CreditManager.IsWithinWindow was never called) → replays and
-            // wildly jumping MessageIds were accepted. See docs/SECURITY_AUDIT.md (Finding H2).
-            if (!ValidateSequence(connection, header))
-                return BuildError(header, NtStatus.InvalidParameter);
+                // [AUDIT-2026-06] Validate MessageId against the sequence/credit window (§3.3.5.2.3).
+                // Previously dead code (CreditManager.IsWithinWindow was never called) → replays and
+                // wildly jumping MessageIds were accepted. See docs/SECURITY_AUDIT.md (Finding H2).
+                if (!ValidateSequence(connection, header))
+                    return BuildError(header, NtStatus.InvalidParameter);
+            }
 
             // Make the authenticated caller available to a per-user IFileStore backend (ambient,
             // valid for this command only; reset in the finally below).
@@ -131,31 +142,31 @@ public sealed partial class Smb2Dispatcher
 
             return header.Command switch
             {
-                SmbCommand.Negotiate => HandleNegotiate(connection, header, segment),
-                SmbCommand.SessionSetup => HandleSessionSetup(connection, header, segment),
-                SmbCommand.TreeConnect => HandleTreeConnect(connection, header, segment),
-                SmbCommand.TreeDisconnect => HandleTreeDisconnect(connection, header, segment),
-                SmbCommand.Logoff => HandleLogoff(connection, header, segment),
-                SmbCommand.Echo => HandleEcho(connection, header, segment),
-                SmbCommand.Create => HandleCreate(connection, header, segment),
-                SmbCommand.Close => HandleClose(connection, header, segment),
-                SmbCommand.Read => HandleRead(connection, header, segment),
-                SmbCommand.Write => HandleWrite(connection, header, segment),
-                SmbCommand.QueryDirectory => HandleQueryDirectory(connection, header, segment),
-                SmbCommand.QueryInfo => HandleQueryInfo(connection, header, segment),
-                SmbCommand.SetInfo => HandleSetInfo(connection, header, segment),
-                SmbCommand.Flush => HandleFlush(connection, header, segment),
-                SmbCommand.Ioctl => HandleIoctl(connection, header, segment),
-                SmbCommand.Lock => HandleLock(connection, header, segment),
-                SmbCommand.Cancel => HandleCancel(connection, header, segment),
-                SmbCommand.ChangeNotify => HandleChangeNotify(connection, header, segment),
-                SmbCommand.OplockBreak => HandleOplockBreak(connection, header, segment),
+                SmbCommand.Negotiate => HandleNegotiate(connection, header, segment.Span),
+                SmbCommand.SessionSetup => HandleSessionSetup(connection, header, segment.Span),
+                SmbCommand.TreeConnect => HandleTreeConnect(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.TreeDisconnect => HandleTreeDisconnect(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.Logoff => HandleLogoff(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.Echo => HandleEcho(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.Create => await HandleCreateAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.Close => await HandleCloseAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.Read => await HandleReadAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.Write => await HandleWriteAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.QueryDirectory => await HandleQueryDirectoryAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.QueryInfo => await HandleQueryInfoAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.SetInfo => await HandleSetInfoAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.Flush => await HandleFlushAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.Ioctl => HandleIoctl(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.Lock => HandleLock(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.Cancel => HandleCancel(connection, header, segment.Span),
+                SmbCommand.ChangeNotify => HandleChangeNotify(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.OplockBreak => HandleOplockBreak(connection, header, segment.Span, frameEncrypted),
                 _ => BuildError(header, NtStatus.NotSupported),
             };
         }
         catch (SmbWireFormatException ex)
         {
-            _log?.Invoke($"[parse] {header.Command} → INVALID_PARAMETER: {ex.Message}; Bytes: {Hex(segment)}");
+            _log?.Invoke($"[parse] {header.Command} → INVALID_PARAMETER: {ex.Message}; Bytes: {Hex(segment.Span)}");
             return BuildError(header, NtStatus.InvalidParameter);
         }
         catch (Exception ex)
@@ -298,7 +309,7 @@ public sealed partial class Smb2Dispatcher
     private ResponseSegment HandleNegotiate(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
     {
         if (connection.NegotiateDone)
-            return BuildError(header, NtStatus.InvalidParameter); // nur ein NEGOTIATE je Connection.
+            return BuildError(header, NtStatus.InvalidParameter); // only one NEGOTIATE per connection.
 
         NegotiateRequest request = NegotiateRequest.Parse(segment, Smb2Header.Size);
         byte[] securityBuffer = _server.Options.SpnegoNegotiator!.CreateInitialServerToken();
@@ -489,11 +500,11 @@ public sealed partial class Smb2Dispatcher
 
     // --- TREE_CONNECT (Context §12) ---
 
-    private ResponseSegment HandleTreeConnect(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleTreeConnect(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         TreeConnectRequest request = TreeConnectRequest.Parse(segment, Smb2Header.Size);
@@ -548,11 +559,11 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, respHeader, response.ToBody());
     }
 
-    private ResponseSegment HandleTreeDisconnect(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleTreeDisconnect(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         session.TreeConnects.TryRemove(header.TreeId, out _);
@@ -564,14 +575,14 @@ public sealed partial class Smb2Dispatcher
 
     // --- LOGOFF / ECHO ---
 
-    private ResponseSegment HandleLogoff(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleLogoff(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
         // [AUDIT-2026-06] LOGOFF previously — unlike all other session handlers — did NOT verify
         // the signature; an injected LOGOFF could tear down a session that requires signing.
         // See docs/SECURITY_AUDIT.md (Finding M4).
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         CloseSessionOpens(session); // release handles/locks/oplocks/share-modes of this session (O5)
@@ -584,7 +595,7 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, respHeader, LogoffMessage.BuildResponseBody());
     }
 
-    private ResponseSegment HandleEcho(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleEcho(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         EchoMessage.ValidateRequest(segment[Smb2Header.Size..]);
 
@@ -594,7 +605,7 @@ public sealed partial class Smb2Dispatcher
             if (!TryGetValidSession(connection, header.SessionId, out SmbSession s))
                 return BuildError(header, NtStatus.UserSessionDeleted);
             session = s;
-            if (!VerifyInboundSignature(session, header, segment))
+            if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
                 return BuildError(header, NtStatus.AccessDenied);
         }
 
@@ -607,7 +618,7 @@ public sealed partial class Smb2Dispatcher
             : ResponseSegment.Unsigned(respHeader, body);
     }
 
-    // --- Hilfsfunktionen ---
+    // --- Helper functions ---
 
     private bool TryGetValidSession(SmbConnection connection, ulong sessionId, out SmbSession session)
     {
@@ -621,14 +632,14 @@ public sealed partial class Smb2Dispatcher
     /// Verifies the signature of incoming messages when the session requires signing
     /// (Context §10 inbound check). Sessions that do not require signing pass through.
     /// </summary>
-    private bool VerifyInboundSignature(SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment)
+    private static bool VerifyInboundSignature(SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         // [AUDIT-2026-06] Frames received encrypted are already authenticated by AEAD
         // (§3.1.4.1) and carry no signature. Previously the host permanently cleared session.SigningRequired
         // for this (downgrade risk once RejectUnencryptedAccess was off) — now we only skip
         // the check for this one frame without changing the session policy.
         // See docs/SECURITY_AUDIT.md (Finding M2).
-        if (_frameWasEncrypted) return true;
+        if (frameEncrypted) return true;
         if (!session.SigningRequired) return true;
         if (!header.Flags.HasFlag(Smb2HeaderFlags.Signed)) return false;
 

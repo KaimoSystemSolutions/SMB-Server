@@ -74,7 +74,7 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    /// <summary><b>Nur Test/Dev:</b> akzeptiert jede Auth anonym. In Produktion nicht verwenden (Context §8.4).</summary>
+    /// <summary><b>Test/Dev only:</b> accepts any auth anonymously. Do not use in production (Context §8.4).</summary>
     public SmbServerBuilder UseDevAuthentication()
     {
         _options.SpnegoNegotiator = new DevSpnegoNegotiator();

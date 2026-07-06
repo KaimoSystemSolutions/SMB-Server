@@ -13,7 +13,9 @@ namespace Smb.Server;
 /// <summary>
 /// File commands (M4, Context §13–§16): CREATE, CLOSE, READ, WRITE, QUERY_DIRECTORY,
 /// QUERY_INFO via an <see cref="IFileStore"/> backend. Read-only browsing works
-/// fully; writing depends on backend configuration.
+/// fully; writing depends on backend configuration. Handlers are async
+/// (backend I/O does not block a thread); parsing happens before the first <c>await</c>,
+/// since request records carry only scalars/<c>byte[]</c>.
 /// </summary>
 public sealed partial class Smb2Dispatcher
 {
@@ -43,23 +45,23 @@ public sealed partial class Smb2Dispatcher
     private bool TryGetOpen(SmbSession session, ulong persistent, ulong volatileId, out SmbOpen open)
         => session.Opens.TryGetValue((persistent, volatileId), out open!);
 
-    private ResponseSegment HandleCreate(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleCreateAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
         if (!session.TreeConnects.TryGetValue(header.TreeId, out SmbTreeConnect? tree))
             return BuildError(header, NtStatus.NetworkNameDeleted);
 
         // Named-pipe share (IPC$): open a DCERPC pipe instead of using the file backend.
         if (tree.Share.Type == ShareType.Pipe)
-            return HandlePipeCreate(connection, header, session, tree, segment);
+            return HandlePipeCreate(connection, header, session, tree, segment.Span);
 
         if (tree.Share.FileStore is not { } store)
             return BuildError(header, NtStatus.NotSupported);
 
-        CreateRequest request = CreateRequest.Parse(segment, Smb2Header.Size);
+        CreateRequest request = CreateRequest.Parse(segment.Span, Smb2Header.Size);
 
         // [AUDIT-2026-06] Enforce DesiredAccess against the MaximalAccess granted by the
         // authorization policy (§3.3.5.9). Previously DesiredAccess was granted unfiltered →
@@ -98,24 +100,25 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.SharingViolation);
         open.ShareModeKey = shareKey;
 
-        FileStoreResult<IFileHandle> result = store.Create(
-            request.Name, access, disposition, dirRequired, nonDirRequired, out CreateOutcome outcome);
+        FileStoreResult<FileCreateResult> result = await store.CreateAsync(
+            request.Name, access, disposition, dirRequired, nonDirRequired).ConfigureAwait(false);
         if (!result.IsSuccess)
         {
             _server.Options.ShareModeManager.Close(shareKey, open);
             return BuildError(header, result.Status);
         }
 
-        IFileHandle handle = result.Value!;
+        IFileHandle handle = result.Value.Handle;
+        CreateOutcome outcome = result.Value.Action;
         open.LocalOpen = handle;
         if (request.Options.HasFlag(CreateOptions.DeleteOnClose))
         {
             // DELETE_ON_CLOSE may require the Delete permission (enforced by the backend). Honor a
             // denial here instead of silently dropping it: roll the open back and fail the CREATE.
-            NtStatus delStatus = store.SetDeleteOnClose(handle, true);
+            NtStatus delStatus = await store.SetDeleteOnCloseAsync(handle, true).ConfigureAwait(false);
             if (delStatus != NtStatus.Success)
             {
-                handle.Dispose();
+                await handle.DisposeAsync().ConfigureAwait(false);
                 _server.Options.ShareModeManager.Close(shareKey, open);
                 return BuildError(header, delStatus);
             }
@@ -130,7 +133,7 @@ public sealed partial class Smb2Dispatcher
         open.OplockLevel = grant.GrantedLevel;
         DispatchOplockBreaks(grant.Breaks);
 
-        FileEntryInfo info = handle.GetInfo();
+        FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
         var response = new CreateResponse
         {
             OplockLevel = grant.GrantedLevel,
@@ -190,11 +193,11 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), response.ToBody());
     }
 
-    private ResponseSegment HandleIoctl(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleIoctl(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         IoctlMessage.Request req = IoctlMessage.ParseRequest(segment, Smb2Header.Size);
@@ -241,23 +244,26 @@ public sealed partial class Smb2Dispatcher
             IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
     }
 
-    private ResponseSegment HandleClose(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleCloseAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        (ushort flags, ulong persistent, ulong vol) = CloseMessage.ParseRequest(segment, Smb2Header.Size);
+        (ushort flags, ulong persistent, ulong vol) = CloseMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, persistent, vol, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
 
-        FileEntryInfo? info = (flags & CloseMessage.FlagPostQueryAttributes) != 0 ? open.LocalOpen?.GetInfo() : null;
+        FileEntryInfo? info = null;
+        if ((flags & CloseMessage.FlagPostQueryAttributes) != 0 && open.LocalOpen is not null)
+            info = await open.LocalOpen.GetInfoAsync().ConfigureAwait(false);
         session.Opens.TryRemove(open.Key, out _);
         ReleaseLocks(connection, open);
         _server.Options.OplockManager.ReleaseOwner(open);
         if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
-        open.LocalOpen?.Dispose();
+        if (open.LocalOpen is not null)
+            await open.LocalOpen.DisposeAsync().ConfigureAwait(false);
 
         byte[] body = info is null
             ? CloseMessage.BuildResponseBody()
@@ -268,14 +274,14 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), body);
     }
 
-    private ResponseSegment HandleRead(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleReadAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        ReadMessage.Request req = ReadMessage.ParseRequest(segment, Smb2Header.Size);
+        ReadMessage.Request req = ReadMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
 
@@ -290,7 +296,7 @@ public sealed partial class Smb2Dispatcher
         if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, length, forWrite: false))
             return BuildError(header, NtStatus.FileLockConflict);
         var buffer = new byte[length];
-        FileStoreResult<int> result = store.Read(open.LocalOpen, (long)req.Offset, buffer);
+        FileStoreResult<int> result = await store.ReadAsync(open.LocalOpen, (long)req.Offset, buffer).ConfigureAwait(false);
         if (!result.IsSuccess)
             return BuildError(header, result.Status);
         if (result.Value == 0 && length > 0)
@@ -300,14 +306,14 @@ public sealed partial class Smb2Dispatcher
             ReadMessage.BuildResponseBody(buffer.AsSpan(0, result.Value)));
     }
 
-    private ResponseSegment HandleWrite(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleWriteAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        WriteMessage.Request req = WriteMessage.ParseRequest(segment, Smb2Header.Size);
+        WriteMessage.Request req = WriteMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
             return BuildError(header, NtStatus.FileClosed);
 
@@ -324,7 +330,7 @@ public sealed partial class Smb2Dispatcher
         if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, (ulong)req.Data.Length, forWrite: true))
             return BuildError(header, NtStatus.FileLockConflict);
 
-        FileStoreResult<int> result = store.Write(open.LocalOpen, (long)req.Offset, req.Data);
+        FileStoreResult<int> result = await store.WriteAsync(open.LocalOpen, (long)req.Offset, req.Data).ConfigureAwait(false);
         if (!result.IsSuccess)
             return BuildError(header, result.Status);
 
@@ -332,16 +338,16 @@ public sealed partial class Smb2Dispatcher
             WriteMessage.BuildResponseBody((uint)result.Value));
     }
 
-    private ResponseSegment HandleQueryDirectory(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleQueryDirectoryAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
             return BuildError(header, err);
 
-        QueryDirectoryMessage.Request req = QueryDirectoryMessage.ParseRequest(segment, Smb2Header.Size);
+        QueryDirectoryMessage.Request req = QueryDirectoryMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
@@ -356,7 +362,7 @@ public sealed partial class Smb2Dispatcher
         // only; later (continuation) calls page through the snapshot regardless of any pattern sent.
         if (open.DirectoryListing is null)
         {
-            FileStoreResult<IReadOnlyList<FileEntryInfo>> listing = store.QueryDirectory(open.LocalOpen, req.SearchPattern);
+            FileStoreResult<IReadOnlyList<FileEntryInfo>> listing = await store.QueryDirectoryAsync(open.LocalOpen, req.SearchPattern).ConfigureAwait(false);
             if (!listing.IsSuccess)
                 return BuildError(header, listing.Status);
             if (listing.Value!.Count == 0)
@@ -386,18 +392,18 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), QueryDirectoryMessage.BuildResponseBody(buffer));
     }
 
-    private ResponseSegment HandleQueryInfo(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleQueryInfoAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        QueryInfoMessage.Request req = QueryInfoMessage.ParseRequest(segment, Smb2Header.Size);
+        QueryInfoMessage.Request req = QueryInfoMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
-        FsccFileStat stat = ToStat(open.LocalOpen.GetInfo());
+        FsccFileStat stat = ToStat(await open.LocalOpen.GetInfoAsync().ConfigureAwait(false));
 
         byte[]? buffer = req.InfoType switch
         {
@@ -412,16 +418,16 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(buffer));
     }
 
-    private ResponseSegment HandleSetInfo(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleSetInfoAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
             return BuildError(header, err);
 
-        SetInfoMessage.Request req = SetInfoMessage.ParseRequest(segment, Smb2Header.Size);
+        SetInfoMessage.Request req = SetInfoMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
@@ -431,10 +437,11 @@ public sealed partial class Smb2Dispatcher
         NtStatus status = (FileInformationClass)req.FileInfoClass switch
         {
             FileInformationClass.FileEndOfFileInformation =>
-                store.SetEndOfFile(open.LocalOpen, System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(req.Buffer)),
+                await store.SetEndOfFileAsync(open.LocalOpen,
+                    System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(req.Buffer)).ConfigureAwait(false),
             FileInformationClass.FileDispositionInformation =>
-                store.SetDeleteOnClose(open.LocalOpen, req.Buffer.Length > 0 && req.Buffer[0] != 0),
-            FileInformationClass.FileRenameInformation => DoRename(store, open.LocalOpen, req.Buffer),
+                await store.SetDeleteOnCloseAsync(open.LocalOpen, req.Buffer.Length > 0 && req.Buffer[0] != 0).ConfigureAwait(false),
+            FileInformationClass.FileRenameInformation => await DoRenameAsync(store, open.LocalOpen, req.Buffer).ConfigureAwait(false),
             // Times/attributes/allocation are accepted (no hard setting needed for browsing/writing).
             FileInformationClass.FileBasicInformation => NtStatus.Success,
             FileInformationClass.FileAllocationInformation => NtStatus.Success,
@@ -448,25 +455,25 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), SetInfoMessage.BuildResponseBody());
     }
 
-    private static NtStatus DoRename(IFileStore store, IFileHandle handle, byte[] buffer)
+    private static ValueTask<NtStatus> DoRenameAsync(IFileStore store, IFileHandle handle, byte[] buffer)
     {
         (bool replace, string newPath) = SetInfoMessage.ParseRename(buffer);
-        return store.Rename(handle, newPath, replace);
+        return store.RenameAsync(handle, newPath, replace);
     }
 
-    private ResponseSegment HandleFlush(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandleFlushAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         // FLUSH Request (§2.2.17): StructureSize(2)+Reserved1(2)+Reserved2(4)+FileId(16).
-        ulong persistent = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(segment.Slice(Smb2Header.Size + 8, 8));
-        ulong vol = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(segment.Slice(Smb2Header.Size + 16, 8));
+        ulong persistent = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(segment.Span.Slice(Smb2Header.Size + 8, 8));
+        ulong vol = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(segment.Span.Slice(Smb2Header.Size + 16, 8));
         if (TryGetOpen(session, persistent, vol, out SmbOpen open) && open.LocalOpen is not null
             && TryGetFileStore(session, header.TreeId, out IFileStore store, out _))
-            store.Flush(open.LocalOpen);
+            await store.FlushAsync(open.LocalOpen).ConfigureAwait(false);
 
         // FLUSH Response (§2.2.18): StructureSize=4, Reserved(2).
         var body = new byte[4];

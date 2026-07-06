@@ -47,7 +47,7 @@ public class DispatcherEndToEndTests
         Assert.True(header.Flags.HasFlag(Smb2HeaderFlags.ServerToRedir));
         Assert.Equal(SmbDialect.Smb311, conn.Dialect);
 
-        // Body-StructureSize muss 65 sein.
+        // Body StructureSize must be 65.
         Assert.Equal(65, System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(response.AsSpan(64, 2)));
     }
 
@@ -60,7 +60,7 @@ public class DispatcherEndToEndTests
         dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest(
             [SmbDialect.Smb311], ciphers: [SmbCipherId.Aes128Gcm]));
 
-        // 2) SESSION_SETUP (Dev-Negotiator akzeptiert in einem Schritt)
+        // 2) SESSION_SETUP (Dev-Negotiator accepts in a single step)
         byte[] ssResp = dispatcher.ProcessMessage(conn,
             TestHelpers.BuildSessionSetupRequest(1, 0, [0x01, 0x02, 0x03]));
         Smb2Header ssHeader = Smb2Header.Read(ssResp);
@@ -102,7 +102,7 @@ public class DispatcherEndToEndTests
         // DialectRevision (Body-Offset 4) = 0x02FF (Wildcard).
         Assert.Equal((ushort)SmbDialect.Wildcard2FF,
             System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(response.AsSpan(64 + 4, 2)));
-        // Verbindung darf dadurch nicht als "fertig ausgehandelt" gelten.
+        // The connection must not be considered "fully negotiated" as a result.
         Assert.False(conn.NegotiateDone);
     }
 
@@ -125,8 +125,8 @@ public class DispatcherEndToEndTests
         var (dispatcher, _, conn) = NewServer();
         dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
 
-        // Ein unbekannter/reservierter Command-Code (alle definierten SmbCommands sind inzwischen
-        // implementiert) trifft den Default-Arm des Dispatchers → STATUS_NOT_SUPPORTED.
+        // An unknown/reserved command code (all defined SmbCommands are now implemented)
+        // hits the dispatcher's default arm → STATUS_NOT_SUPPORTED.
         byte[] req = TestHelpers.Concat(
             TestHelpers.BuildHeader((SmbCommand)0x00FF, 1, sessionId: 0),
             new byte[4]);
@@ -157,7 +157,7 @@ public class DispatcherEndToEndTests
 
         SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(conn.Dialect, conn.SigningAlgorithmId);
         bool ok = Smb2Signer.Verify(alg, session.SigningKey, ssResp, ssHeader.MessageId, isServer: true, isCancel: false);
-        Assert.True(ok, "Die signierte SESSION_SETUP-Response muss mit dem SigningKey verifizierbar sein.");
+        Assert.True(ok, "The signed SESSION_SETUP response must be verifiable with the SigningKey.");
     }
 
     [Fact]
@@ -176,11 +176,11 @@ public class DispatcherEndToEndTests
         SmbSession session = state.SessionGlobalList[ss.SessionId];
         SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(conn.Dialect, conn.SigningAlgorithmId);
 
-        // Signierter ECHO → akzeptiert.
+        // Signed ECHO → accepted.
         byte[] signedEcho = TestHelpers.BuildEchoRequest(2, ss.SessionId, session.SigningKey, alg);
         Assert.Equal(NtStatus.Success, Smb2Header.Read(dispatcher.ProcessMessage(conn, signedEcho)).Status);
 
-        // Unsignierter ECHO bei Signing-Pflicht → ACCESS_DENIED.
+        // Unsigned ECHO when signing is required → ACCESS_DENIED.
         byte[] unsignedEcho = TestHelpers.BuildEchoRequest(3, ss.SessionId);
         Assert.Equal(NtStatus.AccessDenied, Smb2Header.Read(dispatcher.ProcessMessage(conn, unsignedEcho)).Status);
     }

@@ -1,13 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Zustandsmodell (Connection/Session/TreeConnect/Open), Command-Dispatcher,
-       Sequenz-/Credit-/Negotiate-Logik (Context §7, §19). -->
+  <!-- State model (Connection/Session/TreeConnect/Open), command dispatcher,
+       sequence/credit/negotiate logic (Context §7, §19). -->
   <PropertyGroup>
     <RootNamespace>Smb.Server</RootNamespace>
     <AssemblyName>Smb.Server</AssemblyName>
     <SignAssembly>False</SignAssembly>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <Title>Smb.Server</Title>
-    <Description>Zustandsmodell und Command-Dispatcher einer modularen SMB-2/3-Server-Bibliothek: Connection/Session/TreeConnect/Open, Sequenz-, Credit- und Negotiate-Logik. Kern zum Bau eines eigenen SMB-Servers.</Description>
+    <Description>State model and command dispatcher for a modular SMB 2/3 server library: Connection/Session/TreeConnect/Open, sequence, credit and negotiate logic. Core for building a custom SMB server.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Smb.Protocol\Smb.Protocol.csproj" />

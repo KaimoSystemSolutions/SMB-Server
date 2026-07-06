@@ -32,70 +32,65 @@ public sealed class SymlinkSandboxTests : IDisposable
     }
 
     [Fact]
-    public void Create_ThroughDirectorySymlinkEscapingRoot_IsDenied()
+    public async Task Create_ThroughDirectorySymlinkEscapingRoot_IsDenied()
     {
-        // A directory symlink INSIDE the share pointing OUTSIDE must not grant access to the target.
         string link = Path.Combine(_root, "escape");
         if (!TryCreateSymlink(link, _outside, directory: true))
-            return; // symlink creation not permitted on this host → effectively skipped
+            return;
 
-        var store = new LocalFileStore(_root, readOnly: true);
+        IFileStore store = new LocalFileStore(_root, readOnly: true);
 
-        FileStoreResult<IFileHandle> result = store.Create(
+        FileStoreResult<FileCreateResult> result = await store.CreateAsync(
             "escape\\secret.txt", FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true);
 
         Assert.False(result.IsSuccess);
         Assert.Equal(NtStatus.ObjectNameNotFound, result.Status);
     }
 
     [Fact]
-    public void Create_ThroughFileSymlinkEscapingRoot_IsDenied()
+    public async Task Create_ThroughFileSymlinkEscapingRoot_IsDenied()
     {
-        // A file symlink INSIDE the share pointing to a file OUTSIDE must be denied too.
         string link = Path.Combine(_root, "leak.txt");
         if (!TryCreateSymlink(link, Path.Combine(_outside, "secret.txt"), directory: false))
-            return; // effectively skipped where symlinks are not permitted
+            return;
 
-        var store = new LocalFileStore(_root, readOnly: true);
+        IFileStore store = new LocalFileStore(_root, readOnly: true);
 
-        FileStoreResult<IFileHandle> result = store.Create(
+        FileStoreResult<FileCreateResult> result = await store.CreateAsync(
             "leak.txt", FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true);
 
         Assert.False(result.IsSuccess);
         Assert.Equal(NtStatus.ObjectNameNotFound, result.Status);
     }
 
     [Fact]
-    public void Create_NormalFileWithinRoot_StillWorks()
+    public async Task Create_NormalFileWithinRoot_StillWorks()
     {
-        // Sanity: the hardening must not break legitimate in-root access.
         File.WriteAllText(Path.Combine(_root, "ok.txt"), "hello");
-        var store = new LocalFileStore(_root, readOnly: true);
+        IFileStore store = new LocalFileStore(_root, readOnly: true);
 
-        FileStoreResult<IFileHandle> result = store.Create(
+        FileStoreResult<FileCreateResult> result = await store.CreateAsync(
             "ok.txt", FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true);
 
         Assert.True(result.IsSuccess);
     }
 
     [Fact]
-    public void Create_FileWithinSymlinkedRoot_IsAllowed()
+    public async Task Create_FileWithinSymlinkedRoot_IsAllowed()
     {
-        // The root itself may live under a symlink (e.g. /mnt/tank/... on ZFS). Access to a normal
-        // file under such a root must still work — both sides of the check are resolved consistently.
         string linkedRoot = Path.Combine(_base, "linked-share");
         if (!TryCreateSymlink(linkedRoot, _root, directory: true))
-            return; // effectively skipped where symlinks are not permitted
+            return;
 
         File.WriteAllText(Path.Combine(_root, "inside.txt"), "hi");
-        var store = new LocalFileStore(linkedRoot, readOnly: true);
+        IFileStore store = new LocalFileStore(linkedRoot, readOnly: true);
 
-        FileStoreResult<IFileHandle> result = store.Create(
+        FileStoreResult<FileCreateResult> result = await store.CreateAsync(
             "inside.txt", FileAccessIntent.Read, CreateDispositionIntent.Open,
-            directoryRequired: false, nonDirectoryRequired: true, out _);
+            directoryRequired: false, nonDirectoryRequired: true);
 
         Assert.True(result.IsSuccess);
     }
@@ -110,9 +105,6 @@ public sealed class SymlinkSandboxTests : IDisposable
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
         {
-            // Fall back to a directory junction on Windows (a reparse point that needs no special
-            // privilege), so the sandbox is genuinely exercised on dev machines without Developer
-            // Mode too. ResolveLinkTarget resolves junctions just like symlinks.
             return directory && OperatingSystem.IsWindows() && TryCreateDirectoryJunction(link, target);
         }
     }

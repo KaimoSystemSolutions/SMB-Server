@@ -69,11 +69,11 @@ public sealed partial class Smb2Dispatcher
     /// holder confirms the downgrade. The server downgrades in the manager and responds with an
     /// OPLOCK_BREAK response (§2.2.25.1).
     /// </summary>
-    private ResponseSegment HandleOplockBreak(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
+    private ResponseSegment HandleOplockBreak(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment))
+        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         OplockBreakMessage.Acknowledgment ack;

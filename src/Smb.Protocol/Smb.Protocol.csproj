@@ -1,9 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Reine Wire-Typen: Header, Requests, Responses, Enums, Negotiate-Contexts.
-       KEIN I/O, KEIN State. Span<byte>-basiert, Little-Endian. (Context §2) -->
+  <!-- Pure wire types: Header, Requests, Responses, Enums, Negotiate Contexts.
+       NO I/O, NO state. Span<byte>-based, little-endian. (Context §2) -->
   <PropertyGroup>
     <RootNamespace>Smb.Protocol</RootNamespace>
     <AssemblyName>Smb.Protocol</AssemblyName>
-    <Description>Reine SMB-2/3-Wire-Typen (Header, Requests, Responses, Enums, Negotiate-Contexts) ohne I/O oder State. Span&lt;byte&gt;-basiert, Little-Endian. Basis-Paket der Smb.*-Server-Bibliothek.</Description>
+    <Description>Pure SMB 2/3 wire types (Header, Requests, Responses, Enums, Negotiate Contexts) without I/O or state. Span&lt;byte&gt;-based, little-endian. Base package of the Smb.* server library.</Description>
   </PropertyGroup>
 </Project>

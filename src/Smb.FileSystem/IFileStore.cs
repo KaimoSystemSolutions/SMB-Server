@@ -13,48 +13,77 @@ public interface IFileHandle : IDisposable
     FileEntryInfo GetInfo();
 
     /// <summary>
+    /// Async variant of <see cref="GetInfo"/>. Defaults to the synchronous call — backends whose
+    /// metadata lookup does real I/O (remote/cloud stores) should override this.
+    /// </summary>
+    ValueTask<FileEntryInfo> GetInfoAsync(CancellationToken cancellationToken = default)
+        => new(GetInfo());
+
+    /// <summary>
+    /// Async close. Defaults to <see cref="IDisposable.Dispose"/> — backends whose close path
+    /// does real I/O (e.g. DELETE_ON_CLOSE against a remote store) should override this.
+    /// The server calls this variant; <c>Dispose</c> remains the synchronous fallback.
+    /// </summary>
+    ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
     /// Real path in the underlying file system — for CHANGE_NOTIFY watchers, OS locks, etc. that
     /// need a real path. <c>null</c> if the backend has none (virtual/in-memory).
     /// </summary>
     string? PhysicalPath => null;
 }
 
+/// <summary>Result payload of <see cref="IFileStore.CreateAsync"/>: opened handle + what happened.</summary>
+public readonly record struct FileCreateResult(IFileHandle Handle, CreateOutcome Action);
+
 /// <summary>
 /// NTFS-semantic file backend behind a share (Context §2, §13). Returns NT status codes; a concrete
 /// backend (local FS, virtual, …) maps its semantics onto this. Paths are share-relative,
 /// '\\'-separated, without a leading backslash.
+/// <para>
+/// The contract is async-first (<see cref="ValueTask"/>): backends that are natively asynchronous
+/// (network/cloud storage, databases) implement it directly without sync-over-async; purely
+/// synchronous backends derive from <see cref="SyncFileStore"/> and keep their Span-based code.
+/// </para>
 /// </summary>
 public interface IFileStore
 {
-    /// <summary>Opens/creates per CreateDisposition. <paramref name="createAction"/> reports what happened.</summary>
-    FileStoreResult<IFileHandle> Create(
+    /// <summary>Opens/creates per CreateDisposition. <see cref="FileCreateResult.Action"/> reports what happened.</summary>
+    ValueTask<FileStoreResult<FileCreateResult>> CreateAsync(
         string path,
         FileAccessIntent access,
         CreateDispositionIntent disposition,
         bool directoryRequired,
         bool nonDirectoryRequired,
-        out CreateOutcome createAction);
+        CancellationToken cancellationToken = default);
 
     /// <summary>Reads from an open handle.</summary>
-    FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer);
+    ValueTask<FileStoreResult<int>> ReadAsync(
+        IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken cancellationToken = default);
 
     /// <summary>Writes to an open handle, returns the number of bytes written.</summary>
-    FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data);
+    ValueTask<FileStoreResult<int>> WriteAsync(
+        IFileHandle handle, long offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default);
 
     /// <summary>Lists a directory (optionally with a wildcard search pattern).</summary>
-    FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern);
+    ValueTask<FileStoreResult<IReadOnlyList<FileEntryInfo>>> QueryDirectoryAsync(
+        IFileHandle handle, string searchPattern, CancellationToken cancellationToken = default);
 
     /// <summary>Sets the file size (SET FileEndOfFileInformation).</summary>
-    NtStatus SetEndOfFile(IFileHandle handle, long length);
+    ValueTask<NtStatus> SetEndOfFileAsync(IFileHandle handle, long length, CancellationToken cancellationToken = default);
 
     /// <summary>Renames/moves (SET FileRenameInformation).</summary>
-    NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists);
+    ValueTask<NtStatus> RenameAsync(IFileHandle handle, string newPath, bool replaceIfExists, CancellationToken cancellationToken = default);
 
     /// <summary>Marks for deletion on close (SET FileDispositionInformation / DELETE_ON_CLOSE).</summary>
-    NtStatus SetDeleteOnClose(IFileHandle handle, bool delete);
+    ValueTask<NtStatus> SetDeleteOnCloseAsync(IFileHandle handle, bool delete, CancellationToken cancellationToken = default);
 
     /// <summary>Flushes buffers to the backend.</summary>
-    NtStatus Flush(IFileHandle handle);
+    ValueTask<NtStatus> FlushAsync(IFileHandle handle, CancellationToken cancellationToken = default);
 }
 
 /// <summary>Simplified access intent (derived from CREATE DesiredAccess, Context §13.1).</summary>
