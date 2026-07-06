@@ -3,6 +3,7 @@ using Smb.FileSystem.Versioning;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Messages.Fscc;
+using Smb.Server.Leases;
 using Smb.Server.Oplocks;
 using Smb.Server.Rpc;
 using Smb.Server.Sharing;
@@ -127,16 +128,49 @@ public sealed partial class Smb2Dispatcher
         session.Opens[open.Key] = open;
         Interlocked.Increment(ref tree.OpenCount);
 
-        // Request oplock (Context §15): the manager determines the granted level and delivers
-        // any breaks due to other holders, who are notified out-of-band.
-        OplockGrant grant = _server.Options.OplockManager.RequestOplock(open, request.RequestedOplockLevel);
-        open.OplockLevel = grant.GrantedLevel;
-        DispatchOplockBreaks(grant.Breaks);
+        // Caching delegation (Context §15): a modern client (SMB 2.1+) requests a *lease* via the
+        // "RqLs" CREATE context; older clients request a classic *oplock* via RequestedOplockLevel.
+        // The two are mutually exclusive per open — grant whichever was asked for, mirror it in the
+        // response (and, for a lease, echo the granted state back in a response context).
+        OplockLevel grantedOplock;
+        byte[]? responseContexts = null;
+
+        CreateContext? leaseContext = CreateContextList.Find(request.Contexts, CreateContextNames.Lease);
+        if (leaseContext is not null)
+        {
+            LeaseRequest leaseReq = LeaseRequest.FromContext(leaseContext);
+            open.LeaseKey = leaseReq.Key;
+            open.ParentLeaseKey = leaseReq.ParentKey;
+
+            LeaseGrant leaseGrant = _server.Options.LeaseManager.RequestLease(open, leaseReq);
+            open.LeaseState = leaseGrant.GrantedState;
+            open.LeaseEpoch = leaseGrant.Epoch;
+            DispatchLeaseBreaks(leaseGrant.Breaks);
+
+            grantedOplock = OplockLevel.Lease;
+            responseContexts = CreateContextList.Serialize(new CreateContext[]
+            {
+                new()
+                {
+                    Name = leaseContext.Name,
+                    Data = leaseReq.SerializeResponse(leaseGrant.GrantedState, leaseGrant.Epoch),
+                },
+            });
+        }
+        else
+        {
+            // Request oplock (Context §15): the manager determines the granted level and delivers
+            // any breaks due to other holders, who are notified out-of-band.
+            OplockGrant grant = _server.Options.OplockManager.RequestOplock(open, request.RequestedOplockLevel);
+            grantedOplock = grant.GrantedLevel;
+            DispatchOplockBreaks(grant.Breaks);
+        }
+        open.OplockLevel = grantedOplock;
 
         FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
         var response = new CreateResponse
         {
-            OplockLevel = grant.GrantedLevel,
+            OplockLevel = grantedOplock,
             CreateAction = (CreateAction)(uint)outcome,
             CreationTime = info.CreationTime,
             LastAccessTime = info.LastAccessTime,
@@ -149,7 +183,7 @@ public sealed partial class Smb2Dispatcher
             VolatileFileId = open.VolatileFileId,
         };
 
-        return MaybeSigned(session, RespHeader(header, session), response.ToBody());
+        return MaybeSigned(session, RespHeader(header, session), response.ToBody(responseContexts));
     }
 
     private ResponseSegment HandlePipeCreate(SmbConnection connection, Smb2Header header,
@@ -261,6 +295,7 @@ public sealed partial class Smb2Dispatcher
         session.Opens.TryRemove(open.Key, out _);
         ReleaseLocks(connection, open);
         _server.Options.OplockManager.ReleaseOwner(open);
+        _server.Options.LeaseManager.ReleaseOwner(open);
         if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
         if (open.LocalOpen is not null)
             await open.LocalOpen.DisposeAsync().ConfigureAwait(false);
@@ -536,6 +571,7 @@ public sealed partial class Smb2Dispatcher
         {
             _server.Options.LockManager.ReleaseOwner(open);
             _server.Options.OplockManager.ReleaseOwner(open);
+            _server.Options.LeaseManager.ReleaseOwner(open);
             if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
             open.LocalOpen?.Dispose();
         }

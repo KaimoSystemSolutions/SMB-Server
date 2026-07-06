@@ -165,7 +165,7 @@ internal static class TestHelpers
     public static byte[] BuildCreateRequest(ulong messageId, ulong sessionId, uint treeId, string name,
         uint desiredAccess, uint disposition, uint options, byte[]? signingKey = null,
         SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac, byte requestedOplockLevel = 0,
-        uint shareAccess = 0x00000007)
+        uint shareAccess = 0x00000007, byte[]? createContexts = null)
     {
         byte[] nameBytes = System.Text.Encoding.Unicode.GetBytes(name);
         var body = new GrowableWriter(64 + nameBytes.Length);
@@ -183,15 +183,64 @@ internal static class TestHelpers
         int nameOffPos = body.Position;
         body.WriteUInt16(0);               // NameOffset (patch)
         body.WriteUInt16((ushort)nameBytes.Length);
-        body.WriteUInt32(0);               // CreateContextsOffset
-        body.WriteUInt32(0);               // CreateContextsLength
+        int ctxOffPos = body.Position;
+        body.WriteUInt32(0);               // CreateContextsOffset (patch)
+        body.WriteUInt32(0);               // CreateContextsLength (patch)
         int nameStart = body.Position;
         if (nameBytes.Length > 0) body.WriteBytes(nameBytes);
         else body.WriteByte(0);            // StructureSize "+1"
         body.PatchUInt16(nameOffPos, (ushort)(Smb2Header.Size + nameStart));
 
+        if (createContexts is { Length: > 0 })
+        {
+            PadToAbs8(body);               // contexts are 8-byte aligned (relative to message start)
+            int ctxStart = body.Position;
+            body.WriteBytes(createContexts);
+            body.PatchUInt32(ctxOffPos, (uint)(Smb2Header.Size + ctxStart));
+            body.PatchUInt32(ctxOffPos + 4, (uint)createContexts.Length);
+        }
+
         byte[] header = BuildHeader(SmbCommand.Create, messageId, sessionId, treeId);
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    /// <summary>Builds a single "RqLs" lease-V1 CREATE context blob (32-byte data) as an 8-byte-aligned chain.</summary>
+    public static byte[] BuildLeaseV1Context(byte[] leaseKey16, LeaseState requestedState)
+    {
+        var data = new byte[LeaseRequest.V1Size];
+        var w = new SpanWriter(data);
+        w.WriteBytes(leaseKey16);
+        w.WriteUInt32((uint)requestedState);
+        w.WriteUInt32(0);                  // LeaseFlags
+        w.WriteUInt64(0);                  // LeaseDuration
+        return CreateContextList.Serialize(new[]
+        {
+            new CreateContext { Name = LeaseContextName(), Data = data },
+        });
+    }
+
+    /// <summary>Builds a LEASE_BREAK acknowledgment (client→server, §2.2.24.2, StructureSize 36).</summary>
+    public static byte[] BuildLeaseBreakAck(ulong messageId, ulong sessionId, uint treeId,
+        byte[] leaseKey16, LeaseState state, byte[]? signingKey = null,
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(36);
+        body.WriteUInt16(36);              // StructureSize
+        body.WriteUInt16(0);               // Reserved
+        body.WriteUInt32(0);               // Flags
+        body.WriteBytes(leaseKey16);
+        body.WriteUInt32((uint)state);
+        body.WriteUInt64(0);               // LeaseDuration
+
+        byte[] header = BuildHeader(SmbCommand.OplockBreak, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
+    private static byte[] LeaseContextName()
+    {
+        var b = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(b, CreateContextNames.Lease);
+        return b;
     }
 
     public static byte[] BuildQueryDirectoryRequest(ulong messageId, ulong sessionId, uint treeId,

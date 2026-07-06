@@ -126,16 +126,18 @@ public class OplockTests : IDisposable
     }
 
     [Fact]
-    public void OplockBreakAck_WithLeaseStructureSize_ReturnsNotSupported()
+    public void OplockBreakAck_WithUnknownStructureSize_ReturnsNotSupported()
     {
-        // A lease break acknowledgment (§2.2.24.2, StructureSize 36) is not yet supported.
+        // A break acknowledgment whose StructureSize is neither 24 (oplock) nor 36 (lease) is an
+        // unknown variant → STATUS_NOT_SUPPORTED. (StructureSize 36 is now routed to the lease path,
+        // see LeaseDispatcherTests.)
         var (d, conn, sid, tid) = Setup();
 
-        var body = new byte[36];
-        BinaryPrimitives.WriteUInt16LittleEndian(body, 36); // StructureSize ≠ 24 → lease break
-        byte[] leaseAck = TestHelpers.Concat(TestHelpers.BuildHeader(SmbCommand.OplockBreak, 20, sid, tid), body);
+        var body = new byte[40];
+        BinaryPrimitives.WriteUInt16LittleEndian(body, 40); // neither 24 nor 36
+        byte[] unknownAck = TestHelpers.Concat(TestHelpers.BuildHeader(SmbCommand.OplockBreak, 20, sid, tid), body);
 
-        Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(d.ProcessMessage(conn, leaseAck)).Status);
+        Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(d.ProcessMessage(conn, unknownAck)).Status);
     }
 
     // --- Setup & helpers (analogous to LockDispatcherTests) ---

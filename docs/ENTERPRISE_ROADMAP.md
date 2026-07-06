@@ -42,18 +42,29 @@ performance penalty for every file open. This is the single highest-impact gap.
 > manager and context types exist and are unit-tested, but CREATE does not yet parse
 > the lease context or grant leases on the wire. That wiring is M1.2.
 
-### M1.2 — Lease break pipeline
+### M1.2 — Lease break pipeline ✅ (break-before-grant deferred)
 
-- [ ] Implement lease break notification (§2.2.23.2): build and send
-      `SMB2_LEASE_BREAK_NOTIFICATION` via `connection.SendRawAsync`.
-- [ ] Handle `SMB2_LEASE_BREAK_ACKNOWLEDGMENT` (§2.2.24.2, StructureSize 36) in
-      `Smb2Dispatcher.Oplock.cs` — currently throws `SmbWireFormatException`.
-- [ ] Implement break-before-grant: when a new CREATE conflicts with an existing
-      lease, the server must wait for the holder's acknowledgment before proceeding
-      (timeout → break to None).
-- [ ] Wire lease breaks into `HandleCreateAsync` alongside oplock grants.
-- [ ] Integration tests: two clients, file open triggers lease break, acknowledgment
-      downgrades correctly, timeout falls back to None.
+- [x] Implement lease break notification (§2.2.23.2): build and send
+      `SMB2_LEASE_BREAK_NOTIFICATION` via `connection.SendRawAsync`
+      (`Messages/LeaseBreakMessages.cs`, `Smb2Dispatcher.Lease.cs`).
+- [x] Handle `SMB2_LEASE_BREAK_ACKNOWLEDGMENT` (§2.2.24.2, StructureSize 36) — routed
+      from `HandleOplockBreak` by StructureSize to `HandleLeaseBreakAck`, answered with
+      a `SMB2_LEASE_BREAK` response (§2.2.25.2).
+- [x] Wire lease breaks into `HandleCreateAsync` alongside oplock grants: CREATE parses
+      the "RqLs" context, grants via `ILeaseManager`, echoes the granted state in a
+      response context, and releases the lease at CLOSE / connection teardown.
+- [x] Integration tests: solo grant + echoed context, second distinct key triggers a
+      LEASE_BREAK notification and Read downgrade, acknowledgment answered, CLOSE releases
+      (`tests/Smb.Tests/LeaseDispatcherTests.cs`, 5 tests).
+- [ ] **Deferred:** blocking break-before-grant. The conflicting CREATE does not wait for
+      the holder's acknowledgment (with timeout → break to None); the holder is downgraded
+      immediately in the manager. This is the *same* intentional simplification the classic
+      oplock path already makes (see `InMemoryOplockManager`); implementing the blocking
+      wait + timeout is its own focused pass and touches both managers symmetrically.
+
+> **Note:** M1.2 delivers the complete grant → notify → acknowledge → release pipeline on
+> the wire. What remains (the blocking wait) is a correctness refinement for concurrent
+> conflicting opens, not a gap in the message flow.
 
 ### M1.3 — Directory leases
 
@@ -468,7 +479,7 @@ Phase 11 (Quota)      ──── independent
 |------|-----------|--------|-------|
 | 2026-07-06 | Roadmap created | Complete | Baseline: M1–M5 core + async I/O + security audit done |
 | 2026-07-06 | Phase 1 / M1.1 | Complete | Lease state model, context parse/serialize, InMemoryLeaseManager; 18 tests, full suite 175 green |
-| | Phase 1 / M1.2 | Not started | |
+| 2026-07-06 | Phase 1 / M1.2 | Complete (break-before-grant deferred) | Lease grant on the wire (CREATE parses "RqLs", echoes granted state), LEASE_BREAK notification + acknowledgment + response, release at CLOSE/teardown; 5 dispatcher tests, full suite 180 green. Blocking break-before-grant wait deferred (same simplification as classic oplocks). |
 | | Phase 1 / M1.3 | Not started | |
 | | Phase 2 / M2.1 | Not started | |
 | | Phase 2 / M2.2 | Not started | |

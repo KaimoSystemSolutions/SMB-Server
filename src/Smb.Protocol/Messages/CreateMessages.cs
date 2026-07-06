@@ -18,6 +18,12 @@ public sealed class CreateRequest
     /// <summary>Share-relative name (UTF-16LE, no leading backslash). Empty = share root.</summary>
     public string Name { get; init; } = string.Empty;
 
+    /// <summary>
+    /// The CREATE-context chain (§2.2.13.2): leases, durable-handle requests, maximal-access
+    /// queries, etc. Empty when the request carries no contexts.
+    /// </summary>
+    public IReadOnlyList<CreateContext> Contexts { get; init; } = Array.Empty<CreateContext>();
+
     public static CreateRequest Parse(ReadOnlySpan<byte> message, int bodyOffset)
     {
         var r = new SpanReader(message[bodyOffset..]);
@@ -37,8 +43,8 @@ public sealed class CreateRequest
         var options = (CreateOptions)r.ReadUInt32();
         ushort nameOffset = r.ReadUInt16();
         ushort nameLength = r.ReadUInt16();
-        r.ReadUInt32();                     // CreateContextsOffset
-        r.ReadUInt32();                     // CreateContextsLength
+        int contextsOffset = (int)r.ReadUInt32();   // CreateContextsOffset (from SMB2 header start)
+        int contextsLength = (int)r.ReadUInt32();   // CreateContextsLength
 
         string name = string.Empty;
         if (nameLength > 0)
@@ -47,6 +53,10 @@ public sealed class CreateRequest
                 throw new SmbWireFormatException("CREATE name extends past the message.");
             name = System.Text.Encoding.Unicode.GetString(message.Slice(nameOffset, nameLength));
         }
+
+        // Offsets in the CREATE request are relative to the start of the SMB2 header (= start of
+        // the whole message span here), not to the body — pass the full span to the chain parser.
+        IReadOnlyList<CreateContext> contexts = CreateContextList.Parse(message, contextsOffset, contextsLength);
 
         return new CreateRequest
         {
@@ -57,6 +67,7 @@ public sealed class CreateRequest
             Disposition = disposition,
             Options = options,
             Name = name.TrimStart('\\'),
+            Contexts = contexts,
         };
     }
 }
@@ -78,9 +89,20 @@ public sealed class CreateResponse
     public ulong PersistentFileId { get; init; }
     public ulong VolatileFileId { get; init; }
 
-    public byte[] ToBody()
+    /// <summary>Offset of the fixed 88-byte structure's buffer from the SMB2 header start
+    /// (64-byte header + 88-byte structure). Already 8-byte aligned, so the context chain — when
+    /// present — starts here without extra padding.</summary>
+    private const int ContextsAbsoluteOffset = Smb2Header.Size + 88;
+
+    /// <summary>
+    /// Serializes the CREATE response. When <paramref name="contexts"/> is non-empty (e.g. the
+    /// granted lease echoed back, §2.2.13.2.8), it is appended after the fixed structure and the
+    /// <c>CreateContextsOffset</c>/<c>Length</c> fields are filled in.
+    /// </summary>
+    public byte[] ToBody(byte[]? contexts = null)
     {
-        var body = new byte[88];
+        bool hasContexts = contexts is { Length: > 0 };
+        var body = new byte[hasContexts ? 88 + contexts!.Length : 88];
         var w = new SpanWriter(body);
         w.WriteUInt16(StructureSize);
         w.WriteByte((byte)OplockLevel);
@@ -96,8 +118,9 @@ public sealed class CreateResponse
         w.WriteUInt32(0);                   // Reserved2
         w.WriteUInt64(PersistentFileId);
         w.WriteUInt64(VolatileFileId);
-        w.WriteUInt32(0);                   // CreateContextsOffset
-        w.WriteUInt32(0);                   // CreateContextsLength
+        w.WriteUInt32(hasContexts ? ContextsAbsoluteOffset : 0u);   // CreateContextsOffset
+        w.WriteUInt32(hasContexts ? (uint)contexts!.Length : 0u);   // CreateContextsLength
+        if (hasContexts) w.WriteBytes(contexts!);
         return body;
     }
 }

@@ -13,9 +13,10 @@ namespace Smb.Server;
 /// (out-of-band, MessageId <c>0xFFFFFFFFFFFFFFFF</c>); the holder confirms with an
 /// OPLOCK_BREAK acknowledgment, which is handled here.
 /// <para>
-/// Intentional simplifications in this first stage: the conflicting access does <i>not</i>
-/// wait for the acknowledgment (the holder is immediately downgraded in state); lease breaks
-/// (§2.2.23.2 ff.) and signing of unsolicited notifications are deferred to a later pass.
+/// Intentional simplification in this stage: the conflicting access does <i>not</i> wait for the
+/// acknowledgment (the holder is immediately downgraded in state). The lease equivalent
+/// (§2.2.23.2 ff.) lives in <c>Smb2Dispatcher.Lease.cs</c>; its acknowledgment (StructureSize
+/// 36) is routed from <see cref="HandleOplockBreak"/>.
 /// </para>
 /// </summary>
 public sealed partial class Smb2Dispatcher
@@ -71,6 +72,13 @@ public sealed partial class Smb2Dispatcher
     /// </summary>
     private ResponseSegment HandleOplockBreak(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
+        // Command 0x12 carries both the classic oplock break (StructureSize 24) and the lease break
+        // (§2.2.24.2, StructureSize 36); route by the structure size before parsing.
+        if (segment.Length >= Smb2Header.Size + 2
+            && System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(segment.Slice(Smb2Header.Size, 2))
+               == LeaseBreakMessage.AcknowledgmentStructureSize)
+            return HandleLeaseBreakAck(connection, header, segment, frameEncrypted);
+
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
         if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
@@ -83,7 +91,7 @@ public sealed partial class Smb2Dispatcher
         }
         catch (SmbWireFormatException)
         {
-            // StructureSize ≠ 24 → lease break acknowledgment (§2.2.24.2), not yet supported.
+            // StructureSize neither 24 (oplock) nor 36 (lease) → unknown break variant.
             return BuildError(header, NtStatus.NotSupported);
         }
 
