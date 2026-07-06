@@ -1,5 +1,6 @@
 using Smb.FileSystem;
 using Smb.Protocol.Enums;
+using Smb.Protocol.Messages;
 using Smb.Server.Rpc;
 
 namespace Smb.Server.State;
@@ -29,6 +30,26 @@ public sealed class SmbOpen
     /// the last level granted to this open (for tests/diagnostics).
     /// </summary>
     public OplockLevel OplockLevel { get; set; } = OplockLevel.None;
+
+    /// <summary>
+    /// Lease key of this open (SMB 2.1+, Context §15). Zero (default) when the open holds no lease.
+    /// Opens sharing the same key share one lease in the <c>ILeaseManager</c>; set at CREATE from the
+    /// lease CREATE context.
+    /// </summary>
+    public LeaseKey LeaseKey { get; set; }
+
+    /// <summary>
+    /// Lease caching state currently granted for this open's lease (Context §15). The
+    /// <c>ILeaseManager</c> is authoritative; this value mirrors the last granted state (for
+    /// tests/diagnostics), analogous to <see cref="OplockLevel"/>.
+    /// </summary>
+    public LeaseState LeaseState { get; set; } = LeaseState.None;
+
+    /// <summary>Lease epoch last granted to this open (lease V2; used to order state changes).</summary>
+    public ushort LeaseEpoch { get; set; }
+
+    /// <summary>Parent directory lease key (lease V2 / directory leasing). Zero when unused.</summary>
+    public LeaseKey ParentLeaseKey { get; set; }
 
     /// <summary>
     /// Snapshot of the directory listing taken at the start of a QUERY_DIRECTORY scan (Context §14).

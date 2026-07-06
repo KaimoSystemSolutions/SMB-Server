@@ -1,0 +1,158 @@
+using Smb.Protocol.Enums;
+using Smb.Protocol.Messages;
+using Smb.Server.State;
+
+namespace Smb.Server.Leases;
+
+/// <summary>
+/// Process-local default <see cref="ILeaseManager"/>: manages granted leases in memory, grouped per
+/// file (key = actual backend path of the open, identical to <see cref="Locking.InMemoryLockManager"/>
+/// and <see cref="Oplocks.InMemoryOplockManager"/>). Opens sharing one <see cref="LeaseKey"/> share a
+/// single lease. The granting policy is intentionally conservative and mirrors the oplock manager:
+/// <list type="bullet">
+/// <item>While only <b>one</b> lease key is present on a file, that lease receives the fully
+/// requested state — including Read+Write+Handle.</item>
+/// <item>Once a <b>second, distinct</b> lease key accesses the same file, all write/handle caching
+/// breaks down to Read (shared read caching is preserved); the new lease also receives at most Read.</item>
+/// </list>
+/// The <c>Epoch</c> (lease V2) is incremented on every server-initiated state change. Not yet
+/// modelled (deferred to later passes / Phase 4): waiting for the break acknowledgment before the
+/// conflicting access proceeds, and parent/directory lease relationships.
+/// </summary>
+public sealed class InMemoryLeaseManager : ILeaseManager
+{
+    private readonly object _gate = new();
+
+    /// <summary>fileKey → lease keys currently held on that file.</summary>
+    private readonly Dictionary<string, HashSet<LeaseKey>> _fileKeys = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>leaseKey → holder (global; lease keys are effectively unique per client+file).</summary>
+    private readonly Dictionary<LeaseKey, LeaseHolder> _byKey = new();
+
+    /// <summary>open → lease key it is attached to (for release without touching backend state).</summary>
+    private readonly Dictionary<SmbOpen, LeaseKey> _openIndex = new();
+
+    public LeaseGrant RequestLease(SmbOpen open, LeaseRequest request)
+    {
+        LeaseState requested = request.RequestedState & LeaseState.ReadWriteHandle;
+        LeaseKey key = request.Key;
+        if (key.IsZero) return LeaseGrant.None;   // no lease key → no lease
+
+        string fileKey = FileKey(open);
+        lock (_gate)
+        {
+            HashSet<LeaseKey> keysOnFile = GetOrAddFile(fileKey);
+            bool hasOtherKey = HasOtherKey(keysOnFile, key);
+
+            // A distinct second key joining the file forces write/handle caching of the other
+            // leases down to shared Read caching (§3.3.5.9.8, conservative).
+            var breaks = new List<LeaseBreak>();
+            if (hasOtherKey)
+            {
+                foreach (LeaseKey other in keysOnFile)
+                {
+                    if (other == key) continue;
+                    LeaseHolder h = _byKey[other];
+                    LeaseState shareable = h.State & LeaseState.Read;
+                    if (shareable != h.State)
+                    {
+                        LeaseState from = h.State;
+                        h.State = shareable;
+                        h.Epoch++;
+                        breaks.Add(new LeaseBreak(h.Key, from, shareable, h.Epoch, First(h.Opens)));
+                    }
+                }
+            }
+
+            // Grant for this key: shared file → read caching only; solo → the full request.
+            LeaseState granted = hasOtherKey ? (requested & LeaseState.Read) : requested;
+
+            if (_byKey.TryGetValue(key, out LeaseHolder? holder))
+            {
+                holder.Opens.Add(open);
+                if (granted != holder.State) holder.Epoch++;
+                holder.State = granted;
+            }
+            else
+            {
+                holder = new LeaseHolder(key, fileKey)
+                {
+                    State = granted,
+                    Epoch = request.IsV2 ? request.Epoch : (ushort)0,
+                };
+                holder.Opens.Add(open);
+                _byKey[key] = holder;
+                keysOnFile.Add(key);
+            }
+            _openIndex[open] = key;
+
+            return new LeaseGrant(holder.State, holder.Epoch, breaks);
+        }
+    }
+
+    public LeaseState Acknowledge(LeaseKey key, LeaseState newState)
+    {
+        lock (_gate)
+        {
+            if (!_byKey.TryGetValue(key, out LeaseHolder? holder))
+                return LeaseState.None;
+
+            // An acknowledgment only confirms a downgrade; the epoch was already bumped when the
+            // break was decided, so it is not incremented again here.
+            holder.State = newState & LeaseState.ReadWriteHandle;
+            return holder.State;
+        }
+    }
+
+    public void ReleaseOwner(SmbOpen open)
+    {
+        lock (_gate)
+        {
+            if (!_openIndex.Remove(open, out LeaseKey key)) return;
+            if (!_byKey.TryGetValue(key, out LeaseHolder? holder)) return;
+
+            holder.Opens.Remove(open);
+            if (holder.Opens.Count != 0) return;
+
+            _byKey.Remove(key);
+            if (_fileKeys.TryGetValue(holder.FileKey, out HashSet<LeaseKey>? keys))
+            {
+                keys.Remove(key);
+                if (keys.Count == 0) _fileKeys.Remove(holder.FileKey);
+            }
+        }
+    }
+
+    // --- internal ---
+
+    private HashSet<LeaseKey> GetOrAddFile(string fileKey)
+    {
+        if (!_fileKeys.TryGetValue(fileKey, out HashSet<LeaseKey>? keys))
+            _fileKeys[fileKey] = keys = new HashSet<LeaseKey>();
+        return keys;
+    }
+
+    private static bool HasOtherKey(HashSet<LeaseKey> keys, LeaseKey self)
+    {
+        foreach (LeaseKey k in keys)
+            if (k != self) return true;
+        return false;
+    }
+
+    private static SmbOpen First(HashSet<SmbOpen> opens)
+    {
+        foreach (SmbOpen o in opens) return o;
+        throw new InvalidOperationException("Lease holder has no opens.");
+    }
+
+    private static string FileKey(SmbOpen open) => open.LocalOpen?.PhysicalPath ?? open.PathName;
+
+    private sealed class LeaseHolder(LeaseKey key, string fileKey)
+    {
+        public LeaseKey Key { get; } = key;
+        public string FileKey { get; } = fileKey;
+        public LeaseState State { get; set; }
+        public ushort Epoch { get; set; }
+        public HashSet<SmbOpen> Opens { get; } = new();
+    }
+}

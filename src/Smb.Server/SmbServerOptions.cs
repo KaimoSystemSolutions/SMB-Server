@@ -2,6 +2,7 @@ using Smb.Auth;
 using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Server.Authorization;
+using Smb.Server.Leases;
 using Smb.Server.Locking;
 using Smb.Server.Notification;
 using Smb.Server.Oplocks;
@@ -120,6 +121,14 @@ public sealed class SmbServerOptions
     /// delegate to a cluster coordinator, for example.
     /// </summary>
     public IOplockManager OplockManager { get; set; } = new InMemoryOplockManager();
+
+    /// <summary>
+    /// Lease management (SMB 2.1+ leases, Context §15). Default <see cref="InMemoryLeaseManager"/>
+    /// (process-local). Set to <see cref="NullLeaseManager"/> to disable leasing (CREATE then always
+    /// grants <see cref="LeaseState.None"/> and clients fall back to classic oplocks), or hook in a
+    /// custom implementation to delegate to a cluster coordinator, for example.
+    /// </summary>
+    public ILeaseManager LeaseManager { get; set; } = new InMemoryLeaseManager();
 
     /// <summary>
     /// Share-mode / sharing-violation management (CREATE ShareAccess, Context §13). Default
