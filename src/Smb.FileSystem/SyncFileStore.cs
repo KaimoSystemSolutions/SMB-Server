@@ -80,4 +80,12 @@ public abstract class SyncFileStore : IFileStore
     public virtual ValueTask<NtStatus> FlushAsync(
         IFileHandle handle, CancellationToken cancellationToken = default)
         => new(Flush(handle));
+
+    public virtual ValueTask<FileStoreResult<Smb.Protocol.Security.SecurityDescriptor>> GetSecurityAsync(
+        IFileHandle handle, CancellationToken cancellationToken = default)
+        => new(FileStoreResult<Smb.Protocol.Security.SecurityDescriptor>.Fail(NtStatus.NotSupported));
+
+    public virtual ValueTask<NtStatus> SetSecurityAsync(
+        IFileHandle handle, Smb.Protocol.Security.SecurityDescriptor descriptor, CancellationToken cancellationToken = default)
+        => new(NtStatus.NotSupported);
 }

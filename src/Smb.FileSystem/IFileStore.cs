@@ -84,6 +84,24 @@ public interface IFileStore
 
     /// <summary>Flushes buffers to the backend.</summary>
     ValueTask<NtStatus> FlushAsync(IFileHandle handle, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns the security descriptor of an open handle (QUERY_INFO / InfoType Security, Phase 3).
+    /// Defaults to <see cref="NtStatus.NotSupported"/> — backends that carry per-file ACLs override it.
+    /// The caller selects which components to return via the request's SECURITY_INFORMATION flags.
+    /// </summary>
+    ValueTask<FileStoreResult<Smb.Protocol.Security.SecurityDescriptor>> GetSecurityAsync(
+        IFileHandle handle, CancellationToken cancellationToken = default)
+        => new(FileStoreResult<Smb.Protocol.Security.SecurityDescriptor>.Fail(NtStatus.NotSupported));
+
+    /// <summary>
+    /// Stores the security descriptor of an open handle (SET_INFO / InfoType Security, Phase 3).
+    /// Defaults to <see cref="NtStatus.NotSupported"/>. The dispatcher passes the already-merged
+    /// descriptor (existing descriptor with the requested SECURITY_INFORMATION components replaced).
+    /// </summary>
+    ValueTask<NtStatus> SetSecurityAsync(
+        IFileHandle handle, Smb.Protocol.Security.SecurityDescriptor descriptor, CancellationToken cancellationToken = default)
+        => new(NtStatus.NotSupported);
 }
 
 /// <summary>Simplified access intent (derived from CREATE DesiredAccess, Context §13.1).</summary>

@@ -355,9 +355,31 @@ internal static class TestHelpers
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
     }
 
+    public static byte[] BuildQueryInfoRequest(ulong messageId, ulong sessionId, uint treeId,
+        ulong persistentId, ulong volatileId, byte infoType, byte fileInfoClass, uint outputBufferLength,
+        uint additionalInformation = 0, byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+    {
+        var body = new GrowableWriter(40);
+        body.WriteUInt16(41);              // StructureSize
+        body.WriteByte(infoType);
+        body.WriteByte(fileInfoClass);
+        body.WriteUInt32(outputBufferLength);
+        body.WriteUInt16(0);               // InputBufferOffset
+        body.WriteUInt16(0);               // Reserved
+        body.WriteUInt32(0);               // InputBufferLength
+        body.WriteUInt32(additionalInformation);
+        body.WriteUInt32(0);               // Flags
+        body.WriteUInt64(persistentId);
+        body.WriteUInt64(volatileId);
+
+        byte[] header = BuildHeader(SmbCommand.QueryInfo, messageId, sessionId, treeId);
+        return Finish(header, body.ToArray(), messageId, signingKey, alg);
+    }
+
     public static byte[] BuildSetInfoRequest(ulong messageId, ulong sessionId, uint treeId,
         ulong persistentId, ulong volatileId, byte infoType, byte fileInfoClass, byte[] buffer,
-        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+        byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac,
+        uint additionalInformation = 0)
     {
         var body = new GrowableWriter(40 + buffer.Length);
         body.WriteUInt16(33);              // StructureSize
@@ -367,7 +389,7 @@ internal static class TestHelpers
         int offPos = body.Position;
         body.WriteUInt16(0);               // BufferOffset (patch)
         body.WriteUInt16(0);               // Reserved
-        body.WriteUInt32(0);               // AdditionalInformation
+        body.WriteUInt32(additionalInformation); // AdditionalInformation (SECURITY_INFORMATION for InfoType Security)
         body.WriteUInt64(persistentId);
         body.WriteUInt64(volatileId);
         int bufStart = body.Position;

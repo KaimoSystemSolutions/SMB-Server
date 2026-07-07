@@ -3,6 +3,8 @@ using Smb.FileSystem.Versioning;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Messages.Fscc;
+using Smb.Protocol.Security;
+using Smb.Protocol.Wire;
 using Smb.Server.Leases;
 using Smb.Server.Oplocks;
 using Smb.Server.Rpc;
@@ -450,6 +452,9 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
+        if (req.InfoType == InfoType.Security)
+            return await HandleQuerySecurityAsync(session, header, open, req).ConfigureAwait(false);
+
         FsccFileStat stat = ToStat(await open.LocalOpen.GetInfoAsync().ConfigureAwait(false));
 
         byte[]? buffer = req.InfoType switch
@@ -477,6 +482,9 @@ public sealed partial class Smb2Dispatcher
         SetInfoMessage.Request req = SetInfoMessage.ParseRequest(segment.Span, Smb2Header.Size);
         if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
+
+        if (req.InfoType == InfoType.Security)
+            return await HandleSetSecurityAsync(session, header, store, open, req).ConfigureAwait(false);
 
         if (req.InfoType != InfoType.File)
             return BuildError(header, NtStatus.NotSupported);
@@ -525,6 +533,73 @@ public sealed partial class Smb2Dispatcher
         (bool replace, string newPath) = SetInfoMessage.ParseRename(buffer);
         return store.RenameAsync(handle, newPath, replace);
     }
+
+    /// <summary>
+    /// QUERY_INFO with InfoType Security (§2.2.37 / MS-DTYP §2.4.6): returns the open's security
+    /// descriptor, limited to the components the client requested via AdditionalInformation.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleQuerySecurityAsync(
+        SmbSession session, Smb2Header header, SmbOpen open, QueryInfoMessage.Request req)
+    {
+        if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
+            return BuildError(header, err);
+
+        FileStoreResult<SecurityDescriptor> result = await store.GetSecurityAsync(open.LocalOpen!).ConfigureAwait(false);
+        if (!result.IsSuccess)
+            return BuildError(header, result.Status);
+
+        var which = (SecurityInformation)req.AdditionalInformation;
+        byte[] descriptor = FilterSecurityDescriptor(result.Value!, which).ToBytes();
+
+        // The client sizes its buffer; if the descriptor does not fit it retries with the needed size.
+        if (descriptor.Length > req.OutputBufferLength)
+            return BuildError(header, NtStatus.BufferTooSmall);
+
+        return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(descriptor));
+    }
+
+    /// <summary>
+    /// SET_INFO with InfoType Security (§2.2.39): merges the requested components (per
+    /// AdditionalInformation) from the supplied descriptor into the stored one and persists it.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleSetSecurityAsync(
+        SmbSession session, Smb2Header header, IFileStore store, SmbOpen open, SetInfoMessage.Request req)
+    {
+        SecurityDescriptor incoming;
+        try { incoming = SecurityDescriptor.Parse(req.Buffer); }
+        catch (SmbWireFormatException) { return BuildError(header, NtStatus.InvalidParameter); }
+
+        FileStoreResult<SecurityDescriptor> existing = await store.GetSecurityAsync(open.LocalOpen!).ConfigureAwait(false);
+        if (!existing.IsSuccess)
+            return BuildError(header, existing.Status);
+
+        var which = (SecurityInformation)req.AdditionalInformation;
+        SecurityDescriptor merged = MergeSecurityDescriptor(existing.Value!, incoming, which);
+
+        NtStatus status = await store.SetSecurityAsync(open.LocalOpen!, merged).ConfigureAwait(false);
+        if (status != NtStatus.Success)
+            return BuildError(header, status);
+
+        return MaybeSigned(session, RespHeader(header, session), SetInfoMessage.BuildResponseBody());
+    }
+
+    /// <summary>Returns a descriptor containing only the components selected by <paramref name="which"/>.</summary>
+    private static SecurityDescriptor FilterSecurityDescriptor(SecurityDescriptor sd, SecurityInformation which)
+        => SecurityDescriptor.Create(
+            which.HasFlag(SecurityInformation.Owner) ? sd.Owner : null,
+            which.HasFlag(SecurityInformation.Group) ? sd.Group : null,
+            which.HasFlag(SecurityInformation.Dacl) ? sd.Dacl : null,
+            which.HasFlag(SecurityInformation.Sacl) ? sd.Sacl : null);
+
+    /// <summary>Copies the components selected by <paramref name="which"/> from <paramref name="incoming"/>
+    /// over <paramref name="existing"/>, keeping the rest.</summary>
+    private static SecurityDescriptor MergeSecurityDescriptor(
+        SecurityDescriptor existing, SecurityDescriptor incoming, SecurityInformation which)
+        => SecurityDescriptor.Create(
+            which.HasFlag(SecurityInformation.Owner) ? incoming.Owner : existing.Owner,
+            which.HasFlag(SecurityInformation.Group) ? incoming.Group : existing.Group,
+            which.HasFlag(SecurityInformation.Dacl) ? incoming.Dacl : existing.Dacl,
+            which.HasFlag(SecurityInformation.Sacl) ? incoming.Sacl : existing.Sacl);
 
     private async ValueTask<ResponseSegment> HandleFlushAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {

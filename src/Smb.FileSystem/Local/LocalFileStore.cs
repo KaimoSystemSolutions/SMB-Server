@@ -1,5 +1,7 @@
 using Microsoft.Win32.SafeHandles;
+using Smb.FileSystem.Security;
 using Smb.Protocol.Enums;
+using Smb.Protocol.Security;
 
 namespace Smb.FileSystem.Local;
 
@@ -14,8 +16,9 @@ public sealed class LocalFileStore : SyncFileStore
     private readonly string _root;
     private readonly string _realRoot;
     private readonly bool _readOnly;
+    private readonly ISecurityDescriptorStore _securityStore;
 
-    public LocalFileStore(string rootDirectory, bool readOnly = true)
+    public LocalFileStore(string rootDirectory, bool readOnly = true, ISecurityDescriptorStore? securityStore = null)
     {
         _root = Path.GetFullPath(rootDirectory);
         Directory.CreateDirectory(_root);
@@ -24,6 +27,7 @@ public sealed class LocalFileStore : SyncFileStore
         // the containment check must be resolved consistently.
         _realRoot = TryResolveRealPath(_root) ?? _root;
         _readOnly = readOnly;
+        _securityStore = securityStore ?? new InMemorySecurityDescriptorStore();
     }
 
     protected override FileStoreResult<IFileHandle> Create(
@@ -252,6 +256,35 @@ public sealed class LocalFileStore : SyncFileStore
     }
 
     protected override NtStatus Flush(IFileHandle handle) => ((LocalFileHandle)handle).FlushStream();
+
+    /// <summary>
+    /// Returns the stored security descriptor for the handle, or a permissive default (owner Local
+    /// System, DACL granting Everyone full control) when none has been set — so a file with no explicit
+    /// ACL behaves as before. Descriptors live in the injected <see cref="ISecurityDescriptorStore"/>.
+    /// </summary>
+    public override ValueTask<FileStoreResult<SecurityDescriptor>> GetSecurityAsync(
+        IFileHandle handle, CancellationToken cancellationToken = default)
+    {
+        var h = (LocalFileHandle)handle;
+        SecurityDescriptor sd = _securityStore.TryGet(h.FullPath) ?? DefaultDescriptor();
+        return new(FileStoreResult<SecurityDescriptor>.Ok(sd));
+    }
+
+    public override ValueTask<NtStatus> SetSecurityAsync(
+        IFileHandle handle, SecurityDescriptor descriptor, CancellationToken cancellationToken = default)
+    {
+        if (_readOnly) return new(NtStatus.AccessDenied);
+        var h = (LocalFileHandle)handle;
+        _securityStore.Set(h.FullPath, descriptor);
+        return new(NtStatus.Success);
+    }
+
+    /// <summary>The implicit ACL for a file that has none set: everyone gets full control (0x1F01FF).</summary>
+    private static SecurityDescriptor DefaultDescriptor()
+    {
+        var dacl = new Acl { Aces = [Ace.Allow(WellKnownSids.Everyone, 0x001F01FF)] };
+        return SecurityDescriptor.Create(WellKnownSids.LocalSystem, WellKnownSids.BuiltinUsers, dacl);
+    }
 
     /// <summary>Resolves a share-relative path to a full path, sandboxed against directory escape.</summary>
     private bool TryResolve(string relative, out string fullPath)

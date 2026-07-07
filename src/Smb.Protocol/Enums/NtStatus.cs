@@ -20,6 +20,7 @@ public enum NtStatus : uint
     EndOfFile = 0xC0000011,
     NoSuchFile = 0xC000000F,
     AccessDenied = 0xC0000022,
+    BufferTooSmall = 0xC0000023,
     NetworkNameDeleted = 0xC00000C9,
     ObjectNameInvalid = 0xC0000033,
     ObjectNameNotFound = 0xC0000034,

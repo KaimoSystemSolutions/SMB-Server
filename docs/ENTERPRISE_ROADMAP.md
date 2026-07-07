@@ -193,24 +193,44 @@ dependency (behind `ILdapSearcher`); consumers who want the real network binding
 Without per-file ACLs, authorization is limited to share-level policies. Enterprise
 file servers enforce granular read/write/delete permissions per folder and file.
 
-### M3.1 — Security descriptor model
+### M3.1 — Security descriptor model ✅
 
-- [ ] Define `SecurityDescriptor`, `Acl`, `Ace` types in `Smb.Protocol` (NT SID
-      format, DACL/SACL, ACE types: ACCESS_ALLOWED, ACCESS_DENIED, SYSTEM_AUDIT).
-- [ ] Implement binary serialization/deserialization (self-relative format,
-      MS-DTYP §2.4.6).
-- [ ] Tests: round-trip known descriptors, parse Windows-generated SD blobs.
+Built in small tested increments in `src/Smb.Protocol/Security/` (the wire/data layer):
 
-### M3.2 — QUERY_SECURITY_INFO / SET_SECURITY_INFO
+- [x] **A** — `Sid` value type (MS-DTYP §2.4.2): binary ↔ string, `Write`/`ToBytes`/`Parse(out consumed)`,
+      value equality for use as a dictionary/set key; `Sid.Create(authority, subs…)`. 15 tests.
+- [x] **B** — ACE enums (`AceType`, `AceFlags`, `SecurityDescriptorControl`); `Ace` — basic ACEs
+      (ACCESS_ALLOWED/DENIED, SYSTEM_AUDIT/ALARM) parse/serialize with `Allow`/`Deny`/`Audit` factories,
+      unknown/object ACE types preserved verbatim in `RawData`. 5 tests.
+- [x] **C** — `Acl` (revision + ACE list) parse/serialize (AclSize authoritative on parse). Tested via SD.
+- [x] **D** — `SecurityDescriptor` self-relative parse/serialize (MS-DTYP §2.4.6, `Create` factory sets
+      DACL/SACL-present bits, control flags preserved so no-DACL / NULL-DACL / present-DACL all round-trip)
+      + `WellKnownSids`. 5 tests (incl. NULL-vs-no DACL, SACL, Windows-shaped blob).
+- [x] Tests: 25 total (`SidTests`, `AceTests`, `SecurityDescriptorTests`), full suite 264 green.
 
-- [ ] Implement `SmbCommand.QueryInfo` with `InfoType.Security` (§2.2.37):
-      return the security descriptor of an open handle.
-- [ ] Implement `SmbCommand.SetInfo` with `InfoType.Security` (§2.2.39):
-      modify owner, group, DACL, SACL.
-- [ ] Extend `IFileStore` with `GetSecurityAsync` / `SetSecurityAsync`.
-- [ ] Implement in `LocalFileStore` by reading/writing NTFS ACLs (Windows) or
-      extended attributes / POSIX ACLs (Linux/ZFS).
-- [ ] Tests: read SD, modify DACL, verify access denied after ACE removal.
+> **Note:** `Smb.Protocol.Security.Sid` and the older `Smb.Auth.Ldap.SidConverter` (M2.2) now both parse
+> SIDs; a later cleanup can have `SidConverter` delegate to `Sid` (Auth depends on Protocol). Left as-is
+> for now to avoid churn in the tested M2.2 code.
+
+### M3.2 — QUERY_SECURITY_INFO / SET_SECURITY_INFO ✅
+
+- [x] `IFileStore.GetSecurityAsync` / `SetSecurityAsync` added as default-`NotSupported` interface methods
+      (existing backends unaffected); `SyncFileStore` exposes overridable virtuals. New
+      `SecurityInformation` flags enum (MS-DTYP §2.4.7).
+- [x] QUERY_INFO `InfoType.Security` (`HandleQuerySecurityAsync`): returns the handle's descriptor
+      filtered to the components requested via `AdditionalInformation`; `STATUS_BUFFER_TOO_SMALL` when it
+      does not fit.
+- [x] SET_INFO `InfoType.Security` (`HandleSetSecurityAsync`): merges the requested components from the
+      supplied descriptor into the stored one and persists it.
+- [x] `LocalFileStore` implements both via a pluggable **`ISecurityDescriptorStore`** seam (default
+      `InMemorySecurityDescriptorStore`, physical-path keyed) — portable and testable; a deployment can
+      inject a real NTFS/POSIX-ACL-backed store. A file with no explicit ACL returns a permissive default
+      (owner Local System, Everyone full control) so behavior is unchanged until an ACL is set.
+- [x] Tests: query default SD, set+persist a replaced DACL, buffer-too-small (`SecurityInfoDispatcherTests`,
+      3). Full suite 267 green. *(access-denied-after-ACE-removal is M3.3.)*
+
+> **Modularity:** the actual OS-ACL mapping (NTFS / POSIX) is the `ISecurityDescriptorStore`
+> implementation the user supplies; the core stays dependency-free and cross-platform.
 
 ### M3.3 — Access check enforcement
 
