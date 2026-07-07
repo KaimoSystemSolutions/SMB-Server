@@ -44,6 +44,7 @@ public enum NtStatus : uint
     InvalidDeviceRequest = 0xC0000010,
     NotFound = 0xC0000225,
     NotAReparsePoint = 0xC0000275,
+    RequestNotAccepted = 0xC00000D0,
 }
 
 /// <summary>NTSTATUS evaluation via the severity field (Context §17).</summary>

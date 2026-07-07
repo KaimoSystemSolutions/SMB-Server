@@ -6,6 +6,19 @@ using Smb.Protocol.Enums;
 namespace Smb.Server.State;
 
 /// <summary>
+/// Transient state of an in-progress channel binding (§3.3.5.5.2): the fresh SPNEGO context the
+/// binding connection re-authenticates through, plus its own preauth integrity hash (3.1.1) which
+/// seeds the channel signing key. Discarded once the channel is established or the binding fails.
+/// </summary>
+public sealed class ChannelBindInProgress
+{
+    public required ISpnegoServerContext AuthContext { get; init; }
+
+    /// <summary>Per-channel preauth hash (3.1.1 only), seeded from the connection's NEGOTIATE hash.</summary>
+    public PreauthIntegrityHash? PreauthHash { get; init; }
+}
+
+/// <summary>
 /// State of a TCP connection (Context §19, §3.3.1.7). One TCP connection = one
 /// SMB2 connection; multiple sessions can share it. Holds the sequence/credit window,
 /// the negotiated dialect/crypto parameters and (3.1.1) the preauth hash.
@@ -62,6 +75,13 @@ public sealed class SmbConnection
 
     /// <summary>Sessions on this connection (SessionId → session).</summary>
     public ConcurrentDictionary<ulong, SmbSession> Sessions { get; } = new();
+
+    /// <summary>
+    /// In-progress channel bindings on this connection (SessionId → transient GSS state), used only
+    /// during a <c>SESSION_SETUP</c> with <c>SMB2_SESSION_FLAG_BINDING</c> until the channel is
+    /// established (§3.3.5.5.2). Removed on success or failure.
+    /// </summary>
+    public ConcurrentDictionary<ulong, ChannelBindInProgress> PendingBindings { get; } = new();
 
     public DateTimeOffset CreationTime { get; } = DateTimeOffset.UtcNow;
 

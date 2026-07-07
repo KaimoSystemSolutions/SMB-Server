@@ -117,9 +117,11 @@ internal sealed class SmbConnectionHandler
         finally
         {
             connection.SendRawAsync = null;
-            connection.CancelAllPending();            // cancel pending LOCKs etc.
             await DrainInflightAsync().ConfigureAwait(false); // drain running I/Os (before writeLock dispose!)
-            _dispatcher.OnConnectionClosed(connection); // release opens: handles/locks/oplocks/share-modes (O5)
+            // OnConnectionClosed releases opens (handles/locks/oplocks/share-modes, O5) and cancels pending
+            // async ops — but keeps a session (and its pending LOCK/CHANGE_NOTIFY) alive when another
+            // multichannel channel survives, rerouting their final response there (M6.3 failover).
+            _dispatcher.OnConnectionClosed(connection);
             _server.Connections.TryRemove(connection.ConnectionId, out _);
             _writeLock.Dispose();
             _ioGate?.Dispose();

@@ -73,6 +73,12 @@ public static class NegotiateProcessor
         var caps = Smb2Capabilities.None;
         if (largeMtu) caps |= Smb2Capabilities.LargeMtu;
 
+        // Multichannel is a 3.x feature (Phase 6). Advertising the capability tells the client it may
+        // open additional connections and bind them to the session (§3.3.5.5.2) after discovering the
+        // server's interfaces via FSCTL_QUERY_NETWORK_INTERFACE_INFO.
+        if (options.EnableMultichannel && dialect.IsSmb3OrLater())
+            caps |= Smb2Capabilities.MultiChannel;
+
         var responseContexts = new List<NegotiateContext>();
 
         if (dialect == SmbDialect.Smb311)

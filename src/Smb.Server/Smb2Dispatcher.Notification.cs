@@ -17,7 +17,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         ChangeNotifyMessage.Request req = ChangeNotifyMessage.ParseRequest(segment, Smb2Header.Size);
@@ -94,11 +94,8 @@ public sealed partial class Smb2Dispatcher
             ? MaybeSigned(session, h, body)
             : ResponseSegment.Unsigned(h, body);
 
-        byte[] bytes = AssembleResponse([seg]);
-        Func<byte[], bool, Task>? sender = connection.SendRawAsync;
-        if (sender is null) return;
-        try { await sender(bytes, encrypt).ConfigureAwait(false); }
-        catch { /* connection already gone */ }
+        // Failover (M6.3): deliver on a surviving channel if the originating one dropped.
+        await SendOutOfBandAsync(session, connection, seg, encrypt).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -414,30 +414,76 @@ protection all landed with 22 new tests (7 + 10 + 5), suite 302 → **324 green*
 Multichannel binds multiple TCP connections to a single SMB session for
 throughput aggregation and failover.
 
-### M6.1 — Session binding
+### M6.1 — Session binding ✅
 
-- [ ] Accept `SMB2_SESSION_SETUP` with `SMB2_SESSION_FLAG_BINDING` flag on a
-      second TCP connection.
-- [ ] Verify the binding request's signature using the session's signing key.
-- [ ] Share session state (identity, encryption keys, tree connects, opens)
-      across bound connections.
-- [ ] Tests: establish session on conn A, bind on conn B, access open from conn B.
+- [x] Accept `SMB2_SESSION_SETUP` with `SMB2_SESSION_FLAG_BINDING` on a second connection
+      (`Smb2Dispatcher.HandleSessionBinding`), routed from `HandleSessionSetup` by the request flag.
+- [x] Verify the binding request's signature using the **session** signing key before anything else
+      is done (proves the new connection possesses the session key, §3.3.5.5.2); unsigned or
+      wrong-key → `STATUS_ACCESS_DENIED`. Guards: dialect must be 3.x and match the session's
+      (`STATUS_INVALID_PARAMETER`), same `ClientGuid`, session must be `Valid`, not already bound to
+      this connection (`STATUS_REQUEST_NOT_ACCEPTED`), unknown session → `STATUS_USER_SESSION_DELETED`.
+- [x] Per-channel model: `SmbChannel` + `SmbSession.Channels` (keyed by `ConnectionId`), the primary
+      channel registered when the session goes `Valid`. The binding re-runs the GSS exchange on a fresh
+      per-connection context (`SmbConnection.PendingBindings`), confirms the re-authenticated identity
+      matches the session's (`SameIdentity`, no privilege change), and derives a **per-channel signing
+      key** from the *session* key: 3.1.1 uses the channel's own preauth hash so the key differs per
+      channel (`DeriveChannelSigningKey`, §3.3.5.5.3); 3.0/3.0.2 has no preauth input so it equals the
+      session key. Signing/verification resolve `SmbSession.SigningKeyFor(connection)` at the two choke
+      points (`AssembleResponse`, `VerifyInboundSignature`).
+- [x] Share session state: the bound connection joins the existing `SmbSession`, so identity, keys,
+      tree connects and opens are shared. Channel-aware teardown (`OnConnectionClosed`) drops only the
+      closing channel; the session and its opens survive until the **last** channel closes.
+- [x] Tests (`tests/Smb.Tests/Phase6BindingTests.cs`, 4): bind on conn B then READ conn A's open over
+      conn B signed with the channel key (asserting the channel key differs from the session key and the
+      final binding response verifies under it); unsigned/wrong-key binding → `ACCESS_DENIED`; unknown
+      session → `USER_SESSION_DELETED`; closing the bound channel keeps the session, closing the last
+      tears it down. Full suite **328 green**.
 
-### M6.2 — Interface discovery (FSCTL_QUERY_NETWORK_INTERFACE_INFO)
+> **Note:** the two remaining M6.x milestones build on this: M6.2 advertises the interfaces the client
+> uses to *open* extra channels, M6.3 migrates in-flight I/O when a bound channel drops. Same
+> break-before-grant-style simplification is not relevant here; the binding path is complete on the wire.
 
-- [ ] Implement `FSCTL_QUERY_NETWORK_INTERFACE_INFO` (§2.2.32.5): return the
-      server's network interfaces (IP, link speed, RSS capability).
-- [ ] Enumerate system NICs via `NetworkInterface.GetAllNetworkInterfaces()`.
-- [ ] Tests: IOCTL returns valid interface list, client can parse it.
+### M6.2 — Interface discovery (FSCTL_QUERY_NETWORK_INTERFACE_INFO) ✅
 
-### M6.3 — Channel failover
+- [x] `FSCTL_QUERY_NETWORK_INTERFACE_INFO` (§2.2.32.5) handled in the IOCTL dispatcher
+      (`HandleQueryNetworkInterfaceInfo`); issued without a file handle. Returns the chained
+      `NETWORK_INTERFACE_INFO` array (IfIndex, capability, link speed, IPv4/IPv6 `SOCKADDR_STORAGE`).
+      Refused (`STATUS_NOT_SUPPORTED`) when multichannel is disabled or the dialect is &lt; 3.0; the
+      output is capped to the client's `MaxOutputResponse` (`STATUS_BUFFER_TOO_SMALL`).
+- [x] Pure wire builder `NetworkInterfaceInfoMessage.Build` (152-byte entries) in `Smb.Protocol`.
+      The NIC source is a seam **`INetworkInterfaceProvider`** (`Smb.Server.Multichannel`,
+      `SmbServerOptions.NetworkInterfaceProvider`); default `SystemNetworkInterfaceProvider` enumerates
+      operational, non-loopback NICs via `NetworkInterface.GetAllNetworkInterfaces()` (unicast
+      IPv4/IPv6, link speed; RSS/RDMA not detectable via the managed API → `None`). So the core stays
+      testable (fake provider) and a deployment advertises exactly the interfaces it wants.
+- [x] `SMB2_GLOBAL_CAP_MULTICHANNEL` advertised on 3.x NEGOTIATE (`SmbServerOptions.EnableMultichannel`,
+      default on) so clients actually attempt multichannel and issue this FSCTL.
+- [x] Tests (`tests/Smb.Tests/Phase6InterfaceInfoTests.cs`, 5): two-interface chained round-trip
+      (IPv4 + IPv6 parsed), empty list, multichannel disabled → NOT_SUPPORTED, 2.x dialect →
+      NOT_SUPPORTED, capability advertised only for 3.x.
 
-- [ ] When a bound connection drops, ongoing I/O migrates to surviving connections.
-- [ ] Pending async operations (LOCK, CHANGE_NOTIFY) survive channel loss if
-      another channel remains.
-- [ ] Tests: drop one of two channels, verify session and opens survive.
+### M6.3 — Channel failover ✅
 
-**Estimated scope:** ~1,500 LOC production + ~600 LOC tests.
+- [x] Session + opens survive a bound-channel drop (from M6.1); `OnConnectionClosed` removes only the
+      closing channel and tears the session down solely when the last channel goes.
+- [x] Pending async operations (blocking LOCK, CHANGE_NOTIFY) survive channel loss when another channel
+      remains: `OnConnectionClosed` cancels only pending ops whose session did **not** survive; the rest
+      complete and reroute. The host no longer blanket-cancels on drop (that logic moved into the
+      channel-aware `OnConnectionClosed`).
+- [x] Out-of-band responses fail over: `SmbSession.SelectSendChannel(preferred)` picks a live channel,
+      and the centralized `SendOutOfBandAsync` selects it **before** signing/framing (so the per-channel
+      3.1.1 key is correct) — used by lease break, oplock break, blocking-LOCK final and CHANGE_NOTIFY
+      final. If the originating channel dropped, the final response goes out on a surviving one.
+- [x] Tests (`tests/Smb.Tests/Phase6FailoverTests.cs`, 2): `SelectSendChannel` prefers the live channel
+      then fails over then returns null; a blocking LOCK issued on channel B, whose channel drops while
+      pending, is granted and its final response delivered on the surviving channel A (same AsyncId).
+
+**Estimated scope:** ~1,500 LOC production + ~600 LOC tests. *(Actual: ~260 LOC production + ~330 LOC
+tests across M6.1–M6.3 — the channel model + per-channel signing added in M6.1 carried M6.3 directly.)*
+
+**Phase 6 complete.** Session binding (M6.1), interface discovery (M6.2) and channel failover (M6.3)
+landed with 11 tests (4 + 5 + 2), suite 324 → **335 green**.
 
 ---
 
@@ -675,9 +721,9 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 5 / M5.1 | Complete | Server-side copy. `CopyChunkMessage` (resume-key + SRV_COPYCHUNK_COPY / _RESPONSE, pure); FSCTL_SRV_REQUEST_RESUME_KEY assigns `SmbOpen.ResumeKey`; FSCTL_SRV_COPYCHUNK(_WRITE) locates the source by key in the session, enforces §2.2.31.1 limits (maxima on violation), copies chunks. Optional `IFileStore.CopyRangeAsync` offload seam preferred for same-store copies, else a 64 KiB read/write fallback (spans shares). 7 tests (`CopyChunkTests.cs`), full suite 309 green. |
 | 2026-07-07 | Phase 5 / M5.2 | Complete | Additional FSCTLs. Pure wire in `FsctlMessage` (set-sparse / zero-data / allocated-ranges structs, FSCTL codes); two opt-in seams `ISparseFileStore` + `IReparsePointStore` (checked with `is`). SET_SPARSE/SET_ZERO_DATA/QUERY_ALLOCATED_RANGES, GET/SET/DELETE_REPARSE_POINT (opaque buffer, NOT_A_REPARSE_POINT/NOT_SUPPORTED defaults), DFS_GET_REFERRALS → NOT_FOUND stub. Access-gated; output capped to MaxOutputResponse. New NtStatus `NotFound`/`NotAReparsePoint`. 10 tests (`AdditionalFsctlTests.cs`). |
 | 2026-07-07 | Phase 5 / M5.3 | Complete | FSCTL_VALIDATE_NEGOTIATE_INFO hardening (was unhandled). Parses the request and compares capabilities / client GUID / security mode / negotiated dialect against the connection's negotiated state; mismatch → new `SmbConnection.MustTerminate` flag, no reply, host drops the connection; match → server info (signed). `HandleIoctlAsync` now returns `ResponseSegment?`. 5 tests (`ValidateNegotiateTests.cs`). **Phase 5 complete — suite 324 green.** |
-| | Phase 6 / M6.1 | Not started | |
-| | Phase 6 / M6.2 | Not started | |
-| | Phase 6 / M6.3 | Not started | |
+| 2026-07-07 | Phase 6 / M6.1 | Complete | Session binding (multichannel). `SmbChannel` + `SmbSession.Channels`/`SigningKeyFor`, primary channel registered on login; `HandleSessionBinding` validates (dialect/ClientGuid/Valid/not-already-bound), verifies the request signature under the session key, re-runs GSS on a per-connection context (`ChannelBindInProgress`), matches identity, derives a per-channel signing key (3.1.1 uses the channel preauth hash, §3.3.5.5.3). Per-channel sign/verify at `AssembleResponse`/`VerifyInboundSignature`. Channel-aware teardown keeps the session until the last channel closes. New `NtStatus.RequestNotAccepted`. 4 tests (`Phase6BindingTests.cs`), full suite 328 green. |
+| 2026-07-07 | Phase 6 / M6.2 | Complete | FSCTL_QUERY_NETWORK_INTERFACE_INFO. Pure `NetworkInterfaceInfoMessage.Build` (152-byte chained entries, IPv4/IPv6 SOCKADDR_STORAGE) in `Smb.Protocol`; seam `INetworkInterfaceProvider` + default `SystemNetworkInterfaceProvider` (NIC enumeration) in `Smb.Server.Multichannel`, injectable via `SmbServerOptions.NetworkInterfaceProvider`. Handler `HandleQueryNetworkInterfaceInfo` (NOT_SUPPORTED when disabled/<3.0, output capped to MaxOutputResponse). `SMB2_GLOBAL_CAP_MULTICHANNEL` advertised on 3.x NEGOTIATE (`EnableMultichannel`, default on). 5 tests (`Phase6InterfaceInfoTests.cs`), suite 333 green. |
+| 2026-07-07 | Phase 6 / M6.3 | Complete | Channel failover. `SmbSession.SelectSendChannel(preferred)` + centralized `SendOutOfBandAsync` (selects a live channel BEFORE signing so the per-channel key is right) — wired into lease/oplock break + blocking-LOCK/CHANGE_NOTIFY finals. `OnConnectionClosed` now cancels only pending async ops whose session didn't survive (others complete + reroute); host no longer blanket-cancels. 2 tests (`Phase6FailoverTests.cs`: SelectSendChannel prefer/failover/null; blocking LOCK on a dropping channel granted + delivered on the survivor). **Phase 6 complete — suite 335 green.** |
 | | Phase 7 / M7.1 | Not started | |
 | | Phase 7 / M7.2 | Not started | |
 | | Phase 8 / M8.1 | Not started | |

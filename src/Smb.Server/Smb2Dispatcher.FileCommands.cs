@@ -54,7 +54,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
         if (!session.TreeConnects.TryGetValue(header.TreeId, out SmbTreeConnect? tree))
             return BuildError(header, NtStatus.NetworkNameDeleted);
@@ -305,7 +305,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         IoctlMessage.Request req = IoctlMessage.ParseRequest(segment.Span, Smb2Header.Size);
@@ -313,6 +313,10 @@ public sealed partial class Smb2Dispatcher
         // [M5.3] FSCTL_VALIDATE_NEGOTIATE_INFO — secure-negotiate downgrade check (3.0/3.0.2).
         if (req.CtlCode == IoctlMessage.FsctlValidateNegotiateInfo)
             return HandleValidateNegotiate(connection, header, session, req);
+
+        // [M6.2] FSCTL_QUERY_NETWORK_INTERFACE_INFO — advertise server NICs for multichannel.
+        if (req.CtlCode == NetworkInterfaceInfoMessage.FsctlQueryNetworkInterfaceInfo)
+            return HandleQueryNetworkInterfaceInfo(connection, header, session, req);
 
         // FSCTL_PIPE_TRANSCEIVE: DCERPC request → response via the named pipe.
         if (req.CtlCode == IoctlMessage.FsctlPipeTransceive
@@ -636,6 +640,26 @@ public sealed partial class Smb2Dispatcher
             IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
     }
 
+    /// <summary>
+    /// [M6.2] FSCTL_QUERY_NETWORK_INTERFACE_INFO (§3.3.5.15.4): returns the server's network interfaces
+    /// so a multichannel client can open extra connections and bind them. Issued without a file handle
+    /// (FileId 0xFFFF…). Refused when multichannel is disabled or the dialect is &lt; 3.0.
+    /// </summary>
+    private ResponseSegment HandleQueryNetworkInterfaceInfo(SmbConnection connection, Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        if (!_server.Options.EnableMultichannel || !connection.Dialect.IsSmb3OrLater())
+            return BuildError(header, NtStatus.NotSupported);
+
+        byte[] output = NetworkInterfaceInfoMessage.Build(_server.Options.NetworkInterfaceProvider.GetInterfaces());
+
+        // Honour the client's output cap (§3.3.5.15): if the interface list doesn't fit, ask it to retry.
+        if (output.Length > req.MaxOutputResponse)
+            return BuildError(header, NtStatus.BufferTooSmall);
+
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
+    }
+
     /// <summary>Greatest dialect this server supports among the client-offered list (0 = none common).</summary>
     private static ushort PickDialect(ushort[] offered)
     {
@@ -690,7 +714,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         (ushort flags, ulong persistent, ulong vol) = CloseMessage.ParseRequest(segment.Span, Smb2Header.Size);
@@ -727,7 +751,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         ReadMessage.Request req = ReadMessage.ParseRequest(segment.Span, Smb2Header.Size);
@@ -763,7 +787,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         WriteMessage.Request req = WriteMessage.ParseRequest(segment.Span, Smb2Header.Size);
@@ -799,7 +823,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
             return BuildError(header, err);
@@ -853,7 +877,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         QueryInfoMessage.Request req = QueryInfoMessage.ParseRequest(segment.Span, Smb2Header.Size);
@@ -882,7 +906,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
             return BuildError(header, err);
@@ -1027,7 +1051,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         // FLUSH Request (§2.2.17): StructureSize(2)+Reserved1(2)+Reserved2(4)+FileId(16).
@@ -1107,8 +1131,29 @@ public sealed partial class Smb2Dispatcher
     {
         foreach (SmbSession session in connection.Sessions.Values)
         {
+            // Multichannel (§3.3.7.1 applies per session, not per channel): drop only the channel this
+            // connection provided. As long as another bound channel remains, the session and its opens
+            // survive so the client keeps working over the surviving connection(s). Only when the last
+            // channel goes are the opens released and the session removed. Sessions with no channel
+            // table (2.x) collapse to the previous single-connection behaviour.
+            session.Channels.TryRemove(connection.ConnectionId, out _);
+            if (!session.Channels.IsEmpty)
+                continue;
+
             CloseSessionOpens(session);
             _server.SessionGlobalList.TryRemove(session.SessionId, out _);
+        }
+
+        // Pending async operations on this connection (blocking LOCK / CHANGE_NOTIFY): cancel only
+        // those whose session did NOT survive on another channel. The rest are left to complete and
+        // reroute their final response to a surviving channel (M6.3 failover, §3.3.5).
+        foreach (PendingAsyncRequest pending in connection.PendingRequests.Values)
+        {
+            SmbSession? owner = pending.Owner?.Session;
+            bool survives = owner is not null && !owner.Channels.IsEmpty;
+            if (survives) continue;
+            pending.Cancel();
+            connection.PendingRequests.TryRemove(pending.MessageId, out _);
         }
     }
 

@@ -18,7 +18,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         LockMessage.Request req = LockMessage.ParseRequest(segment, Smb2Header.Size);
@@ -126,12 +126,9 @@ public sealed partial class Smb2Dispatcher
             ? MaybeSigned(session, h, LockMessage.BuildResponseBody())
             : ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
 
-        byte[] bytes = AssembleResponse([seg]);
-
-        Func<byte[], bool, Task>? sender = connection.SendRawAsync;
-        if (sender is null) return;
-        try { await sender(bytes, ResponseNeedsEncryption(session, pending.Owner)).ConfigureAwait(false); }
-        catch { /* connection already gone — nothing to do */ }
+        // Failover (M6.3): if the originating channel dropped while the lock was blocked, deliver the
+        // final response on a surviving channel of the session instead.
+        await SendOutOfBandAsync(session, connection, seg, ResponseNeedsEncryption(session, pending.Owner)).ConfigureAwait(false);
     }
 
     /// <summary>At CLOSE, releases all locks of the open and cancels its pending (blocking) locks.</summary>

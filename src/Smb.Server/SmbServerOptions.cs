@@ -5,6 +5,7 @@ using Smb.Server.Authorization;
 using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Locking;
+using Smb.Server.Multichannel;
 using Smb.Server.Notification;
 using Smb.Server.Oplocks;
 using Smb.Server.Sharing;
@@ -163,6 +164,21 @@ public sealed class SmbServerOptions
     /// <see cref="System.TimeProvider.System"/>; inject a fake in tests for deterministic expiry.
     /// </summary>
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
+
+    /// <summary>
+    /// Advertise multichannel (Phase 6): set <c>SMB2_GLOBAL_CAP_MULTICHANNEL</c> on 3.x NEGOTIATE and
+    /// serve FSCTL_QUERY_NETWORK_INTERFACE_INFO so clients open and bind additional channels. On by
+    /// default; session binding itself (§3.3.5.5.2) is always accepted when a valid signed request
+    /// arrives, independently of this flag.
+    /// </summary>
+    public bool EnableMultichannel { get; set; } = true;
+
+    /// <summary>
+    /// Source of the interfaces reported by FSCTL_QUERY_NETWORK_INTERFACE_INFO (multichannel). Default
+    /// <see cref="SystemNetworkInterfaceProvider"/> (enumerates operational, non-loopback NICs). Supply
+    /// a custom provider to control exactly which interfaces (and capabilities) are advertised.
+    /// </summary>
+    public INetworkInterfaceProvider NetworkInterfaceProvider { get; set; } = new SystemNetworkInterfaceProvider();
 
     /// <summary>Validates the configuration and throws on misconfiguration.</summary>
     public void Validate()

@@ -107,7 +107,7 @@ public sealed partial class Smb2Dispatcher
             offset += segmentLength;
         }
 
-        return AssembleResponse(segments);
+        return AssembleResponse(connection, segments);
     }
 
     /// <summary>
@@ -370,6 +370,12 @@ public sealed partial class Smb2Dispatcher
         SessionSetupRequest request = SessionSetupRequest.Parse(segment, Smb2Header.Size);
         bool is311 = connection.Dialect == SmbDialect.Smb311;
 
+        // SMB 3.x session binding (multichannel, §3.3.5.5.2): a second connection joins an existing
+        // session to aggregate throughput / provide failover. Handled on its own path — the session
+        // is already authenticated, only a new channel (with its own signing key) is added.
+        if (request.Flags.HasFlag(SessionSetupFlags.Binding))
+            return HandleSessionBinding(connection, header, request, segment, is311);
+
         SmbSession session;
         if (header.SessionId == 0)
         {
@@ -450,6 +456,13 @@ public sealed partial class Smb2Dispatcher
 
         session.State = SessionState.Valid;
 
+        // Register the primary channel (Context §8.1 Session.ChannelList). Its signing key is the
+        // session signing key; further connections bind additional channels with their own keys.
+        // Tracking it here also makes channel-aware teardown correct: the session survives until the
+        // last channel closes. Only for 3.x, where multichannel exists.
+        if (connection.Dialect.IsSmb3OrLater())
+            session.Channels[connection.ConnectionId] = new SmbChannel { Connection = connection, SigningKey = session.SigningKey };
+
         var sessionFlags = SessionResponseFlags.None;
         if (session.IsGuest) sessionFlags |= SessionResponseFlags.IsGuest;
         if (session.IsAnonymous) sessionFlags |= SessionResponseFlags.IsNull;
@@ -464,6 +477,132 @@ public sealed partial class Smb2Dispatcher
         return sign
             ? ResponseSegment.Signed(respHeader, respBody, session)
             : ResponseSegment.Unsigned(respHeader, respBody);
+    }
+
+    /// <summary>
+    /// Handles a <c>SESSION_SETUP</c> carrying <c>SMB2_SESSION_FLAG_BINDING</c> (§3.3.5.5.2): a new
+    /// connection joins an existing, already-authenticated session as an additional channel. The
+    /// binding request must be signed under the session key (proving the new connection possesses it);
+    /// the client re-authenticates over GSS (so the identity can be confirmed and a per-channel signing
+    /// key derived, §3.3.5.5.3). On success the connection is registered as a channel and shares the
+    /// session's identity, keys, tree connects and opens.
+    /// </summary>
+    private ResponseSegment HandleSessionBinding(SmbConnection connection, Smb2Header header,
+        SessionSetupRequest request, ReadOnlySpan<byte> segment, bool is311)
+    {
+        // Multichannel is an SMB 3.x feature — reject binding on 2.x.
+        if (!connection.Dialect.IsSmb3OrLater())
+            return BuildError(header, NtStatus.RequestNotAccepted);
+
+        // The target session must exist in the global table (it may live on another connection).
+        if (header.SessionId == 0 ||
+            !_server.SessionGlobalList.TryGetValue(header.SessionId, out SmbSession? session))
+            return BuildError(header, NtStatus.UserSessionDeleted);
+
+        // Binding a connection that already carries this session is not a new channel.
+        if (connection.Sessions.ContainsKey(session.SessionId))
+            return BuildError(header, NtStatus.RequestNotAccepted);
+
+        // The session must have finished authenticating on its first channel before others bind.
+        if (session.State != SessionState.Valid)
+            return BuildError(header, NtStatus.InvalidParameter);
+
+        // The channel must use the same dialect the session negotiated (§3.3.5.5.2).
+        if (connection.Dialect != session.Connection.Dialect)
+            return BuildError(header, NtStatus.InvalidParameter);
+
+        // Defence in depth: only bind channels originating from the same client.
+        if (!connection.ClientGuid.AsSpan().SequenceEqual(session.Connection.ClientGuid))
+            return BuildError(header, NtStatus.AccessDenied);
+
+        // The binding request MUST be signed and verify under the *session* signing key — this proves
+        // the new connection holds the session key (§3.3.5.5.2). Encryption-only is not accepted here.
+        if (!header.Flags.HasFlag(Smb2HeaderFlags.Signed))
+            return BuildError(header, NtStatus.AccessDenied);
+        SmbSigningAlgorithmId sesAlg = Smb2Signer.ResolveAlgorithm(session.Connection.Dialect, session.Connection.SigningAlgorithmId);
+        if (!Smb2Signer.Verify(sesAlg, session.SigningKey, segment, header.MessageId, isServer: false, isCancel: false))
+            return BuildError(header, NtStatus.AccessDenied);
+
+        // Per-channel GSS state (fresh SPNEGO context + this channel's preauth hash) lives on the
+        // connection across the (possibly multi-leg) exchange until the channel is established.
+        ChannelBindInProgress bind = connection.PendingBindings.GetOrAdd(session.SessionId, _ =>
+            new ChannelBindInProgress
+            {
+                AuthContext = _server.Options.SpnegoNegotiator!.CreateServerContext(),
+                PreauthHash = is311 ? connection.PreauthHash.Clone() : null,
+            });
+
+        // 3.1.1: the channel signing key is bound to this channel's own preauth hash → include the request.
+        bind.PreauthHash?.Append(segment);
+
+        GssResult auth = bind.AuthContext.Accept(request.SecurityBuffer);
+
+        if (auth.NeedsMoreProcessing)
+        {
+            var more = new SessionSetupResponse { SecurityBuffer = auth.OutToken ?? [] };
+            Smb2Header mh = BuildSessionHeader(header, session, NtStatus.MoreProcessingRequired);
+            byte[] mbody = more.ToBody();
+            if (is311) bind.PreauthHash?.Append(Concat(mh.ToArray(), mbody));
+            // Intermediate binding responses are signed with the session key (no channel yet); the
+            // ResponseSegment resolves session.SigningKeyFor(connection), which falls back to it.
+            return ResponseSegment.Signed(mh, mbody, session);
+        }
+
+        if (!auth.IsSuccess)
+        {
+            connection.PendingBindings.TryRemove(session.SessionId, out _);
+            return BuildError(header, auth.Status);
+        }
+
+        // The re-authenticated identity MUST be the session's own — binding must not change the
+        // principal (§3.3.5.5.2). Anonymous/guest sessions cannot host bound channels.
+        if (!SameIdentity(session.Identity, auth.Identity))
+        {
+            connection.PendingBindings.TryRemove(session.SessionId, out _);
+            return BuildError(header, NtStatus.AccessDenied);
+        }
+
+        connection.PendingBindings.TryRemove(session.SessionId, out _);
+
+        // Derive the channel signing key from the *session* key — never the binding auth's session key
+        // (§3.3.5.5.3). For 3.1.1 the channel's own preauth hash makes it distinct per channel; for
+        // 3.0/3.0.2 the KDF has no preauth input, so it equals the session signing key.
+        byte[] channelKey = DeriveChannelSigningKey(connection, session, bind.PreauthHash);
+        session.Channels[connection.ConnectionId] = new SmbChannel { Connection = connection, SigningKey = channelKey };
+        connection.Sessions[session.SessionId] = session;
+
+        var flags = SessionResponseFlags.None;
+        if (session.EncryptData) flags |= SessionResponseFlags.EncryptData;
+        var response = new SessionSetupResponse { SessionFlags = flags, SecurityBuffer = auth.OutToken ?? [] };
+        Smb2Header respHeader = BuildSessionHeader(header, session, NtStatus.Success);
+        byte[] respBody = response.ToBody();
+
+        // The final binding response is signed with the *new channel* key: the channel is already
+        // registered above, so ResponseSegment resolves session.SigningKeyFor(connection) to it.
+        return ResponseSegment.Signed(respHeader, respBody, session);
+    }
+
+    /// <summary>Derives the signing key for a bound channel (§3.3.5.5.3). See <see cref="HandleSessionBinding"/>.</summary>
+    private static byte[] DeriveChannelSigningKey(SmbConnection connection, SmbSession session, PreauthIntegrityHash? channelPreauth)
+    {
+        byte[] preauth = channelPreauth?.Value ?? new byte[64];
+        Smb3SessionKeys keys = Smb3KeyDerivation.Derive(
+            connection.Dialect, connection.CipherId, session.SessionKey, session.FullSessionKey, preauth);
+        return keys.SigningKey;
+    }
+
+    /// <summary>
+    /// True when two identities denote the same non-anonymous principal (used to confirm a binding
+    /// re-auth targets the session's own user). Prefers the user SID; falls back to Domain\User.
+    /// </summary>
+    private static bool SameIdentity(SecurityIdentity? a, SecurityIdentity? b)
+    {
+        if (a is null || b is null) return false;
+        if (a.IsAnonymous || b.IsAnonymous || a.IsGuest || b.IsGuest) return false;
+        if (a.UserSid is not null && b.UserSid is not null)
+            return string.Equals(a.UserSid, b.UserSid, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(a.DomainName, b.DomainName, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(a.UserName, b.UserName, StringComparison.OrdinalIgnoreCase);
     }
 
     private Smb2Header BuildSessionHeader(Smb2Header request, SmbSession session, NtStatus status)
@@ -531,7 +670,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         TreeConnectRequest request = TreeConnectRequest.Parse(segment, Smb2Header.Size);
@@ -590,7 +729,7 @@ public sealed partial class Smb2Dispatcher
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         session.TreeConnects.TryRemove(header.TreeId, out _);
@@ -609,12 +748,13 @@ public sealed partial class Smb2Dispatcher
         // [AUDIT-2026-06] LOGOFF previously — unlike all other session handlers — did NOT verify
         // the signature; an injected LOGOFF could tear down a session that requires signing.
         // See docs/SECURITY_AUDIT.md (Finding M4).
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         CloseSessionOpens(session); // release handles/locks/oplocks/share-modes of this session (O5)
         connection.Sessions.TryRemove(session.SessionId, out _);
         _server.SessionGlobalList.TryRemove(session.SessionId, out _);
+        session.Channels.Clear(); // LOGOFF tears down the whole session across all bound channels
         session.State = SessionState.Expired;
 
         Smb2Header respHeader = header.CreateResponse(NtStatus.Success);
@@ -632,7 +772,7 @@ public sealed partial class Smb2Dispatcher
             if (!TryGetValidSession(connection, header.SessionId, out SmbSession s))
                 return BuildError(header, NtStatus.UserSessionDeleted);
             session = s;
-            if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+            if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
                 return BuildError(header, NtStatus.AccessDenied);
         }
 
@@ -659,7 +799,7 @@ public sealed partial class Smb2Dispatcher
     /// Verifies the signature of incoming messages when the session requires signing
     /// (Context §10 inbound check). Sessions that do not require signing pass through.
     /// </summary>
-    private static bool VerifyInboundSignature(SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
+    private static bool VerifyInboundSignature(SmbConnection connection, SmbSession session, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
     {
         // [AUDIT-2026-06] Frames received encrypted are already authenticated by AEAD
         // (§3.1.4.1) and carry no signature. Previously the host permanently cleared session.SigningRequired
@@ -670,9 +810,11 @@ public sealed partial class Smb2Dispatcher
         if (!session.SigningRequired) return true;
         if (!header.Flags.HasFlag(Smb2HeaderFlags.Signed)) return false;
 
-        SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(session.Connection.Dialect, session.Connection.SigningAlgorithmId);
+        // Multichannel: verify with the key of the channel the request arrived on (per-channel 3.1.1
+        // signing keys, §3.3.5.5.3); falls back to the session key for the single-channel case.
+        SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(connection.Dialect, connection.SigningAlgorithmId);
         bool isCancel = header.Command == SmbCommand.Cancel;
-        return Smb2Signer.Verify(alg, session.SigningKey, segment, header.MessageId, isServer: false, isCancel);
+        return Smb2Signer.Verify(alg, session.SigningKeyFor(connection), segment, header.MessageId, isServer: false, isCancel);
     }
 
     private ResponseSegment MaybeSigned(SmbSession session, Smb2Header header, byte[] body)
@@ -686,8 +828,23 @@ public sealed partial class Smb2Dispatcher
         return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
     }
 
+    /// <summary>
+    /// Sends a completed out-of-band response (lease/oplock break, blocking-LOCK/CHANGE_NOTIFY final)
+    /// on a surviving channel of the session (multichannel failover, M6.3): picks a live channel
+    /// preferring <paramref name="preferred"/>, then signs/frames for that channel (per-channel key)
+    /// and writes it. No-op if no channel can currently send.
+    /// </summary>
+    private static async Task SendOutOfBandAsync(SmbSession session, SmbConnection? preferred, ResponseSegment segment, bool encrypt)
+    {
+        SmbConnection? target = session.SelectSendChannel(preferred);
+        if (target?.SendRawAsync is not { } sender) return;
+        byte[] bytes = AssembleResponse(target, [segment]);
+        try { await sender(bytes, encrypt).ConfigureAwait(false); }
+        catch { /* channel dropped between selection and send — nothing to do */ }
+    }
+
     /// <summary>Assembles segments into the final message, patches NextCommand and signs.</summary>
-    private static byte[] AssembleResponse(List<ResponseSegment> segments)
+    private static byte[] AssembleResponse(SmbConnection connection, List<ResponseSegment> segments)
     {
         var writer = new GrowableWriter(256);
         for (int i = 0; i < segments.Count; i++)
@@ -712,8 +869,10 @@ public sealed partial class Smb2Dispatcher
                 // Update the flags field in the already-written header (offset 16).
                 writer.PatchUInt32(segStart + 16, (uint)h.Flags);
 
-                SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(s.Connection.Dialect, s.Connection.SigningAlgorithmId);
-                Smb2Signer.SignInPlace(alg, s.SigningKey, segSpan, h.MessageId, isServer: true, isCancel: false);
+                // Multichannel: sign with the key of the channel the response goes out on
+                // (per-channel 3.1.1 signing keys, §3.3.5.5.3); falls back to the session key otherwise.
+                SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(connection.Dialect, connection.SigningAlgorithmId);
+                Smb2Signer.SignInPlace(alg, s.SigningKeyFor(connection), segSpan, h.MessageId, isServer: true, isCancel: false);
             }
         }
         return writer.ToArray();

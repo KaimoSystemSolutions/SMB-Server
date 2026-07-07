@@ -43,7 +43,6 @@ public sealed partial class Smb2Dispatcher
     {
         SmbOpen open = brk.Holder;
         SmbSession session = open.Session;
-        SmbConnection connection = session.Connection;
 
         var h = new Smb2Header
         {
@@ -57,12 +56,10 @@ public sealed partial class Smb2Dispatcher
         };
 
         byte[] body = OplockBreakMessage.BuildBody(brk.NewLevel, open.PersistentFileId, open.VolatileFileId);
-        byte[] bytes = AssembleResponse([MaybeSigned(session, h, body)]);
 
-        Func<byte[], bool, Task>? sender = connection.SendRawAsync;
-        if (sender is null) return;
-        try { await sender(bytes, ResponseNeedsEncryption(session, open)).ConfigureAwait(false); }
-        catch { /* connection already gone — nothing to do */ }
+        // Failover (M6.3): send on a surviving channel, preferring the session's primary connection.
+        await SendOutOfBandAsync(session, session.Connection, MaybeSigned(session, h, body),
+            ResponseNeedsEncryption(session, open)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -81,7 +78,7 @@ public sealed partial class Smb2Dispatcher
 
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
         OplockBreakMessage.Acknowledgment ack;

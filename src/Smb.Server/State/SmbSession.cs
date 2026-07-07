@@ -57,6 +57,37 @@ public sealed class SmbSession
     public ConcurrentDictionary<ulong, SmbTreeConnect> TreeConnects { get; } = new();
     public ConcurrentDictionary<(ulong Persistent, ulong Volatile), SmbOpen> Opens { get; } = new();
 
+    /// <summary>
+    /// Connections this session is bound to for multichannel (Context §8.1 <c>Session.ChannelList</c>),
+    /// keyed by <see cref="SmbConnection.ConnectionId"/>. The primary channel is registered when the
+    /// session becomes <see cref="SessionState.Valid"/>; a <c>SESSION_SETUP</c> with the binding flag
+    /// adds more. Empty for 2.x sessions (multichannel is 3.x only).
+    /// </summary>
+    public ConcurrentDictionary<Guid, SmbChannel> Channels { get; } = new();
+
+    /// <summary>
+    /// Signing key to use for traffic on <paramref name="connection"/>. Returns the channel's own key
+    /// when the connection is a registered channel (per-channel 3.1.1 keys, §3.3.5.5.3), otherwise the
+    /// session signing key — which covers the single-channel case, 2.x sessions, and the brief window
+    /// before a channel is registered (intermediate binding legs sign with the session key).
+    /// </summary>
+    public byte[] SigningKeyFor(SmbConnection connection)
+        => Channels.TryGetValue(connection.ConnectionId, out SmbChannel? ch) ? ch.SigningKey : SigningKey;
+
+    /// <summary>
+    /// Picks a connected channel to send an out-of-band response on (multichannel failover, M6.3,
+    /// §3.3.5): the <paramref name="preferred"/> channel if it can still send, otherwise any surviving
+    /// channel, else <c>null</c>. The caller signs/frames for the returned connection (per-channel key),
+    /// so selection must happen before assembly.
+    /// </summary>
+    public SmbConnection? SelectSendChannel(SmbConnection? preferred = null)
+    {
+        if (preferred is { SendRawAsync: not null }) return preferred;
+        foreach (SmbChannel ch in Channels.Values)
+            if (ch.Connection.SendRawAsync is not null) return ch.Connection;
+        return null;
+    }
+
     private long _encryptionNonce;
 
     /// <summary>

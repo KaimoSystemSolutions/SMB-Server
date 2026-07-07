@@ -87,11 +87,12 @@ internal static class TestHelpers
     /// <summary>Baut einen SESSION_SETUP-Request (Header + Body) mit gegebenem Token.</summary>
     public static byte[] BuildSessionSetupRequest(ulong messageId, ulong sessionId, byte[] token,
         Smb2HeaderFlags flags = Smb2HeaderFlags.None, byte[]? signingKey = null,
-        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
+        SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac,
+        SessionSetupFlags sessionFlags = SessionSetupFlags.None)
     {
         var body = new GrowableWriter(64);
         body.WriteUInt16(25);                 // StructureSize
-        body.WriteByte(0);                    // Flags
+        body.WriteByte((byte)sessionFlags);   // Flags (0x01 = SMB2_SESSION_FLAG_BINDING)
         body.WriteByte((byte)SmbSecurityMode.SigningEnabled); // SecurityMode
         body.WriteUInt32((uint)Smb2Capabilities.None);        // Capabilities
         body.WriteUInt32(0);                  // Channel
