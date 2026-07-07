@@ -19,6 +19,10 @@ public sealed class NtlmClient
     /// <summary>Available after <see cref="BuildAuthenticate"/>: the GSS session key (for SMB signing/keys).</summary>
     public byte[] ExportedSessionKey { get; private set; } = [];
 
+    // Raw NEGOTIATE/CHALLENGE kept so an optional MIC can be computed over all three messages.
+    private byte[] _negotiate = [];
+    private byte[] _challenge = [];
+
     public NtlmClient(string domain, string user, string password)
     {
         _domain = domain;
@@ -40,16 +44,22 @@ public sealed class NtlmClient
         w.WriteUInt32((uint)flags);
         w.WriteUInt64(0); // DomainNameFields (empty)
         w.WriteUInt64(0); // WorkstationFields (empty)
-        return w.ToArray();
+        _negotiate = w.ToArray();
+        return _negotiate;
     }
 
     /// <summary>
     /// Processes the CHALLENGE and builds the AUTHENTICATE_MESSAGE (Type 3) with an NTLMv2 response.
     /// Sets <see cref="ExportedSessionKey"/> as a side effect.
     /// </summary>
-    public byte[] BuildAuthenticate(ReadOnlySpan<byte> challengeToken)
+    public byte[] BuildAuthenticate(ReadOnlySpan<byte> challengeToken, bool withMic = false)
     {
+        _challenge = challengeToken.ToArray();
         (byte[] serverChallenge, byte[] targetInfo) = ParseChallenge(challengeToken);
+
+        // When adding a MIC, announce it in MsvAvFlags (bit 0x2); the flag is part of the TargetInfo
+        // that feeds the NTProofStr, so it must be set before computing the response.
+        if (withMic) targetInfo = AddMsvAvFlags(targetInfo, 0x00000002);
 
         byte[] ntHash = NtlmCryptography.NtHash(_password);
         byte[] ntowfV2 = NtlmCryptography.NtowfV2(ntHash, _user, _domain);
@@ -82,7 +92,25 @@ public sealed class NtlmClient
         ExportedSessionKey = RandomNumberGenerator.GetBytes(16);
         byte[] encryptedSessionKey = Rc4.Transform(sessionBaseKey, ExportedSessionKey);
 
-        return BuildAuthenticateMessage(ntResponse, encryptedSessionKey);
+        byte[] message = BuildAuthenticateMessage(ntResponse, encryptedSessionKey);
+
+        if (withMic)
+        {
+            // The message currently has a zeroed MIC field (offset 72); compute the MIC over
+            // NEGOTIATE ‖ CHALLENGE ‖ this message and patch it in place.
+            byte[] mic = NtlmCryptography.ComputeMic(ExportedSessionKey, _negotiate, _challenge, message);
+            mic.CopyTo(message, 72);
+        }
+        return message;
+    }
+
+    /// <summary>Adds/replaces the <c>MsvAvFlags</c> AV pair in a TargetInfo blob (re-encoded with EOL).</summary>
+    private static byte[] AddMsvAvFlags(byte[] targetInfo, uint flags)
+    {
+        List<NtlmAvPair> pairs = NtlmAvPairs.Decode(targetInfo);
+        pairs.RemoveAll(p => p.Id == NtlmAvId.Flags);
+        pairs.Add(new NtlmAvPair(NtlmAvId.Flags, BitConverter.GetBytes(flags)));
+        return NtlmAvPairs.Encode(pairs);
     }
 
     private byte[] BuildAuthenticateMessage(byte[] ntResponse, byte[] encryptedSessionKey)

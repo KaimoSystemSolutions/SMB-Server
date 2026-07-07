@@ -30,7 +30,8 @@ internal static class TestHelpers
         IReadOnlyList<SmbDialect> dialects,
         SmbSecurityMode securityMode = SmbSecurityMode.SigningEnabled,
         IReadOnlyList<SmbCipherId>? ciphers = null,
-        IReadOnlyList<SmbSigningAlgorithmId>? signingAlgs = null)
+        IReadOnlyList<SmbSigningAlgorithmId>? signingAlgs = null,
+        bool includePreauthContext = true)
     {
         bool with311 = dialects.Contains(SmbDialect.Smb311);
         var body = new GrowableWriter(128);
@@ -52,11 +53,12 @@ internal static class TestHelpers
         var contexts = new List<NegotiateContext>();
         if (with311)
         {
-            contexts.Add(new PreauthIntegrityContext
-            {
-                HashAlgorithms = [PreauthHashAlgorithm.Sha512],
-                Salt = new byte[32],
-            });
+            if (includePreauthContext)
+                contexts.Add(new PreauthIntegrityContext
+                {
+                    HashAlgorithms = [PreauthHashAlgorithm.Sha512],
+                    Salt = new byte[32],
+                });
             if (ciphers is not null)
                 contexts.Add(new EncryptionContext { Ciphers = ciphers });
             if (signingAlgs is not null)

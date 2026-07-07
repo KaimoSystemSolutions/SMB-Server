@@ -312,6 +312,14 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.InvalidParameter); // only one NEGOTIATE per connection.
 
         NegotiateRequest request = NegotiateRequest.Parse(segment, Smb2Header.Size);
+
+        // [AUDIT-2026-06] O3: a client offering SMB 3.1.1 MUST send a PreauthIntegrityCapabilities
+        // context advertising a hash algorithm the server supports (SHA-512); otherwise the negotiate
+        // is malformed and MUST be rejected (§3.3.5.4). Without this the preauth-integrity hash would
+        // have no agreed algorithm.
+        if (request.OffersSmb311 && !HasSupportedPreauthContext(request))
+            return BuildError(header, NtStatus.InvalidParameter);
+
         byte[] securityBuffer = _server.Options.SpnegoNegotiator!.CreateInitialServerToken();
 
         NegotiateResponse response = NegotiateProcessor.BuildResponse(connection, request, _server.Options, securityBuffer);
@@ -336,10 +344,29 @@ public sealed partial class Smb2Dispatcher
         return ResponseSegment.Unsigned(respHeader, body);
     }
 
+    /// <summary>
+    /// [AUDIT-2026-06] O3: true if the request carries a PreauthIntegrityCapabilities context that
+    /// lists a hash algorithm the server supports (SHA-512). Required when SMB 3.1.1 is offered.
+    /// </summary>
+    private static bool HasSupportedPreauthContext(NegotiateRequest request)
+    {
+        foreach (NegotiateContext ctx in request.NegotiateContexts)
+            if (ctx is PreauthIntegrityContext preauth
+                && preauth.HashAlgorithms.Contains(PreauthHashAlgorithm.Sha512))
+                return true;
+        return false;
+    }
+
     // --- SESSION_SETUP (Context §8) ---
 
     private ResponseSegment HandleSessionSetup(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
     {
+        // [AUDIT-2026-06] O4: SESSION_SETUP is only valid once NEGOTIATE has completed (§3.3.5.5.1).
+        // Before that the connection has no negotiated dialect/security state, so reject instead of
+        // acting on an undefined state.
+        if (!connection.NegotiateDone)
+            return BuildError(header, NtStatus.InvalidParameter);
+
         SessionSetupRequest request = SessionSetupRequest.Parse(segment, Smb2Header.Size);
         bool is311 = connection.Dialect == SmbDialect.Smb311;
 

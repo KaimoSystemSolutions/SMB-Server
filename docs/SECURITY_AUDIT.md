@@ -160,17 +160,44 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # the fix regression tes
 - `combinedLen <= 4096 ? new byte[combinedLen] : new byte[combinedLen]` (identical branches) →
   simplified. Purely cosmetic. File: `PreauthIntegrityHash.cs`.
 
+### O1 — NTLM MIC not verified (fixed 2026-07-07, Phase 2 / M2.3)
+- **Risk:** Without MIC verification, a MITM could tamper with the NTLM NEGOTIATE flags (a downgrade)
+  undetected — `NtlmCryptography.ComputeMic` existed but was never called server-side.
+- **Fix:** `NtlmServerMechanism` retains the raw NEGOTIATE and CHALLENGE messages and, in
+  `HandleAuthenticate`, recomputes MIC = `HMAC_MD5(ExportedSessionKey, NEGOTIATE ‖ CHALLENGE ‖
+  AUTHENTICATE-with-zero-MIC)` and compares it in constant time (`FixedTimeEquals`). Verified whenever
+  the client announces a MIC via `MsvAvFlags` (bit 0x2); unconditionally when the new
+  `NtlmServerOptions.RequireMessageIntegrity` is set. A present-but-invalid MIC is always rejected.
+- **Files:** `NtlmServerMechanism.cs` (`_negotiateMessage`/`_challengeMessage`, `ClientAnnouncedMic`,
+  `VerifyMic`, `RequireMessageIntegrity`), `NtlmClient.cs` (optional MIC generation for tests).
+- **Re-verification:** `NtlmMicTests` (valid accepted, tampered MIC rejected, tampered negotiate flags
+  detected, strict-mode accept/reject, compat without MIC).
+
+### O3 — 3.1.1 NEGOTIATE preauth context not validated (fixed 2026-07-07, Phase 2 / M2.3)
+- **Risk:** §3.3.5.4 requires a client offering SMB 3.1.1 to send a PreauthIntegrityCapabilities
+  context; without it the preauth-integrity hash has no agreed algorithm.
+- **Fix:** `Smb2Dispatcher.HandleNegotiate` rejects a 3.1.1-offering request lacking a PreauthIntegrity
+  context that lists SHA-512 with `STATUS_INVALID_PARAMETER` (`HasSupportedPreauthContext`).
+- **Files:** `Smb2Dispatcher.cs`.
+- **Re-verification:** `AuthHardeningTests.Negotiate311_WithoutPreauthContext_IsRejected` (+ 3.0 unaffected).
+
+### O4 — SESSION_SETUP before NEGOTIATE not rejected (fixed 2026-07-07, Phase 2 / M2.3)
+- **Risk:** Acting on a SESSION_SETUP before a dialect/security state exists is undefined behavior.
+- **Fix:** `HandleSessionSetup` rejects with `STATUS_INVALID_PARAMETER` when `connection.NegotiateDone`
+  is false.
+- **Files:** `Smb2Dispatcher.cs`.
+- **Re-verification:** `AuthHardeningTests.SessionSetup_BeforeNegotiate_IsRejected`.
+
 ---
 
 ## Open (deliberately deferred — review when convenient)
 
 | ID | Topic | Risk | Recommendation |
 |----|-------|------|----------------|
-| **O1** | **NTLM MIC not verified** (`NtlmCryptography.ComputeMic` exists, never called server-side) | No NTLM downgrade protection (manipulation of NEGOTIATE flags undetected) | Verify MIC in `NtlmServerMechanism.HandleAuthenticate` against the three messages, if `MsvAvFlags` announces it. Was already noted as open in the README. |
-| **O3** | **3.1.1 NEGOTIATE** does not validate whether the client sent a PreauthIntegrity context (with SHA-512) | §3.3.5.4 requires failure otherwise | Check presence + algorithm, otherwise `INVALID_PARAMETER`. |
-| **O4** | **SESSION_SETUP before NEGOTIATE** is not rejected | Robustness / undefined state | Check `connection.NegotiateDone` in `HandleSessionSetup`. |
 | **O6** | **Credit accounting** is a constant window size, not exact set-based extension (see H2) | Low precision vs. spec; non-critical for single-connection | Bitmap-exact sequence window + dynamic credit extension. |
 | **O7** | **No direct test** of AEAD nonce monotonicity (see M1) | Test gap | Make nonce counter checkable via a test-visible interface. |
+
+> **O1, O3, O4 fixed 2026-07-07** (Phase 2 / M2.3) — see the *Fixed* section above.
 
 ---
 

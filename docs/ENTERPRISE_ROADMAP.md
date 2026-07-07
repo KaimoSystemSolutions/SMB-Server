@@ -167,14 +167,22 @@ dependency (behind `ILdapSearcher`); consumers who want the real network binding
 > single `SMB-Server` package (that would force `System.DirectoryServices.Protocols` on everyone). To
 > ship it to external consumers it needs its own NuGet package (or the consumer references the source).
 
-### M2.3 — NTLM hardening (deferred audit items)
+### M2.3 — NTLM hardening (deferred audit items) ✅
 
-- [ ] Implement NTLM MIC verification (audit item O1) to prevent negotiate flag
-      downgrade attacks.
-- [ ] Validate `PreauthIntegrityCapabilities` presence in 3.1.1 negotiate (O3).
-- [ ] Reject `SESSION_SETUP` before `NEGOTIATE` completes (O4).
-- [ ] Tests: MIC tampering rejected, missing preauth context rejected, out-of-order
-      SESSION_SETUP rejected.
+- [x] **O1** — NTLM MIC verification (downgrade protection, MS-NLMP §3.2.5.1.2): `NtlmServerMechanism`
+      keeps the raw NEGOTIATE/CHALLENGE and recomputes the MIC over NEGOTIATE ‖ CHALLENGE ‖
+      AUTHENTICATE-with-zero-MIC under the ExportedSessionKey, comparing it in constant time. Verified
+      whenever the client announces a MIC via `MsvAvFlags` (bit 0x2), or unconditionally when the new
+      `NtlmServerOptions.RequireMessageIntegrity` is set. `NtlmClient` gained optional MIC generation
+      for the tests. *(done)*
+- [x] **O3** — validate `PreauthIntegrityCapabilities` presence in 3.1.1 negotiate: a client offering
+      SMB 3.1.1 without a preauth context (SHA-512) is rejected with `STATUS_INVALID_PARAMETER`
+      (`Smb2Dispatcher.HandleNegotiate` + `HasSupportedPreauthContext`). *(done)*
+- [x] **O4** — reject `SESSION_SETUP` before `NEGOTIATE` completes: guarded on `connection.NegotiateDone`
+      in `HandleSessionSetup`. *(done)*
+- [x] Tests: `NtlmMicTests` (6 — valid/tampered MIC, tampered negotiate flags detected, strict mode
+      accept/reject, compat without MIC) + `AuthHardeningTests` (5 — O3/O4). All three audit items now
+      marked fixed in `docs/SECURITY_AUDIT.md`.
 
 **Estimated scope:** ~1,500 LOC production + ~500 LOC tests.
 
@@ -548,6 +556,7 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 1 / M1.3 | Complete | Directory leases: `LeaseHolder.IsDirectory` tracking, `ILeaseManager.BreakDirectoryLease` + dispatcher `BreakParentDirectoryLease`, hooked into CREATE (add), CLOSE/DeleteOnClose (remove) and SET_INFO rename; RH→R downgrade + epoch bump + out-of-band LEASE_BREAK. `SmbOpen.DeleteOnClose` now kept in sync. 5 dispatcher tests (`DirectoryLeaseTests.cs`), full suite 187 green. |
 | 2026-07-07 | Phase 2 / M2.1 | Complete (platform binding = user seam) | Composable `SpnegoNegotiator` (ordered `IGssMechanismFactory` list, mech selection + SPNEGO wrap/unwrap, raw-NTLM path); `NtlmSpnegoNegotiator` now delegates to it. `KerberosServerMechanism` + `KerberosGssToken` framing delegating ticket crypto to injectable `IKerberosTicketValidator`; `Kerberos`/`NtlmMechanismFactory`, `DelegatingKerberosTicketValidator`. SPNEGO parser gained `SupportedMech`; added `SpnegoTokens.CreateNegTokenInit`. 11 tests (`Phase2AuthTests.cs`), full suite 198 green. |
 | 2026-07-07 | Phase 2 / M2.2 | Complete | LDAP/AD identity backend, built in 5 tested increments. Core (dependency-free, in `Smb.Auth/Ldap/`): `SidConverter`, `ILdapSearcher`/`LdapEntry`, `LdapIdentityBackendOptions`, `LdapIdentityBackend` (`Resolve`→SID/UPN/tokenGroups, `ISidResolver` reverse lookup, `TtlCache`), `LdapFilter`; `SecurityIdentity.UserPrincipalName` added. Opt-in binding: `Smb.Auth.DirectoryServices` (`DirectoryServicesLdapSearcher` over `System.DirectoryServices.Protocols`). 30 tests (SidConverter 17, backend 9, searcher 4), full suite 228 green. |
+| 2026-07-07 | Phase 2 / M2.3 | Complete | NTLM/negotiate hardening (audit O1/O3/O4). O1: NTLM MIC verification in `NtlmServerMechanism` (raw NEGOTIATE/CHALLENGE kept, MIC recomputed + constant-time compared; conditional on `MsvAvFlags`, unconditional under new `NtlmServerOptions.RequireMessageIntegrity`); `NtlmClient` MIC generation for tests. O3: 3.1.1 negotiate without a SHA-512 PreauthIntegrity context → `INVALID_PARAMETER`. O4: `SESSION_SETUP` before `NEGOTIATE` → `INVALID_PARAMETER`. 11 tests (`NtlmMicTests` 6, `AuthHardeningTests` 5), full suite 239 green. **Phase 2 complete.** |
 | | Phase 2 / M2.2 | Not started | |
 | | Phase 2 / M2.3 | Not started | |
 | | Phase 3 / M3.1 | Not started | |

@@ -12,6 +12,14 @@ public sealed class NtlmServerOptions
     public string NetbiosComputerName { get; set; } = Environment.MachineName.ToUpperInvariant();
     public string DnsDomainName { get; set; } = "workgroup";
     public string DnsComputerName { get; set; } = Environment.MachineName.ToLowerInvariant();
+
+    /// <summary>
+    /// [AUDIT-2026-06] O1: when true, an AUTHENTICATE_MESSAGE <b>must</b> carry a valid MIC — a client
+    /// that does not announce/provide one is rejected. When false (default, for compatibility with
+    /// older clients), the MIC is verified only when the client announces it via <c>MsvAvFlags</c>.
+    /// Either way, a present-but-invalid MIC is always rejected (downgrade protection, MS-NLMP §3.2.5.1.2).
+    /// </summary>
+    public bool RequireMessageIntegrity { get; set; }
 }
 
 /// <summary>
@@ -28,6 +36,11 @@ public sealed class NtlmServerMechanism : IGssMechanism
     private readonly NtlmServerOptions _options;
     private Stage _stage = Stage.ExpectNegotiate;
     private byte[] _serverChallenge = [];
+
+    // Raw NEGOTIATE and CHALLENGE messages, kept for the O1 MIC check
+    // (MIC = HMAC_MD5(ExportedSessionKey, NEGOTIATE ‖ CHALLENGE ‖ AUTHENTICATE-with-zero-MIC)).
+    private byte[] _negotiateMessage = [];
+    private byte[] _challengeMessage = [];
 
     public NtlmServerMechanism(IIdentityBackend backend, NtlmServerOptions options)
     {
@@ -50,7 +63,8 @@ public sealed class NtlmServerMechanism : IGssMechanism
 
     private GssResult HandleNegotiate(ReadOnlySpan<byte> inToken)
     {
-        // (The NEGOTIATE_MESSAGE is only read for its flags; its content is otherwise not needed.)
+        // Keep the raw NEGOTIATE_MESSAGE for the MIC computation (O1).
+        _negotiateMessage = inToken.ToArray();
         _serverChallenge = RandomNumberGenerator.GetBytes(8);
 
         byte[] targetInfo = NtlmAvPairs.Encode(
@@ -75,7 +89,8 @@ public sealed class NtlmServerMechanism : IGssMechanism
         };
 
         _stage = Stage.ExpectAuthenticate;
-        return GssResult.Continue(challenge.ToArray());
+        _challengeMessage = challenge.ToArray();
+        return GssResult.Continue(_challengeMessage);
     }
 
     private GssResult HandleAuthenticate(ReadOnlySpan<byte> inToken)
@@ -105,10 +120,53 @@ public sealed class NtlmServerMechanism : IGssMechanism
         byte[] exportedSessionKey = NtlmCryptography.ExportedSessionKey(
             sessionBaseKey, keyExch, auth.EncryptedRandomSessionKey);
 
+        // [AUDIT-2026-06] O1: MIC verification (downgrade protection). Verify when the client announced
+        // a MIC via MsvAvFlags, or unconditionally in strict mode. A present-but-wrong MIC is rejected.
+        bool micAnnounced = ClientAnnouncedMic(auth.ClientChallengeBlob);
+        if (micAnnounced || _options.RequireMessageIntegrity)
+        {
+            if (!micAnnounced)
+                return GssResult.Failed(NtStatus.LogonFailure); // strict mode: MIC required but absent
+            if (!VerifyMic(exportedSessionKey, inToken, auth.Mic))
+                return GssResult.Failed(NtStatus.LogonFailure);
+        }
+
         SecurityIdentity identity;
         try { identity = _backend.Resolve(auth.DomainName, auth.UserName); }
         catch (KeyNotFoundException) { return GssResult.Failed(NtStatus.LogonFailure); }
 
         return GssResult.Succeeded(exportedSessionKey, identity);
+    }
+
+    /// <summary>
+    /// True if the client set the <c>MIC provided</c> bit (0x2) in its <c>MsvAvFlags</c> AV pair, which
+    /// lives in the NTLMv2 client challenge ("temp") starting at offset 28 (after RespType/Reserved/
+    /// Timestamp/ClientChallenge/Reserved), MS-NLMP §2.2.2.7/§3.1.5.1.2.
+    /// </summary>
+    private static bool ClientAnnouncedMic(ReadOnlySpan<byte> clientChallengeBlob)
+    {
+        const int avPairsOffset = 28;
+        if (clientChallengeBlob.Length <= avPairsOffset) return false;
+        foreach (NtlmAvPair pair in NtlmAvPairs.Decode(clientChallengeBlob[avPairsOffset..]))
+            if (pair.Id == NtlmAvId.Flags && pair.Value.Length >= 4)
+                return (BitConverter.ToUInt32(pair.Value, 0) & 0x2) != 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Recomputes the MIC over NEGOTIATE ‖ CHALLENGE ‖ AUTHENTICATE (with the 16-byte MIC field at
+    /// offset 72 zeroed) and compares it in constant time with the one the client sent.
+    /// </summary>
+    private bool VerifyMic(byte[] exportedSessionKey, ReadOnlySpan<byte> authenticateMessage, byte[] receivedMic)
+    {
+        const int micOffset = 72;
+        if (_negotiateMessage.Length == 0 || _challengeMessage.Length == 0) return false;
+        if (authenticateMessage.Length < micOffset + 16) return false;
+
+        byte[] withZeroMic = authenticateMessage.ToArray();
+        Array.Clear(withZeroMic, micOffset, 16);
+        byte[] expected = NtlmCryptography.ComputeMic(
+            exportedSessionKey, _negotiateMessage, _challengeMessage, withZeroMic);
+        return CryptographicOperations.FixedTimeEquals(expected, receivedMic);
     }
 }
