@@ -58,13 +58,40 @@ public sealed class LocalFileStore : SyncFileStore
 
         // Directory open/create — no file stream is held.
         if (directoryRequired || (exists && isDir))
-            return CreateDirectoryHandle(full, relative, disposition, exists, out createAction);
+        {
+            FileStoreResult<IFileHandle> dir = CreateDirectoryHandle(full, relative, disposition, exists, out createAction);
+            if (dir.IsSuccess && createAction == CreateOutcome.Created)
+                ApplyInheritedSecurity(full, isDirectory: true);
+            return dir;
+        }
 
         // Regular file: open ONE persistent OS handle for the lifetime of the SMB open (instead of
         // re-opening per READ/WRITE — O5). FileShare here is permissive; cross-open sharing semantics
         // (CREATE ShareAccess) are enforced server-side by the IShareModeManager, which also works on
         // Unix where OS FileShare is advisory only.
-        return CreateFileHandle(full, relative, access, disposition, exists, out createAction);
+        FileStoreResult<IFileHandle> file = CreateFileHandle(full, relative, access, disposition, exists, out createAction);
+        if (file.IsSuccess && createAction == CreateOutcome.Created)
+            ApplyInheritedSecurity(full, isDirectory: false);
+        return file;
+    }
+
+    /// <summary>
+    /// [M3.3] On creating a new entry, inherit the parent directory's inheritable ACEs (MS-DTYP
+    /// §2.5.3.4) into a stored descriptor for the child. Applied only when the parent has an explicit
+    /// descriptor — a share that never sets an ACL keeps the permissive default for new files, so the
+    /// prior behavior is unchanged.
+    /// </summary>
+    private void ApplyInheritedSecurity(string childFull, bool isDirectory)
+    {
+        string? parent = Path.GetDirectoryName(childFull);
+        if (parent is null)
+            return;
+        SecurityDescriptor? parentSd = _securityStore.TryGet(parent);
+        if (parentSd is null)
+            return;
+        SecurityDescriptor? inherited = AclInheritance.ComputeInherited(parentSd, isDirectory);
+        if (inherited is not null)
+            _securityStore.Set(childFull, inherited);
     }
 
     private FileStoreResult<IFileHandle> CreateDirectoryHandle(

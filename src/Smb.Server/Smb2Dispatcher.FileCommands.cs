@@ -1,3 +1,4 @@
+using Smb.Auth;
 using Smb.FileSystem;
 using Smb.FileSystem.Versioning;
 using Smb.Protocol.Enums;
@@ -114,6 +115,31 @@ public sealed partial class Smb2Dispatcher
         IFileHandle handle = result.Value.Handle;
         CreateOutcome outcome = result.Value.Action;
         open.LocalOpen = handle;
+
+        // [M3.3] Per-file DACL enforcement (MS-DTYP §2.5.3.2): evaluate the file's security descriptor
+        // against the caller's SIDs and cap the granted access to what the DACL permits. On a backend
+        // that carries no descriptors (GetSecurityAsync → NotSupported) only the share-level check above
+        // applies. Runs after the open so we have the handle, but before any observable side effect from
+        // DeleteOnClose; on denial the open is rolled back cleanly (§3.3.5.9).
+        FileStoreResult<SecurityDescriptor> sd = await store.GetSecurityAsync(handle).ConfigureAwait(false);
+        if (sd.IsSuccess)
+        {
+            IReadOnlyList<Sid> callerSids = BuildCallerSids(session.Identity);
+            uint desired = maximumAllowed ? MaximumAllowed : AccessMask.MapGenericToSpecific(request.DesiredAccess);
+            if (!AccessCheck.IsGranted(sd.Value!, callerSids, desired, out uint daclGranted))
+            {
+                await handle.DisposeAsync().ConfigureAwait(false);
+                _server.Options.ShareModeManager.Close(shareKey, open);
+                return BuildError(header, NtStatus.AccessDenied);
+            }
+            grantedAccess = daclGranted;
+        }
+        else
+        {
+            grantedAccess = AccessMask.MapGenericToSpecific(grantedAccess);
+        }
+        open.GrantedAccess = grantedAccess; // specific-rights mask, enforced per-operation below
+
         if (request.Options.HasFlag(CreateOptions.DeleteOnClose))
         {
             // DELETE_ON_CLOSE may require the Delete permission (enforced by the backend). Honor a
@@ -341,6 +367,10 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err) || open.LocalOpen is null)
             return BuildError(header, err == NtStatus.Success ? NtStatus.FileClosed : err);
 
+        // [M3.3] The handle must have been granted FILE_READ_DATA at open (DACL access check).
+        if ((open.GrantedAccess & AccessMask.FileReadData) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
+
         uint length = Math.Min(req.Length, connection.MaxReadSize);
         if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, length, forWrite: false))
             return BuildError(header, NtStatus.FileLockConflict);
@@ -375,6 +405,10 @@ public sealed partial class Smb2Dispatcher
 
         if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err) || open.LocalOpen is null)
             return BuildError(header, err == NtStatus.Success ? NtStatus.FileClosed : err);
+
+        // [M3.3] The handle must have been granted FILE_WRITE_DATA / FILE_APPEND_DATA at open.
+        if ((open.GrantedAccess & AccessMask.WriteAccess) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
 
         if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, (ulong)req.Data.Length, forWrite: true))
             return BuildError(header, NtStatus.FileLockConflict);
@@ -490,6 +524,20 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.NotSupported);
 
         var infoClass = (FileInformationClass)req.FileInfoClass;
+
+        // [M3.3] Enforce the handle's granted access for state-changing SET_INFO classes: truncation is a
+        // write, delete-disposition and rename both require DELETE. Other classes (times/attributes) are
+        // accepted no-ops and are not gated here.
+        uint requiredAccess = infoClass switch
+        {
+            FileInformationClass.FileEndOfFileInformation => AccessMask.FileWriteData,
+            FileInformationClass.FileDispositionInformation => AccessMask.Delete,
+            FileInformationClass.FileRenameInformation => AccessMask.Delete,
+            _ => 0u,
+        };
+        if (requiredAccess != 0 && (open.GrantedAccess & requiredAccess) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
+
         // The physical path before a rename (its parent dir loses the entry); captured up front because
         // the handle relocates in place during the rename (directory leasing, M1.3).
         string? renameOldPhysicalPath = infoClass == FileInformationClass.FileRenameInformation
@@ -641,6 +689,26 @@ public sealed partial class Smb2Dispatcher
         if ((desiredAccess & (Delete | GenericAll)) != 0)
             intent |= FileAccessIntent.Delete;
         return intent;
+    }
+
+    /// <summary>
+    /// Builds the caller's SID set for a DACL access check (M3.3): the primary user SID, all group SIDs
+    /// and the well-known Everyone group; an authenticated (non-anonymous) caller additionally carries
+    /// Authenticated Users. Unparseable SID strings are skipped rather than failing the whole check.
+    /// </summary>
+    private static IReadOnlyList<Sid> BuildCallerSids(SecurityIdentity? identity)
+    {
+        var sids = new List<Sid> { WellKnownSids.Everyone };
+        if (identity is null || identity.IsAnonymous)
+            return sids;
+
+        sids.Add(WellKnownSids.AuthenticatedUsers);
+        if (Sid.TryParse(identity.UserSid, out Sid user))
+            sids.Add(user);
+        foreach (string group in identity.GroupSids)
+            if (Sid.TryParse(group, out Sid g))
+                sids.Add(g);
+        return sids;
     }
 
     private static FileShareMode MapShare(uint shareAccess)

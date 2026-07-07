@@ -232,16 +232,35 @@ Built in small tested increments in `src/Smb.Protocol/Security/` (the wire/data 
 > **Modularity:** the actual OS-ACL mapping (NTFS / POSIX) is the `ISecurityDescriptorStore`
 > implementation the user supplies; the core stays dependency-free and cross-platform.
 
-### M3.3 — Access check enforcement
+### M3.3 — Access check enforcement ✅
 
-- [ ] On CREATE, evaluate the file's DACL against the authenticated user's SIDs
-      (primary + group) to determine the effective `MaximalAccess`.
-- [ ] Enforce access mask on READ, WRITE, DELETE, SET_INFO operations.
-- [ ] Inheritance: new files/directories inherit ACEs from parent directory.
-- [ ] Tests: user with read-only ACE cannot write, inherited ACEs apply, deny ACE
-      overrides allow ACE.
+- [x] On CREATE, evaluate the file's DACL against the authenticated user's SIDs (primary + group +
+      Everyone / Authenticated Users) to determine the effective access. The granted mask is capped to
+      what the DACL permits and stored on the open (`Smb2Dispatcher.HandleCreateAsync` → `AccessCheck`,
+      `BuildCallerSids`). Generic bits in `DesiredAccess` are mapped to specific file rights first
+      (`AccessMask.MapGenericToSpecific`, MS-DTYP §2.5.3.2). A denial rolls the open back with no side
+      effects. On a backend whose `GetSecurityAsync` is `NotSupported` only share-level authorization
+      applies (unchanged), so non-ACL backends are unaffected.
+- [x] Enforce the granted access per operation: READ needs `FILE_READ_DATA`, WRITE needs
+      `FILE_WRITE_DATA`/`FILE_APPEND_DATA`, SET_INFO delete-disposition and rename need `DELETE`,
+      end-of-file (truncate) needs `FILE_WRITE_DATA` (`Smb2Dispatcher.FileCommands.cs`). `SmbOpen.GrantedAccess`
+      is now the authoritative specific-rights mask (previously write-only).
+- [x] Inheritance: a newly created file/directory inherits the parent directory's inheritable ACEs
+      (`AclInheritance.ComputeInherited`, MS-DTYP §2.5.3.4 — ObjectInherit/ContainerInherit,
+      InheritOnly/NoPropagate, `Inherited` flag). Wired into `LocalFileStore` on `CreateOutcome.Created`;
+      only applied when the parent carries an explicit descriptor, so shares that never set an ACL keep
+      the permissive default for new files.
+- [x] Tests: `AclInheritanceTests` (7 — the pure inheritance algorithm) + `AccessEnforcementTests`
+      (5 — read-only DACL denies a write open, per-operation READ/WRITE enforcement via MAXIMUM_ALLOWED,
+      deny-ACE overrides allow, delete-disposition needs DELETE, new file inherits the parent ACE). Full
+      suite 287 green.
 
-**Estimated scope:** ~2,000 LOC production + ~800 LOC tests.
+> **Modularity:** the pure evaluator (`AccessCheck`) and inheritance (`AclInheritance`) live in
+> `Smb.Protocol.Security` (dependency-free); enforcement is in the dispatcher; the ACL *storage* remains
+> the `ISecurityDescriptorStore` seam a deployment maps onto real NTFS/POSIX ACLs. **Phase 3 complete.**
+
+**Estimated scope:** ~2,000 LOC production + ~800 LOC tests. *(Actual: ~120 LOC production + ~260 LOC
+tests — the `AccessCheck` evaluator and SD model were already in place from M3.1.)*
 
 ---
 
@@ -577,11 +596,9 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 2 / M2.1 | Complete (platform binding = user seam) | Composable `SpnegoNegotiator` (ordered `IGssMechanismFactory` list, mech selection + SPNEGO wrap/unwrap, raw-NTLM path); `NtlmSpnegoNegotiator` now delegates to it. `KerberosServerMechanism` + `KerberosGssToken` framing delegating ticket crypto to injectable `IKerberosTicketValidator`; `Kerberos`/`NtlmMechanismFactory`, `DelegatingKerberosTicketValidator`. SPNEGO parser gained `SupportedMech`; added `SpnegoTokens.CreateNegTokenInit`. 11 tests (`Phase2AuthTests.cs`), full suite 198 green. |
 | 2026-07-07 | Phase 2 / M2.2 | Complete | LDAP/AD identity backend, built in 5 tested increments. Core (dependency-free, in `Smb.Auth/Ldap/`): `SidConverter`, `ILdapSearcher`/`LdapEntry`, `LdapIdentityBackendOptions`, `LdapIdentityBackend` (`Resolve`→SID/UPN/tokenGroups, `ISidResolver` reverse lookup, `TtlCache`), `LdapFilter`; `SecurityIdentity.UserPrincipalName` added. Opt-in binding: `Smb.Auth.DirectoryServices` (`DirectoryServicesLdapSearcher` over `System.DirectoryServices.Protocols`). 30 tests (SidConverter 17, backend 9, searcher 4), full suite 228 green. |
 | 2026-07-07 | Phase 2 / M2.3 | Complete | NTLM/negotiate hardening (audit O1/O3/O4). O1: NTLM MIC verification in `NtlmServerMechanism` (raw NEGOTIATE/CHALLENGE kept, MIC recomputed + constant-time compared; conditional on `MsvAvFlags`, unconditional under new `NtlmServerOptions.RequireMessageIntegrity`); `NtlmClient` MIC generation for tests. O3: 3.1.1 negotiate without a SHA-512 PreauthIntegrity context → `INVALID_PARAMETER`. O4: `SESSION_SETUP` before `NEGOTIATE` → `INVALID_PARAMETER`. 11 tests (`NtlmMicTests` 6, `AuthHardeningTests` 5), full suite 239 green. **Phase 2 complete.** |
-| | Phase 2 / M2.2 | Not started | |
-| | Phase 2 / M2.3 | Not started | |
-| | Phase 3 / M3.1 | Not started | |
-| | Phase 3 / M3.2 | Not started | |
-| | Phase 3 / M3.3 | Not started | |
+| 2026-07-07 | Phase 3 / M3.1 | Complete | Security-descriptor model in `Smb.Protocol.Security`: `Sid`, `Ace`/`Acl`, self-relative `SecurityDescriptor`, `WellKnownSids`, plus the pure `AccessCheck` evaluator (MS-DTYP §2.5.3.2). 25+ tests. |
+| 2026-07-07 | Phase 3 / M3.2 | Complete | QUERY/SET_SECURITY over the dispatcher; `IFileStore.Get/SetSecurityAsync` (default NotSupported), `LocalFileStore` via the pluggable `ISecurityDescriptorStore` (default in-memory, permissive fallback). 3 dispatcher tests, suite 267 green. |
+| 2026-07-07 | Phase 3 / M3.3 | Complete | Access-check enforcement. CREATE evaluates the file DACL against the caller's SIDs (generic→specific mapping via `AccessMask.MapGenericToSpecific`), caps `SmbOpen.GrantedAccess`, rolls back on denial; NotSupported backends fall back to share-level only. Per-op enforcement on READ (`FILE_READ_DATA`), WRITE (`WRITE`/`APPEND`), SET_INFO delete/rename (`DELETE`) and EOF (`FILE_WRITE_DATA`). ACE inheritance for new entries (`AclInheritance.ComputeInherited`) wired into `LocalFileStore`. 12 tests (`AclInheritanceTests` 7, `AccessEnforcementTests` 5), full suite 287 green. **Phase 3 complete.** |
 | | Phase 4 / M4.1 | Not started | |
 | | Phase 4 / M4.2 | Not started | |
 | | Phase 4 / M4.3 | Not started | |

@@ -31,4 +31,32 @@ public static class AccessMask
 
     /// <summary>Any bit that lets a caller modify file content (write or append).</summary>
     public const uint WriteAccess = FileWriteData | FileAppendData;
+
+    // Per-object generic mapping for files (MS-DTYP §2.4.4.1 / winnt.h FILE_GENERIC_*). A DACL is
+    // written with specific rights, so a DesiredAccess/ACE that carries a generic bit must be mapped
+    // to the equivalent specific rights before the access check (MS-DTYP §2.5.3.2 step 2).
+    public const uint FileGenericRead = ReadControl | FileReadData | FileReadAttributes | FileReadEa | Synchronize;
+    public const uint FileGenericWrite = ReadControl | FileWriteData | FileWriteAttributes | FileWriteEa | FileAppendData | Synchronize;
+    public const uint FileGenericExecute = ReadControl | FileReadAttributes | FileExecute | Synchronize;
+
+    /// <summary>FILE_ALL_ACCESS (0x001F01FF) — every specific/standard right a file grants.</summary>
+    public const uint FileAllAccess =
+        FileReadData | FileWriteData | FileAppendData | FileReadEa | FileWriteEa | FileExecute |
+        FileDeleteChild | FileReadAttributes | FileWriteAttributes |
+        Delete | ReadControl | WriteDac | WriteOwner | Synchronize;
+
+    /// <summary>
+    /// Replaces the generic bits (<see cref="GenericRead"/>/<c>Write</c>/<c>Execute</c>/<c>All</c>) of
+    /// <paramref name="mask"/> with the equivalent specific file rights, leaving all other bits
+    /// (including <see cref="MaximumAllowed"/>) untouched. Idempotent for masks that carry no generic bits.
+    /// </summary>
+    public static uint MapGenericToSpecific(uint mask)
+    {
+        uint result = mask & ~(GenericRead | GenericWrite | GenericExecute | GenericAll);
+        if ((mask & GenericRead) != 0) result |= FileGenericRead;
+        if ((mask & GenericWrite) != 0) result |= FileGenericWrite;
+        if ((mask & GenericExecute) != 0) result |= FileGenericExecute;
+        if ((mask & GenericAll) != 0) result |= FileAllAccess;
+        return result;
+    }
 }
