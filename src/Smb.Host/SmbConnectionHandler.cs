@@ -95,10 +95,15 @@ internal sealed class SmbConnectionHandler
                 //    Empty response = nothing to send (e.g. CANCEL).
                 await DrainInflightAsync().ConfigureAwait(false);
                 byte[] response = await _dispatcher.ProcessMessageAsync(connection, message, transportEncrypted).ConfigureAwait(false);
-                if (response.Length == 0) continue;
 
                 // 6. Encrypt (if needed), NBSS-frame, write back in serialized fashion.
-                await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct);
+                //    Empty response = nothing to send (e.g. CANCEL).
+                if (response.Length != 0)
+                    await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct);
+
+                // [M5.3] A failed FSCTL_VALIDATE_NEGOTIATE_INFO (downgrade attack) requires the
+                // transport connection to be torn down (§3.3.5.15.12).
+                if (connection.MustTerminate) break;
             }
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or SocketException)

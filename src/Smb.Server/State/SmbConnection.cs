@@ -21,6 +21,13 @@ public sealed class SmbConnection
 
     public bool NegotiateDone { get; set; }
 
+    /// <summary>
+    /// Set by the dispatcher when the protocol demands the transport connection be torn down
+    /// (Context §3.3.5.15.12): e.g. a failed FSCTL_VALIDATE_NEGOTIATE_INFO signalling a downgrade
+    /// attack. The host closes the connection after the current message instead of replying.
+    /// </summary>
+    public bool MustTerminate { get; set; }
+
     public byte[] ClientGuid { get; set; } = new byte[16];
     public Smb2Capabilities ClientCapabilities { get; set; }
     public Smb2Capabilities ServerCapabilities { get; set; }

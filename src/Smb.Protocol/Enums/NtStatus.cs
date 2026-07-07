@@ -42,6 +42,8 @@ public enum NtStatus : uint
     FileIsADirectory = 0xC00000BA,
     UserSessionDeleted = 0xC0000203,
     InvalidDeviceRequest = 0xC0000010,
+    NotFound = 0xC0000225,
+    NotAReparsePoint = 0xC0000275,
 }
 
 /// <summary>NTSTATUS evaluation via the severity field (Context §17).</summary>

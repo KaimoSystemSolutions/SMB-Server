@@ -301,14 +301,18 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), response.ToBody());
     }
 
-    private ResponseSegment HandleIoctl(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
+    private async ValueTask<ResponseSegment?> HandleIoctlAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        IoctlMessage.Request req = IoctlMessage.ParseRequest(segment, Smb2Header.Size);
+        IoctlMessage.Request req = IoctlMessage.ParseRequest(segment.Span, Smb2Header.Size);
+
+        // [M5.3] FSCTL_VALIDATE_NEGOTIATE_INFO — secure-negotiate downgrade check (3.0/3.0.2).
+        if (req.CtlCode == IoctlMessage.FsctlValidateNegotiateInfo)
+            return HandleValidateNegotiate(connection, header, session, req);
 
         // FSCTL_PIPE_TRANSCEIVE: DCERPC request → response via the named pipe.
         if (req.CtlCode == IoctlMessage.FsctlPipeTransceive
@@ -324,7 +328,337 @@ public sealed partial class Smb2Dispatcher
         if (req.CtlCode == IoctlMessage.FsctlSrvEnumerateSnapshots)
             return HandleEnumerateSnapshots(header, session, req);
 
+        // [M5.1] Server-side copy: hand out a resume key for a source, then copy chunks into a destination.
+        if (req.CtlCode == CopyChunkMessage.FsctlSrvRequestResumeKey)
+            return HandleRequestResumeKey(header, session, req);
+        if (req.CtlCode is CopyChunkMessage.FsctlSrvCopyChunk or CopyChunkMessage.FsctlSrvCopyChunkWrite)
+            return await HandleCopyChunkAsync(header, session, req).ConfigureAwait(false);
+
+        // [M5.2] Sparse-file / reparse-point / DFS FSCTLs.
+        switch (req.CtlCode)
+        {
+            case FsctlMessage.FsctlSetSparse:
+            case FsctlMessage.FsctlSetZeroData:
+            case FsctlMessage.FsctlQueryAllocatedRanges:
+                return await HandleSparseFsctlAsync(header, session, req).ConfigureAwait(false);
+            case FsctlMessage.FsctlGetReparsePoint:
+            case FsctlMessage.FsctlSetReparsePoint:
+            case FsctlMessage.FsctlDeleteReparsePoint:
+                return await HandleReparseFsctlAsync(header, session, req).ConfigureAwait(false);
+            case FsctlMessage.FsctlDfsGetReferrals:
+            case FsctlMessage.FsctlDfsGetReferralsEx:
+                // No DFS namespace configured — the client falls back to the plain path (§3.3.5.15.2).
+                return BuildError(header, NtStatus.NotFound);
+        }
+
         return BuildError(header, NtStatus.InvalidDeviceRequest);
+    }
+
+    /// <summary>
+    /// FSCTL_SRV_REQUEST_RESUME_KEY (MS-SMB2 §3.3.5.15.5): assigns the open a stable 24-byte opaque
+    /// key and returns it. The client presents this key as the <c>SourceKey</c> of a later
+    /// FSCTL_SRV_COPYCHUNK to identify the copy source.
+    /// </summary>
+    private ResponseSegment HandleRequestResumeKey(Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
+            return BuildError(header, NtStatus.FileClosed);
+
+        // Assign once; a repeated request for the same open returns the same key.
+        byte[] key = open.ResumeKey ??= System.Security.Cryptography.RandomNumberGenerator.GetBytes(CopyChunkMessage.ResumeKeyLength);
+        byte[] output = CopyChunkMessage.BuildResumeKeyResponse(key);
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
+    }
+
+    /// <summary>
+    /// FSCTL_SRV_COPYCHUNK / _WRITE (MS-SMB2 §3.3.5.15.6): copies the requested ranges from the source
+    /// open (located by resume key within the same session) into the destination open the IOCTL was
+    /// issued on. Chunk count/size and the total are bounded; exceeding a limit returns the maximums
+    /// with STATUS_INVALID_PARAMETER so the client can re-chunk.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleCopyChunkAsync(Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        // Destination handle = the open the IOCTL targets; must be writable.
+        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen dest) || dest.LocalOpen is null)
+            return BuildError(header, NtStatus.FileClosed);
+        if (!TryGetFileStore(session, header.TreeId, out IFileStore destStore, out NtStatus destErr))
+            return BuildError(header, destErr);
+        if ((dest.GrantedAccess & AccessMask.WriteAccess) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
+
+        CopyChunkMessage.CopyRequest copy = CopyChunkMessage.ParseCopyRequest(req.Input);
+
+        // Locate the source by resume key (same session, possibly a different tree/share).
+        if (!TryFindOpenByResumeKey(session, copy.SourceKey, out SmbOpen source) || source.LocalOpen is null)
+            return BuildError(header, NtStatus.ObjectNameNotFound);
+        if ((source.GrantedAccess & AccessMask.FileReadData) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
+        if (source.TreeConnect.Share.FileStore is not { } sourceStore)
+            return BuildError(header, NtStatus.ObjectNameNotFound);
+
+        // Enforce the server-side-copy limits (§2.2.31.1) before doing any I/O.
+        if (!ValidateCopyLimits(copy.Chunks))
+        {
+            Smb2Header limitHeader = RespHeader(header, session);
+            limitHeader.Status = NtStatus.InvalidParameter;
+            return MaybeSigned(session, limitHeader, IoctlMessage.BuildResponseBody(
+                req.CtlCode, req.PersistentId, req.VolatileId, CopyChunkMessage.BuildLimitExceededResponse()));
+        }
+
+        uint chunksWritten = 0;
+        uint totalWritten = 0;
+        foreach (CopyChunkMessage.Chunk chunk in copy.Chunks)
+        {
+            FileStoreResult<long> copied = await CopyRangeAsync(
+                sourceStore, source.LocalOpen, (long)chunk.SourceOffset,
+                destStore, dest.LocalOpen, (long)chunk.TargetOffset, chunk.Length).ConfigureAwait(false);
+
+            if (!copied.IsSuccess)
+            {
+                // Report progress so far alongside the failure (§3.3.5.15.6).
+                Smb2Header failHeader = RespHeader(header, session);
+                failHeader.Status = copied.Status;
+                return MaybeSigned(session, failHeader, IoctlMessage.BuildResponseBody(
+                    req.CtlCode, req.PersistentId, req.VolatileId,
+                    CopyChunkMessage.BuildCopyResponse(chunksWritten, 0, totalWritten)));
+            }
+
+            chunksWritten++;
+            totalWritten += (uint)copied.Value;
+        }
+
+        byte[] output = CopyChunkMessage.BuildCopyResponse(chunksWritten, 0, totalWritten);
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
+    }
+
+    /// <summary>Validates chunk count / per-chunk size / total against the §2.2.31.1 limits.</summary>
+    private static bool ValidateCopyLimits(IReadOnlyList<CopyChunkMessage.Chunk> chunks)
+    {
+        if (chunks.Count > CopyChunkMessage.MaxChunks)
+            return false;
+        ulong total = 0;
+        foreach (CopyChunkMessage.Chunk chunk in chunks)
+        {
+            if (chunk.Length > CopyChunkMessage.MaxChunkSize)
+                return false;
+            total += chunk.Length;
+        }
+        return total <= CopyChunkMessage.MaxTotalSize;
+    }
+
+    /// <summary>Finds the open in the session whose <see cref="SmbOpen.ResumeKey"/> matches (constant-length compare).</summary>
+    private static bool TryFindOpenByResumeKey(SmbSession session, byte[] sourceKey, out SmbOpen match)
+    {
+        foreach (SmbOpen candidate in session.Opens.Values)
+        {
+            if (candidate.ResumeKey is { } key && key.AsSpan().SequenceEqual(sourceKey))
+            {
+                match = candidate;
+                return true;
+            }
+        }
+        match = null!;
+        return false;
+    }
+
+    /// <summary>
+    /// Copies one range, preferring the backend's native offload (<see cref="IFileStore.CopyRangeAsync"/>)
+    /// when source and destination share the same store, and otherwise falling back to a bounded
+    /// user-space read/write loop that also spans two different backends (cross-share copy).
+    /// </summary>
+    private static async ValueTask<FileStoreResult<long>> CopyRangeAsync(
+        IFileStore sourceStore, IFileHandle source, long sourceOffset,
+        IFileStore destStore, IFileHandle destination, long destOffset, long length)
+    {
+        if (length <= 0)
+            return FileStoreResult<long>.Ok(0);
+
+        if (ReferenceEquals(sourceStore, destStore))
+        {
+            FileStoreResult<long> offloaded = await destStore.CopyRangeAsync(
+                source, sourceOffset, destination, destOffset, length).ConfigureAwait(false);
+            if (offloaded.Status != NtStatus.NotSupported)
+                return offloaded;
+        }
+
+        // Fallback: pull the range through a buffer. 64 KiB blocks keep the peak allocation bounded
+        // even for the maximum 1 MiB chunk.
+        const int block = 64 * 1024;
+        var buffer = new byte[(int)Math.Min(length, block)];
+        long remaining = length;
+        long copied = 0;
+        while (remaining > 0)
+        {
+            int want = (int)Math.Min(remaining, buffer.Length);
+            FileStoreResult<int> read = await sourceStore.ReadAsync(
+                source, sourceOffset + copied, buffer.AsMemory(0, want)).ConfigureAwait(false);
+            if (!read.IsSuccess)
+                return FileStoreResult<long>.Fail(read.Status);
+            if (read.Value == 0)
+                break;                       // source EOF — copy what was available
+
+            int off = 0;
+            while (off < read.Value)
+            {
+                FileStoreResult<int> written = await destStore.WriteAsync(
+                    destination, destOffset + copied + off, buffer.AsMemory(off, read.Value - off)).ConfigureAwait(false);
+                if (!written.IsSuccess)
+                    return FileStoreResult<long>.Fail(written.Status);
+                if (written.Value == 0)
+                    return FileStoreResult<long>.Fail(NtStatus.DiskFull);
+                off += written.Value;
+            }
+
+            copied += read.Value;
+            remaining -= read.Value;
+        }
+
+        return FileStoreResult<long>.Ok(copied);
+    }
+
+    /// <summary>
+    /// [M5.2] FSCTL_SET_SPARSE / FSCTL_SET_ZERO_DATA / FSCTL_QUERY_ALLOCATED_RANGES. Requires the
+    /// backend to implement <see cref="ISparseFileStore"/>; otherwise <c>STATUS_NOT_SUPPORTED</c>.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleSparseFsctlAsync(Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
+            return BuildError(header, NtStatus.FileClosed);
+        if (open.TreeConnect.Share.FileStore is not ISparseFileStore sparse)
+            return BuildError(header, NtStatus.NotSupported);
+
+        switch (req.CtlCode)
+        {
+            case FsctlMessage.FsctlSetSparse:
+            {
+                // Setting sparse mutates file state → needs write access.
+                if ((open.GrantedAccess & AccessMask.WriteAccess) == 0)
+                    return BuildError(header, NtStatus.AccessDenied);
+                NtStatus status = await sparse.SetSparseAsync(open.LocalOpen, FsctlMessage.ParseSetSparse(req.Input)).ConfigureAwait(false);
+                return IoctlResult(header, session, req, status, []);
+            }
+            case FsctlMessage.FsctlSetZeroData:
+            {
+                if ((open.GrantedAccess & AccessMask.WriteAccess) == 0)
+                    return BuildError(header, NtStatus.AccessDenied);
+                FsctlMessage.FileRange range = FsctlMessage.ParseZeroData(req.Input);
+                NtStatus status = await sparse.SetZeroDataAsync(open.LocalOpen, range.Offset, range.Length).ConfigureAwait(false);
+                return IoctlResult(header, session, req, status, []);
+            }
+            default: // FsctlQueryAllocatedRanges
+            {
+                if ((open.GrantedAccess & AccessMask.FileReadData) == 0)
+                    return BuildError(header, NtStatus.AccessDenied);
+                FsctlMessage.FileRange query = FsctlMessage.ParseAllocatedRangeQuery(req.Input);
+                FileStoreResult<IReadOnlyList<FsctlMessage.FileRange>> result =
+                    await sparse.QueryAllocatedRangesAsync(open.LocalOpen, query.Offset, query.Length).ConfigureAwait(false);
+                if (!result.IsSuccess)
+                    return BuildError(header, result.Status);
+
+                byte[] output = FsctlMessage.BuildAllocatedRanges(result.Value!);
+                // Honour the client's output cap (§2.2.31): report BUFFER_TOO_SMALL if it does not fit.
+                if ((uint)output.Length > req.MaxOutputResponse)
+                    return BuildError(header, NtStatus.BufferTooSmall);
+                return IoctlResult(header, session, req, NtStatus.Success, output);
+            }
+        }
+    }
+
+    /// <summary>
+    /// [M5.2] FSCTL_GET/SET/DELETE_REPARSE_POINT. Requires the backend to implement
+    /// <see cref="IReparsePointStore"/>; GET on a non-reparse backend answers
+    /// <c>STATUS_NOT_A_REPARSE_POINT</c>, SET/DELETE answer <c>STATUS_NOT_SUPPORTED</c>.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleReparseFsctlAsync(Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
+            return BuildError(header, NtStatus.FileClosed);
+        IReparsePointStore? reparse = open.TreeConnect.Share.FileStore as IReparsePointStore;
+
+        if (req.CtlCode == FsctlMessage.FsctlGetReparsePoint)
+        {
+            if (reparse is null)
+                return BuildError(header, NtStatus.NotAReparsePoint);
+            FileStoreResult<byte[]> result = await reparse.GetReparsePointAsync(open.LocalOpen).ConfigureAwait(false);
+            if (!result.IsSuccess)
+                return BuildError(header, result.Status);
+            byte[] data = result.Value!;
+            if ((uint)data.Length > req.MaxOutputResponse)
+                return BuildError(header, NtStatus.BufferTooSmall);
+            return IoctlResult(header, session, req, NtStatus.Success, data);
+        }
+
+        // SET / DELETE mutate the file → write access + a reparse-capable backend.
+        if (reparse is null)
+            return BuildError(header, NtStatus.NotSupported);
+        if ((open.GrantedAccess & AccessMask.WriteAccess) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
+
+        NtStatus status = req.CtlCode == FsctlMessage.FsctlSetReparsePoint
+            ? await reparse.SetReparsePointAsync(open.LocalOpen, req.Input).ConfigureAwait(false)
+            : await reparse.DeleteReparsePointAsync(open.LocalOpen, req.Input).ConfigureAwait(false);
+        return IoctlResult(header, session, req, status, []);
+    }
+
+    /// <summary>
+    /// [M5.3] FSCTL_VALIDATE_NEGOTIATE_INFO (MS-SMB2 §3.3.5.15.12): the client re-sends the NEGOTIATE
+    /// parameters it observed so the server can prove a man-in-the-middle did not downgrade them. Every
+    /// field (capabilities, client GUID, security mode, and the negotiated dialect derived from the
+    /// dialect list) must match what this connection actually negotiated; any mismatch is treated as an
+    /// attack and the transport connection is terminated with no response. On success the server returns
+    /// its own negotiated values (signed, so the client can trust them).
+    /// </summary>
+    private ResponseSegment? HandleValidateNegotiate(SmbConnection connection, Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        IoctlMessage.ValidateNegotiateRequest v = IoctlMessage.ParseValidateNegotiate(req.Input);
+
+        ushort negotiated = PickDialect(v.Dialects);
+        bool matches =
+            (uint)connection.ClientCapabilities == v.Capabilities
+            && connection.ClientGuid.AsSpan().SequenceEqual(v.Guid)
+            && (ushort)connection.ClientSecurityMode == v.SecurityMode
+            && negotiated == (ushort)connection.Dialect;
+
+        if (!matches)
+        {
+            // Downgrade attempt (or a broken client): drop the connection without answering.
+            _log?.Invoke($"[validate-negotiate] mismatch on conn {connection.ConnectionId:N} → terminating");
+            connection.MustTerminate = true;
+            return null;
+        }
+
+        byte[] output = IoctlMessage.BuildValidateNegotiateResponse(
+            (uint)connection.ServerCapabilities, _server.Options.ServerGuid,
+            (ushort)connection.ServerSecurityMode, (ushort)connection.Dialect);
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
+    }
+
+    /// <summary>Greatest dialect this server supports among the client-offered list (0 = none common).</summary>
+    private static ushort PickDialect(ushort[] offered)
+    {
+        ushort best = 0;
+        foreach (ushort d in offered)
+            if (Array.IndexOf(SupportedDialects, d) >= 0 && d > best)
+                best = d;
+        return best;
+    }
+
+    private static readonly ushort[] SupportedDialects =
+    [
+        (ushort)SmbDialect.Smb202, (ushort)SmbDialect.Smb210,
+        (ushort)SmbDialect.Smb300, (ushort)SmbDialect.Smb302, (ushort)SmbDialect.Smb311,
+    ];
+
+    /// <summary>Builds an IOCTL response with an explicit NT status and output buffer.</summary>
+    private ResponseSegment IoctlResult(Smb2Header header, SmbSession session, IoctlMessage.Request req, NtStatus status, ReadOnlySpan<byte> output)
+    {
+        if (status != NtStatus.Success)
+            return BuildError(header, status);
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
     }
 
     /// <summary>

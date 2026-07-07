@@ -156,7 +156,7 @@ public sealed partial class Smb2Dispatcher
                 SmbCommand.QueryInfo => await HandleQueryInfoAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
                 SmbCommand.SetInfo => await HandleSetInfoAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
                 SmbCommand.Flush => await HandleFlushAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
-                SmbCommand.Ioctl => HandleIoctl(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.Ioctl => await HandleIoctlAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
                 SmbCommand.Lock => HandleLock(connection, header, segment.Span, frameEncrypted),
                 SmbCommand.Cancel => HandleCancel(connection, header, segment.Span),
                 SmbCommand.ChangeNotify => HandleChangeNotify(connection, header, segment.Span, frameEncrypted),

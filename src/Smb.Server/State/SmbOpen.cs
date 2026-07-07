@@ -84,6 +84,12 @@ public sealed class SmbOpen
     /// <summary>Share-mode reservation key (share + path) for release at CLOSE/teardown (O5). Null = none.</summary>
     public string? ShareModeKey { get; set; }
 
+    /// <summary>
+    /// Opaque 24-byte server-side-copy resume key (Phase 5 / M5.1). Assigned lazily on the first
+    /// FSCTL_SRV_REQUEST_RESUME_KEY so this open can act as a copychunk source; <c>null</c> until then.
+    /// </summary>
+    public byte[]? ResumeKey { get; set; }
+
     /// <summary>For named-pipe opens (IPC$, e.g. \PIPE\srvsvc): the DCERPC pipe state. Otherwise null.</summary>
     public RpcPipe? Pipe { get; set; }
 

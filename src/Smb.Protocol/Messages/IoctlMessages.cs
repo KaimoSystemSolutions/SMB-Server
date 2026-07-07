@@ -73,6 +73,37 @@ public static class IoctlMessage
         return body;
     }
 
+    /// <summary>Parsed VALIDATE_NEGOTIATE_INFO request (MS-SMB2 §2.2.31.4): the client echoes back
+    /// what it sent in NEGOTIATE so the server can prove no attacker downgraded it.</summary>
+    public readonly record struct ValidateNegotiateRequest(
+        uint Capabilities, byte[] Guid, ushort SecurityMode, ushort[] Dialects);
+
+    /// <summary>Parses a VALIDATE_NEGOTIATE_INFO request input buffer (MS-SMB2 §2.2.31.4).</summary>
+    public static ValidateNegotiateRequest ParseValidateNegotiate(ReadOnlySpan<byte> input)
+    {
+        var r = new SpanReader(input);
+        uint capabilities = r.ReadUInt32();
+        byte[] guid = r.ReadByteArray(16);
+        ushort securityMode = r.ReadUInt16();
+        ushort dialectCount = r.ReadUInt16();
+        var dialects = new ushort[dialectCount];
+        for (int i = 0; i < dialectCount; i++)
+            dialects[i] = r.ReadUInt16();
+        return new ValidateNegotiateRequest(capabilities, guid, securityMode, dialects);
+    }
+
+    /// <summary>Builds a VALIDATE_NEGOTIATE_INFO response (MS-SMB2 §2.2.32.6, fixed 24 bytes).</summary>
+    public static byte[] BuildValidateNegotiateResponse(uint capabilities, ReadOnlySpan<byte> serverGuid, ushort securityMode, ushort dialect)
+    {
+        var body = new byte[24];
+        var w = new SpanWriter(body);
+        w.WriteUInt32(capabilities);
+        w.WriteBytes(serverGuid.Length == 16 ? serverGuid : new byte[16]);
+        w.WriteUInt16(securityMode);
+        w.WriteUInt16(dialect);
+        return body;
+    }
+
     /// <summary>
     /// Builds the <c>SRV_SNAPSHOT_ARRAY</c> payload (MS-SMB2 §2.2.32.2) for
     /// FSCTL_SRV_ENUMERATE_SNAPSHOTS from already-formatted <c>@GMT-…</c> tokens.

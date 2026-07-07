@@ -330,36 +330,82 @@ tests — much of Phase 4 reused the existing CREATE-context chain parser and le
 Server-side copy (`FSCTL_SRV_COPYCHUNK`) eliminates double network transfer for
 file copies. Additional FSCTLs are required by Windows Explorer and common tools.
 
-### M5.1 — FSCTL_SRV_COPYCHUNK / COPYCHUNK_WRITE
+### M5.1 — FSCTL_SRV_COPYCHUNK / COPYCHUNK_WRITE ✅
 
-- [ ] Parse `SRV_COPYCHUNK_COPY` input buffer (source key, chunk array).
-- [ ] Implement copy logic in `Smb2Dispatcher`: read from source handle, write to
-      destination handle, return chunk results.
-- [ ] Extend `IFileStore` with optional `CopyRangeAsync` for backends that support
-      native copy offload (e.g., `copy_file_range` on Linux, `FSCTL_DUPLICATE_EXTENTS`
-      on NTFS).
-- [ ] Fallback: user-space read/write loop when backend does not support offload.
-- [ ] Tests: copy within same share, cross-share copy, partial chunk, overlapping
-      ranges, large file (>4 GB).
+- [x] Parse `SRV_COPYCHUNK_COPY` input buffer (source key, chunk array) and build the
+      `SRV_REQUEST_RESUME_KEY` / `SRV_COPYCHUNK_RESPONSE` payloads
+      (`Smb.Protocol.Messages.CopyChunkMessage`, pure).
+- [x] Resume-key mechanism: FSCTL_SRV_REQUEST_RESUME_KEY assigns the source open a stable opaque
+      24-byte key (`SmbOpen.ResumeKey`, lazily allocated via `RandomNumberGenerator`) and returns it;
+      FSCTL_SRV_COPYCHUNK(_WRITE) locates the source by that key within the same session
+      (`TryFindOpenByResumeKey`, constant-length compare) — so cross-share copies inside one session
+      work — and copies each chunk into the destination open the IOCTL targets.
+- [x] Access checks: the destination needs `FILE_WRITE_DATA`, the source `FILE_READ_DATA` (M3.3
+      granted mask); the §2.2.31.1 limits (≤16 chunks, ≤1 MiB/chunk, ≤16 MiB total) are enforced
+      before any I/O and a violation returns the maxima with `STATUS_INVALID_PARAMETER`.
+- [x] Extend `IFileStore` with an optional `CopyRangeAsync` offload seam (default
+      `NotSupported`). The dispatcher prefers it when source and destination share the same store,
+      otherwise falls back to a bounded 64 KiB read/write loop that also spans two backends.
+- [x] Tests (`tests/Smb.Tests/CopyChunkTests.cs`, 7): resume-key / copy-request wire round-trips,
+      same-share copy (two chunks), cross-share copy via the fallback, too-many-chunks →
+      `INVALID_PARAMETER` + maxima, unknown resume key → `OBJECT_NAME_NOT_FOUND`, and the backend
+      offload seam being taken for a same-store copy. Full suite 309 green.
 
-### M5.2 — Additional FSCTLs
+> **Modularity:** the copychunk wire types are pure in `Smb.Protocol`; the copy orchestration
+> (resume-key lookup, limit enforcement, fallback loop) lives in the dispatcher; native offload is
+> the `IFileStore.CopyRangeAsync` seam a backend maps onto `copy_file_range` /
+> `FSCTL_DUPLICATE_EXTENTS`. `LocalFileStore` keeps the default (fallback loop) for now.
 
-- [ ] `FSCTL_SET_ZERO_DATA` — sparse file zero fill.
-- [ ] `FSCTL_QUERY_ALLOCATED_RANGES` — report allocated extents.
-- [ ] `FSCTL_SET_SPARSE` — mark file as sparse.
-- [ ] `FSCTL_GET_REPARSE_POINT` / `FSCTL_SET_REPARSE_POINT` — reparse point
-      (symlink) support with `STATUS_STOPPED_ON_SYMLINK` error data.
-- [ ] `FSCTL_DFS_GET_REFERRALS` — stub returning `STATUS_NOT_FOUND` (no DFS) or
-      referral response (if DFS is implemented in Phase 7).
-- [ ] Tests per FSCTL: valid input, invalid input, unsupported → `STATUS_NOT_SUPPORTED`.
+### M5.2 — Additional FSCTLs ✅
 
-### M5.3 — FSCTL_VALIDATE_NEGOTIATE_INFO hardening
+Wire structures are pure in `Smb.Protocol.Messages.FsctlMessage`; the semantics sit behind two
+opt-in seams (`ISparseFileStore`, `IReparsePointStore`, checked with `is` like `ISnapshotStore`) so
+the core stays dependency-free and a backend maps them onto real OS calls.
 
-- [ ] Verify the existing implementation matches §3.3.5.15.12 completely.
-- [ ] Reject dialect/capability/GUID mismatches with connection termination.
-- [ ] Test: tampered validate-negotiate → connection dropped.
+- [x] `FSCTL_SET_SPARSE` — `ISparseFileStore.SetSparseAsync` (empty input ⇒ TRUE, MS-FSCC §2.3.68).
+- [x] `FSCTL_SET_ZERO_DATA` — `SetZeroDataAsync` over the parsed FILE_ZERO_DATA_INFORMATION range.
+- [x] `FSCTL_QUERY_ALLOCATED_RANGES` — `QueryAllocatedRangesAsync`; the FILE_ALLOCATED_RANGE_BUFFER
+      array is serialized and capped to the request's `MaxOutputResponse` (`STATUS_BUFFER_TOO_SMALL`).
+- [x] `FSCTL_GET_REPARSE_POINT` / `_SET_` / `_DELETE_` — `IReparsePointStore`; the reparse data buffer
+      is opaque to the server. GET on a non-reparse backend answers `STATUS_NOT_A_REPARSE_POINT`,
+      SET/DELETE `STATUS_NOT_SUPPORTED`. (`STATUS_STOPPED_ON_SYMLINK` path-resolution error data is
+      deferred to Phase 11 / M11.2 where symlink traversal is handled.)
+- [x] `FSCTL_DFS_GET_REFERRALS` / `_EX` — stub returning `STATUS_NOT_FOUND` (no DFS namespace), so the
+      client falls back to the plain path. Full DFS is Phase 7.
+- [x] Access gates: SET_SPARSE / SET_ZERO_DATA / SET_REPARSE need write, QUERY / GET need read.
+      Backends without the seam return the correct unsupported status.
+- [x] Tests (`tests/Smb.Tests/AdditionalFsctlTests.cs`, 10): wire round-trips, set-sparse on a capable
+      vs. plain backend, zero-data actually zeroes, query-allocated-ranges output, reparse get/set
+      round-trip + not-a-reparse-point on both a capable-but-empty and a plain backend, DFS → NOT_FOUND.
 
-**Estimated scope:** ~1,000 LOC production + ~500 LOC tests.
+### M5.3 — FSCTL_VALIDATE_NEGOTIATE_INFO hardening ✅
+
+- [x] Implemented FSCTL_VALIDATE_NEGOTIATE_INFO to §3.3.5.15.12 (it was previously unhandled and
+      fell through to `STATUS_INVALID_DEVICE_REQUEST`). The handler parses the request
+      (`IoctlMessage.ParseValidateNegotiate`) and compares **capabilities, client GUID, security mode
+      and the negotiated dialect** (derived from the offered list via `PickDialect`) against the values
+      this connection actually negotiated (stored on `SmbConnection` at NEGOTIATE time).
+- [x] Any mismatch is treated as a downgrade attack: the dispatcher sets a new
+      `SmbConnection.MustTerminate` flag and returns **no response**; the host read loop
+      (`SmbConnectionHandler`) breaks and tears the transport connection down.
+- [x] On a match the server returns its own negotiated values (`BuildValidateNegotiateResponse`,
+      MS-SMB2 §2.2.32.6), signed via the normal path so the client can trust them.
+- [x] Tests (`tests/Smb.Tests/ValidateNegotiateTests.cs`, 5): wire round-trip, matching parameters →
+      server info echoed, and tampered capabilities / GUID / dialect-list each → empty reply +
+      `MustTerminate`. Full suite 324 green.
+
+> **Note:** `HandleIoctlAsync` now returns `ResponseSegment?` so an IOCTL can legitimately produce
+> "no response" (mirroring CANCEL). Secure negotiate is defined for SMB 3.0/3.0.2; 3.1.1 clients rely
+> on preauth integrity instead and do not issue it, but the handler compares against the actual
+> negotiated dialect so it is correct for any dialect that sends it.
+
+**Estimated scope:** ~1,000 LOC production + ~500 LOC tests. *(Actual: ~230 LOC production + ~200 LOC
+tests across M5.1–M5.3 — the IOCTL dispatch, CREATE-context and access-check infrastructure were
+already in place.)*
+
+**Phase 5 complete.** Server-side copy (copychunk + resume keys, offload seam), the sparse/reparse/DFS
+FSCTLs (opt-in `ISparseFileStore` / `IReparsePointStore` seams), and secure-negotiate downgrade
+protection all landed with 22 new tests (7 + 10 + 5), suite 302 → **324 green**.
 
 ---
 
@@ -626,9 +672,9 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 4 / M4.3 | Complete | `IDurableHandleStore` seam + `InMemoryDurableHandleStore` (default) — introduced in M4.1, documented in M4.3 for out-of-process (SQLite/Redis) stores incl. the rehydrate-live-`SmbOpen`-in-`TryClaim` contract for restart survival. **Phase 4 complete (in-process); cross-restart persistence is a documented extension point.** |
 | | Phase 4 / M4.2 | Not started | |
 | | Phase 4 / M4.3 | Not started | |
-| | Phase 5 / M5.1 | Not started | |
-| | Phase 5 / M5.2 | Not started | |
-| | Phase 5 / M5.3 | Not started | |
+| 2026-07-07 | Phase 5 / M5.1 | Complete | Server-side copy. `CopyChunkMessage` (resume-key + SRV_COPYCHUNK_COPY / _RESPONSE, pure); FSCTL_SRV_REQUEST_RESUME_KEY assigns `SmbOpen.ResumeKey`; FSCTL_SRV_COPYCHUNK(_WRITE) locates the source by key in the session, enforces §2.2.31.1 limits (maxima on violation), copies chunks. Optional `IFileStore.CopyRangeAsync` offload seam preferred for same-store copies, else a 64 KiB read/write fallback (spans shares). 7 tests (`CopyChunkTests.cs`), full suite 309 green. |
+| 2026-07-07 | Phase 5 / M5.2 | Complete | Additional FSCTLs. Pure wire in `FsctlMessage` (set-sparse / zero-data / allocated-ranges structs, FSCTL codes); two opt-in seams `ISparseFileStore` + `IReparsePointStore` (checked with `is`). SET_SPARSE/SET_ZERO_DATA/QUERY_ALLOCATED_RANGES, GET/SET/DELETE_REPARSE_POINT (opaque buffer, NOT_A_REPARSE_POINT/NOT_SUPPORTED defaults), DFS_GET_REFERRALS → NOT_FOUND stub. Access-gated; output capped to MaxOutputResponse. New NtStatus `NotFound`/`NotAReparsePoint`. 10 tests (`AdditionalFsctlTests.cs`). |
+| 2026-07-07 | Phase 5 / M5.3 | Complete | FSCTL_VALIDATE_NEGOTIATE_INFO hardening (was unhandled). Parses the request and compares capabilities / client GUID / security mode / negotiated dialect against the connection's negotiated state; mismatch → new `SmbConnection.MustTerminate` flag, no reply, host drops the connection; match → server info (signed). `HandleIoctlAsync` now returns `ResponseSegment?`. 5 tests (`ValidateNegotiateTests.cs`). **Phase 5 complete — suite 324 green.** |
 | | Phase 6 / M6.1 | Not started | |
 | | Phase 6 / M6.2 | Not started | |
 | | Phase 6 / M6.3 | Not started | |

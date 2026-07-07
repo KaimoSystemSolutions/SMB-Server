@@ -86,6 +86,20 @@ public interface IFileStore
     ValueTask<NtStatus> FlushAsync(IFileHandle handle, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Optional server-side copy offload for FSCTL_SRV_COPYCHUNK (Phase 5 / M5.1): copies
+    /// <paramref name="length"/> bytes from <paramref name="source"/> at <paramref name="sourceOffset"/>
+    /// to <paramref name="destination"/> at <paramref name="destinationOffset"/> and returns the number
+    /// of bytes copied. Both handles belong to this same store. Defaults to
+    /// <see cref="NtStatus.NotSupported"/>; the dispatcher then falls back to a read/write loop.
+    /// Backends with native duplicate-extent / copy_file_range support override this.
+    /// </summary>
+    ValueTask<FileStoreResult<long>> CopyRangeAsync(
+        IFileHandle source, long sourceOffset,
+        IFileHandle destination, long destinationOffset,
+        long length, CancellationToken cancellationToken = default)
+        => new(FileStoreResult<long>.Fail(NtStatus.NotSupported));
+
+    /// <summary>
     /// Returns the security descriptor of an open handle (QUERY_INFO / InfoType Security, Phase 3).
     /// Defaults to <see cref="NtStatus.NotSupported"/> — backends that carry per-file ACLs override it.
     /// The caller selects which components to return via the request's SECURITY_INFORMATION flags.
