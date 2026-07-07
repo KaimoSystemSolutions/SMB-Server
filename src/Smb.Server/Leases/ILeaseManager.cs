@@ -52,6 +52,16 @@ public interface ILeaseManager
     /// <summary>At CLOSE, detaches <paramref name="open"/> from its lease; when the last open of a
     /// lease closes, the lease is released (§3.3.5.10).</summary>
     void ReleaseOwner(SmbOpen open);
+
+    /// <summary>
+    /// Breaks any <b>directory</b> lease held on the directory whose backend file key is
+    /// <paramref name="directoryFileKey"/>, because a child entry was added, removed or renamed inside
+    /// it (directory leasing, §2.2.13.2.10 / §3.3.4.18). Each affected directory lease is downgraded so
+    /// it no longer caches the handle (Handle caching removed, keeping at most shared Read); the
+    /// resulting breaks are returned for the dispatcher to deliver out-of-band. Non-directory (file)
+    /// leases on the key are left untouched. Returns an empty list when no directory lease is affected.
+    /// </summary>
+    IReadOnlyList<LeaseBreak> BreakDirectoryLease(string directoryFileKey);
 }
 
 /// <summary>
@@ -65,4 +75,5 @@ public sealed class NullLeaseManager : ILeaseManager
     public LeaseGrant RequestLease(SmbOpen open, LeaseRequest request) => LeaseGrant.None;
     public LeaseState Acknowledge(LeaseKey key, LeaseState newState) => LeaseState.None;
     public void ReleaseOwner(SmbOpen open) { }
+    public IReadOnlyList<LeaseBreak> BreakDirectoryLease(string directoryFileKey) => Array.Empty<LeaseBreak>();
 }

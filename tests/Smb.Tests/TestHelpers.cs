@@ -219,6 +219,29 @@ internal static class TestHelpers
         });
     }
 
+    /// <summary>
+    /// Builds a single "RqLs" lease-V2 CREATE context blob (52-byte data, directory-lease capable,
+    /// §2.2.13.2.10) as an 8-byte-aligned chain. When <paramref name="parentKey16"/> is provided the
+    /// <c>ParentLeaseKeySet</c> flag is set and the key written into the ParentLeaseKey field.
+    /// </summary>
+    public static byte[] BuildLeaseV2Context(byte[] leaseKey16, LeaseState requestedState,
+        byte[]? parentKey16 = null, ushort epoch = 0)
+    {
+        var data = new byte[LeaseRequest.V2Size];
+        var w = new SpanWriter(data);
+        w.WriteBytes(leaseKey16);
+        w.WriteUInt32((uint)requestedState);
+        w.WriteUInt32((uint)(parentKey16 is not null ? LeaseFlags.ParentLeaseKeySet : LeaseFlags.None));
+        w.WriteUInt64(0);                  // LeaseDuration
+        w.WriteBytes(parentKey16 ?? new byte[16]);
+        w.WriteUInt16(epoch);
+        w.WriteUInt16(0);                  // Reserved
+        return CreateContextList.Serialize(new[]
+        {
+            new CreateContext { Name = LeaseContextName(), Data = data },
+        });
+    }
+
     /// <summary>Builds a LEASE_BREAK acknowledgment (client→server, §2.2.24.2, StructureSize 36).</summary>
     public static byte[] BuildLeaseBreakAck(ulong messageId, ulong sessionId, uint treeId,
         byte[] leaseKey16, LeaseState state, byte[]? signingKey = null,

@@ -35,6 +35,23 @@ public sealed partial class Smb2Dispatcher
         }
     }
 
+    /// <summary>
+    /// After a child entry was added, removed or renamed inside a directory, breaks any directory
+    /// lease held on that <i>parent</i> directory (directory leasing, §2.2.13.2.10) and dispatches the
+    /// notifications. <paramref name="childPhysicalPath"/> is the backend path of the affected child;
+    /// its parent directory is derived from it. No-op when the path has no parent or no directory lease
+    /// is held there.
+    /// </summary>
+    private void BreakParentDirectoryLease(string? childPhysicalPath)
+    {
+        if (string.IsNullOrEmpty(childPhysicalPath)) return;
+        string? parent = System.IO.Path.GetDirectoryName(childPhysicalPath);
+        if (string.IsNullOrEmpty(parent)) return;
+
+        IReadOnlyList<LeaseBreak> breaks = _server.Options.LeaseManager.BreakDirectoryLease(parent);
+        if (breaks.Count != 0) DispatchLeaseBreaks(breaks);
+    }
+
     /// <summary>Sends the LEASE_BREAK notification to a holder out-of-band (§2.2.23.2).</summary>
     private async Task SendLeaseBreakAsync(LeaseBreak brk)
     {

@@ -66,14 +66,30 @@ performance penalty for every file open. This is the single highest-impact gap.
 > the wire. What remains (the blocking wait) is a correctness refinement for concurrent
 > conflicting opens, not a gap in the message flow.
 
-### M1.3 — Directory leases
+### M1.3 — Directory leases ✅
 
-- [ ] Extend `ILeaseManager` to track directory lease keys.
-- [ ] Grant directory leases on directory CREATE when requested via V2 context.
-- [ ] Break directory leases on child add/remove/rename within the leased directory.
-- [ ] Tests: directory lease grant, child-create triggers break, acknowledgment.
+- [x] Extend `ILeaseManager` to track directory lease keys (`LeaseHolder.IsDirectory`, set at grant
+      from `open.LocalOpen.IsDirectory`; `NullLeaseManager` returns no breaks).
+- [x] Grant directory leases on directory CREATE when requested via V2 context — the existing lease
+      grant path is backend-path-keyed and already covers directories (solo dir open → full RH).
+- [x] Break directory leases on child add/remove/rename within the leased directory via new
+      `ILeaseManager.BreakDirectoryLease(directoryFileKey)` + dispatcher helper
+      `BreakParentDirectoryLease(childPhysicalPath)` (`Smb2Dispatcher.Lease.cs`). Hooks:
+      CREATE with `CreateOutcome.Created` (add), CLOSE of a `DeleteOnClose` open (remove),
+      SET_INFO `FileRenameInformation` (rename, both source and target parent). The break drops
+      Handle caching, keeping at most shared Read; the epoch is bumped and a LEASE_BREAK
+      notification is delivered out-of-band to the holder.
+- [x] `SmbOpen.DeleteOnClose` is now kept in sync (CREATE `DeleteOnClose` option + SET_INFO
+      `FileDispositionInformation`) so CLOSE knows an entry will be removed — previously a dead field.
+- [x] Tests: directory lease grant + echoed context, child-create/-delete/-rename each trigger a
+      LEASE_BREAK to Read, acknowledgment answered (`tests/Smb.Tests/DirectoryLeaseTests.cs`, 5 tests).
 
-**Estimated scope:** ~1,200 LOC production + ~600 LOC tests.
+> **Note:** For directories the RH→R downgrade plus the epoch bump/notification is the staleness
+> signal; the client re-enumerates on the break. Same break-before-grant simplification as M1.2 /
+> the classic oplock path (the conflicting change is not blocked on the holder's ack).
+
+**Estimated scope:** ~1,200 LOC production + ~600 LOC tests. *(Actual: ~90 LOC production + ~250 LOC
+tests — most of the lease infrastructure was already in place from M1.1/M1.2.)*
 
 ---
 
@@ -480,7 +496,7 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-06 | Roadmap created | Complete | Baseline: M1–M5 core + async I/O + security audit done |
 | 2026-07-06 | Phase 1 / M1.1 | Complete | Lease state model, context parse/serialize, InMemoryLeaseManager; 18 tests, full suite 175 green |
 | 2026-07-06 | Phase 1 / M1.2 | Complete (break-before-grant deferred) | Lease grant on the wire (CREATE parses "RqLs", echoes granted state), LEASE_BREAK notification + acknowledgment + response, release at CLOSE/teardown; 5 dispatcher tests, full suite 180 green. Blocking break-before-grant wait deferred (same simplification as classic oplocks). |
-| | Phase 1 / M1.3 | Not started | |
+| 2026-07-07 | Phase 1 / M1.3 | Complete | Directory leases: `LeaseHolder.IsDirectory` tracking, `ILeaseManager.BreakDirectoryLease` + dispatcher `BreakParentDirectoryLease`, hooked into CREATE (add), CLOSE/DeleteOnClose (remove) and SET_INFO rename; RH→R downgrade + epoch bump + out-of-band LEASE_BREAK. `SmbOpen.DeleteOnClose` now kept in sync. 5 dispatcher tests (`DirectoryLeaseTests.cs`), full suite 187 green. |
 | | Phase 2 / M2.1 | Not started | |
 | | Phase 2 / M2.2 | Not started | |
 | | Phase 2 / M2.3 | Not started | |

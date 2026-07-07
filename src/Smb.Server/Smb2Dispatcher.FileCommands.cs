@@ -123,6 +123,7 @@ public sealed partial class Smb2Dispatcher
                 _server.Options.ShareModeManager.Close(shareKey, open);
                 return BuildError(header, delStatus);
             }
+            open.DeleteOnClose = true;   // so CLOSE knows the entry will be removed (directory-lease break)
         }
 
         session.Opens[open.Key] = open;
@@ -166,6 +167,11 @@ public sealed partial class Smb2Dispatcher
             DispatchOplockBreaks(grant.Breaks);
         }
         open.OplockLevel = grantedOplock;
+
+        // A newly created entry changes its parent directory's listing → break any directory lease
+        // cached on the parent so the holder re-enumerates (directory leasing, M1.3).
+        if (outcome == CreateOutcome.Created)
+            BreakParentDirectoryLease(handle.PhysicalPath);
 
         FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
         var response = new CreateResponse
@@ -297,8 +303,14 @@ public sealed partial class Smb2Dispatcher
         _server.Options.OplockManager.ReleaseOwner(open);
         _server.Options.LeaseManager.ReleaseOwner(open);
         if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
+
+        // A DELETE_ON_CLOSE entry disappears from its parent directory on dispose → capture the path
+        // beforehand and break the parent's directory lease afterwards (directory leasing, M1.3).
+        string? removedPhysicalPath = open.DeleteOnClose ? open.LocalOpen?.PhysicalPath : null;
         if (open.LocalOpen is not null)
             await open.LocalOpen.DisposeAsync().ConfigureAwait(false);
+        if (removedPhysicalPath is not null)
+            BreakParentDirectoryLease(removedPhysicalPath);
 
         byte[] body = info is null
             ? CloseMessage.BuildResponseBody()
@@ -469,7 +481,13 @@ public sealed partial class Smb2Dispatcher
         if (req.InfoType != InfoType.File)
             return BuildError(header, NtStatus.NotSupported);
 
-        NtStatus status = (FileInformationClass)req.FileInfoClass switch
+        var infoClass = (FileInformationClass)req.FileInfoClass;
+        // The physical path before a rename (its parent dir loses the entry); captured up front because
+        // the handle relocates in place during the rename (directory leasing, M1.3).
+        string? renameOldPhysicalPath = infoClass == FileInformationClass.FileRenameInformation
+            ? open.LocalOpen.PhysicalPath : null;
+
+        NtStatus status = infoClass switch
         {
             FileInformationClass.FileEndOfFileInformation =>
                 await store.SetEndOfFileAsync(open.LocalOpen,
@@ -486,6 +504,18 @@ public sealed partial class Smb2Dispatcher
 
         if (status != NtStatus.Success)
             return BuildError(header, status);
+
+        if (infoClass == FileInformationClass.FileDispositionInformation)
+            // Track the delete intent on the open so CLOSE can break the parent directory lease.
+            open.DeleteOnClose = req.Buffer.Length > 0 && req.Buffer[0] != 0;
+        else if (renameOldPhysicalPath is not null)
+        {
+            // A rename removes the entry from the source directory and adds it to the target directory
+            // → break directory leases on both parents (they coincide for an in-place rename, in which
+            // case the second call is a harmless no-op).
+            BreakParentDirectoryLease(renameOldPhysicalPath);
+            BreakParentDirectoryLease(open.LocalOpen.PhysicalPath);
+        }
 
         return MaybeSigned(session, RespHeader(header, session), SetInfoMessage.BuildResponseBody());
     }

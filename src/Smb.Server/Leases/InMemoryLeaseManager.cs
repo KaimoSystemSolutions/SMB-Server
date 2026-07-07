@@ -15,9 +15,14 @@ namespace Smb.Server.Leases;
 /// <item>Once a <b>second, distinct</b> lease key accesses the same file, all write/handle caching
 /// breaks down to Read (shared read caching is preserved); the new lease also receives at most Read.</item>
 /// </list>
-/// The <c>Epoch</c> (lease V2) is incremented on every server-initiated state change. Not yet
-/// modelled (deferred to later passes / Phase 4): waiting for the break acknowledgment before the
-/// conflicting access proceeds, and parent/directory lease relationships.
+/// The <c>Epoch</c> (lease V2) is incremented on every server-initiated state change.
+/// <para>
+/// <b>Directory leases (M1.3):</b> a lease whose open is a directory is tracked as a directory lease.
+/// <see cref="BreakDirectoryLease"/> downgrades such a lease (dropping Handle caching, keeping at most
+/// shared Read) when a child is added/removed/renamed inside the directory, so the client re-reads its
+/// cached enumeration. Not yet modelled (deferred to later passes / Phase 4): waiting for the break
+/// acknowledgment before the conflicting access proceeds.
+/// </para>
 /// </summary>
 public sealed class InMemoryLeaseManager : ILeaseManager
 {
@@ -79,6 +84,7 @@ public sealed class InMemoryLeaseManager : ILeaseManager
                 {
                     State = granted,
                     Epoch = request.IsV2 ? request.Epoch : (ushort)0,
+                    IsDirectory = open.LocalOpen?.IsDirectory ?? false,
                 };
                 holder.Opens.Add(open);
                 _byKey[key] = holder;
@@ -123,6 +129,33 @@ public sealed class InMemoryLeaseManager : ILeaseManager
         }
     }
 
+    public IReadOnlyList<LeaseBreak> BreakDirectoryLease(string directoryFileKey)
+    {
+        lock (_gate)
+        {
+            if (!_fileKeys.TryGetValue(directoryFileKey, out HashSet<LeaseKey>? keys) || keys.Count == 0)
+                return Array.Empty<LeaseBreak>();
+
+            List<LeaseBreak>? breaks = null;
+            foreach (LeaseKey key in keys)
+            {
+                LeaseHolder h = _byKey[key];
+                if (!h.IsDirectory) continue;   // only directory leases care about child changes
+
+                // A change inside the directory invalidates the client's cached handle/enumeration:
+                // drop Handle caching (a directory lease never holds Write), keeping at most shared Read.
+                LeaseState reduced = h.State & LeaseState.Read;
+                if (reduced == h.State) continue;   // already ≤ Read → nothing to break
+
+                LeaseState from = h.State;
+                h.State = reduced;
+                h.Epoch++;
+                (breaks ??= new List<LeaseBreak>()).Add(new LeaseBreak(h.Key, from, reduced, h.Epoch, First(h.Opens)));
+            }
+            return breaks ?? (IReadOnlyList<LeaseBreak>)Array.Empty<LeaseBreak>();
+        }
+    }
+
     // --- internal ---
 
     private HashSet<LeaseKey> GetOrAddFile(string fileKey)
@@ -153,6 +186,7 @@ public sealed class InMemoryLeaseManager : ILeaseManager
         public string FileKey { get; } = fileKey;
         public LeaseState State { get; set; }
         public ushort Epoch { get; set; }
+        public bool IsDirectory { get; init; }
         public HashSet<SmbOpen> Opens { get; } = new();
     }
 }
