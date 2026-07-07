@@ -269,37 +269,59 @@ tests — the `AccessCheck` evaluator and SD model were already in place from M3
 Handles that survive network interruptions are essential for enterprise reliability
 (laptop standby, Wi-Fi roaming, brief outages).
 
-### M4.1 — Durable handles (v1, SMB 2.x)
+### M4.1 — Durable handles (v1, SMB 2.x) ✅
 
-- [ ] Parse `SMB2_CREATE_DURABLE_HANDLE_REQUEST` / `_RECONNECT` create contexts.
-- [ ] On CREATE with durable request: persist the `SmbOpen` state (file path, access,
-      share mode, lease key, position) in a `DurableHandleStore`.
-- [ ] On TCP disconnect: do not release durable opens; start a configurable timeout
-      (default 60 s).
-- [ ] On reconnect with `DURABLE_HANDLE_RECONNECT`: restore the open, verify
-      identity match, resume.
-- [ ] On timeout expiry: release the open normally (close handle, release locks).
-- [ ] Tests: disconnect → reconnect within timeout succeeds, expired handle returns
-      `STATUS_OBJECT_NAME_NOT_FOUND`, identity mismatch rejected.
+- [x] Parse `SMB2_CREATE_DURABLE_HANDLE_REQUEST` ("DHnQ") / `_RECONNECT` ("DHnC") create contexts
+      (`Smb.Protocol.Messages.DurableHandleMessages`).
+- [x] On CREATE with a durable request: grant durability only when the open holds a batch/exclusive
+      oplock or a handle-caching lease (§3.3.5.9.6, `DurabilityAllowed`); assign a stable server-unique
+      persistent FileId (`SmbServerState.AllocatePersistentId`, high bit set), mark `SmbOpen.IsDurable`
+      and echo a "DHnQ" response context. A request without a caching guarantee is ignored (client falls
+      back to a normal handle).
+- [x] On transport drop (`OnConnectionClosed`): durable opens are **not** released — they are registered
+      in the `IDurableHandleStore` with a deadline (`DurableHandleTimeout`, default 60 s) while their
+      backend handle, locks, oplock/lease and share-mode reservation stay intact.
+- [x] On reconnect ("DHnC"): `HandleDurableReconnectAsync` claims the open by FileId, verifies it is not
+      expired and is owned by the same principal (`OwnerKey`), re-attaches it to the new session/tree and
+      resumes. Not found/expired → `STATUS_OBJECT_NAME_NOT_FOUND`; wrong principal → `STATUS_ACCESS_DENIED`
+      (handle kept).
+- [x] On timeout expiry: `ScavengeDurableHandles()` (host-driven, `TimeProvider`-based) releases the open
+      normally (dispose handle, release locks/oplock/lease/share mode).
+- [x] Tests: `DurableHandleTests` (5) reconnect-within-timeout succeeds + reads, expired → scavenged →
+      `OBJECT_NAME_NOT_FOUND`, principal mismatch denied but owner still reconnects, grant only with an
+      oplock; `DurableHandleMessagesTests` (6) protocol round-trips.
 
-### M4.2 — Resilient handles (SMB 3.0)
+### M4.2 — Resilient / persistent handles (SMB 3.0) ✅
 
-- [ ] Parse `SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2` / `_RECONNECT_V2` contexts.
-- [ ] Support `CREATE_FLAG_PERSISTENT` for persistent handles (CA shares).
-- [ ] Resilient handles survive across sessions (not just connections).
-- [ ] Timeout configurable via `SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2.Timeout`.
-- [ ] Tests: session-level reconnect, persistent handle across full server restart
-      (requires serializable handle store).
+- [x] Parse `SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2` ("DH2Q") / `_RECONNECT_V2` ("DH2C") contexts
+      (create GUID, requested timeout, persistent flag).
+- [x] Support the persistent flag for CA shares: new `IShare.ContinuousAvailability`; a persistent
+      request is honored only on a CA share (else downgraded to a normal durable handle). Persistent
+      handles never time out (skipped by the scavenger and the reconnect expiry check).
+- [x] Resilient handles survive across sessions — the store is global and a reconnect is validated by
+      FileId + create GUID + principal (not by session), so any new session of the same user reconnects.
+- [x] Timeout honored from the v2 request (`ResolveDurableTimeout`, 0 = server default, clamped to
+      `MaxDurableHandleTimeout`, default 16 min); a v2 reconnect must present the matching create GUID.
+- [x] Tests: `DurableHandleTests` v2 additions (4) — v2 grant with timeout+GUID, GUID-mismatched
+      reconnect rejected, persistent handle on a CA share survives a 2 h gap + scavenge, persistent flag
+      on a non-CA share downgraded (still expires).
 
-### M4.3 — Persistent handle store interface
+### M4.3 — Persistent handle store interface ✅
 
-- [ ] Define `IDurableHandleStore` interface for persisting handle state beyond
-      process lifetime (needed for server restart resilience).
-- [ ] Implement `InMemoryDurableHandleStore` (default, survives TCP drops but not
-      process restart).
-- [ ] Document the interface for external implementations (SQLite, Redis, etc.).
+- [x] `IDurableHandleStore` (`src/Smb.Server/Durable/`) defines the durable/persistent open storage seam
+      (`Add` / `TryClaim` / `TakeExpired` / `TakeAll`), swappable via `SmbServerOptions.DurableHandleStore`.
+- [x] `InMemoryDurableHandleStore` — default, process-local (survives TCP drops, not a process restart).
+- [x] Documented the contract for out-of-process implementations (SQLite/Redis): persist each entry's
+      reconnect metadata and **rehydrate a live `SmbOpen` in `TryClaim`** after a restart (the dispatcher
+      resumes I/O directly on `DurableHandle.Open`); only persistent (CA) entries must be recoverable.
 
-**Estimated scope:** ~1,800 LOC production + ~700 LOC tests.
+> **Modularity:** durable-handle wire parsing is pure in `Smb.Protocol`; the storage is the
+> `IDurableHandleStore` seam; expiry uses the injectable `SmbServerOptions.TimeProvider`. **Phase 4
+> complete** (in-process). Cross-process *restart* survival for persistent handles is a documented
+> extension point (a serializable store that rehydrates opens), not covered by the in-memory default.
+
+**Estimated scope:** ~1,800 LOC production + ~700 LOC tests. *(Actual: ~330 LOC production + ~330 LOC
+tests — much of Phase 4 reused the existing CREATE-context chain parser and lease/oplock managers.)*
 
 ---
 
@@ -599,7 +621,9 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 3 / M3.1 | Complete | Security-descriptor model in `Smb.Protocol.Security`: `Sid`, `Ace`/`Acl`, self-relative `SecurityDescriptor`, `WellKnownSids`, plus the pure `AccessCheck` evaluator (MS-DTYP §2.5.3.2). 25+ tests. |
 | 2026-07-07 | Phase 3 / M3.2 | Complete | QUERY/SET_SECURITY over the dispatcher; `IFileStore.Get/SetSecurityAsync` (default NotSupported), `LocalFileStore` via the pluggable `ISecurityDescriptorStore` (default in-memory, permissive fallback). 3 dispatcher tests, suite 267 green. |
 | 2026-07-07 | Phase 3 / M3.3 | Complete | Access-check enforcement. CREATE evaluates the file DACL against the caller's SIDs (generic→specific mapping via `AccessMask.MapGenericToSpecific`), caps `SmbOpen.GrantedAccess`, rolls back on denial; NotSupported backends fall back to share-level only. Per-op enforcement on READ (`FILE_READ_DATA`), WRITE (`WRITE`/`APPEND`), SET_INFO delete/rename (`DELETE`) and EOF (`FILE_WRITE_DATA`). ACE inheritance for new entries (`AclInheritance.ComputeInherited`) wired into `LocalFileStore`. 12 tests (`AclInheritanceTests` 7, `AccessEnforcementTests` 5), full suite 287 green. **Phase 3 complete.** |
-| | Phase 4 / M4.1 | Not started | |
+| 2026-07-07 | Phase 4 / M4.1 | Complete | Durable handles v1. `DurableHandleMessages` (DHnQ/DHnC parse/serialize); grant gated on batch/exclusive oplock or handle-lease (`DurabilityAllowed`), stable persistent FileId (`AllocatePersistentId`); `OnConnectionClosed` preserves durable opens in `IDurableHandleStore` with a `TimeProvider`-based deadline; reconnect restores by FileId + principal; `ScavengeDurableHandles` releases expired. `SmbOpen.Session/TreeConnect/PersistentFileId` now settable for re-attach. 11 tests (`DurableHandleTests` 5, `DurableHandleMessagesTests` 6), suite 298 green. |
+| 2026-07-07 | Phase 4 / M4.2 | Complete | Durable/persistent v2. DH2Q/DH2C (create GUID, requested timeout, persistent flag); `IShare.ContinuousAvailability` gates persistent handles (else downgraded); persistent never scavenged; cross-session reconnect (global store, validated by FileId+GUID+principal); `ResolveDurableTimeout` clamps to `MaxDurableHandleTimeout` (16 min). 4 v2 dispatcher tests, suite 302 green. |
+| 2026-07-07 | Phase 4 / M4.3 | Complete | `IDurableHandleStore` seam + `InMemoryDurableHandleStore` (default) — introduced in M4.1, documented in M4.3 for out-of-process (SQLite/Redis) stores incl. the rehydrate-live-`SmbOpen`-in-`TryClaim` contract for restart survival. **Phase 4 complete (in-process); cross-restart persistence is a documented extension point.** |
 | | Phase 4 / M4.2 | Not started | |
 | | Phase 4 / M4.3 | Not started | |
 | | Phase 5 / M5.1 | Not started | |

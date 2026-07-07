@@ -17,6 +17,13 @@ public interface IShare
     /// <summary>Forces encryption for this share (Context §11, §20).</summary>
     bool EncryptData { get; }
 
+    /// <summary>
+    /// Continuous availability (SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY, §2.2.10). When set the share
+    /// grants <b>persistent</b> handles (survive across sessions and, with a serializable handle store,
+    /// server restarts). Off by default; a plain share still grants durable handles.
+    /// </summary>
+    bool ContinuousAvailability { get; }
+
     /// <summary>Optional comment/remark (TREE_CONNECT info).</summary>
     string Remark { get; }
 }
@@ -28,6 +35,7 @@ public sealed class Share : IShare
     public ShareType Type { get; init; } = ShareType.Disk;
     public IFileStore? FileStore { get; init; }
     public bool EncryptData { get; init; }
+    public bool ContinuousAvailability { get; init; }
     public string Remark { get; init; } = string.Empty;
 
     /// <summary>Creates the mandatory <c>IPC$</c> share (PIPE) that many clients connect first (Context §12, §23).</summary>

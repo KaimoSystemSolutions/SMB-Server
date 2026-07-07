@@ -2,6 +2,7 @@ using Smb.Auth;
 using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Server.Authorization;
+using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Locking;
 using Smb.Server.Notification;
@@ -136,6 +137,32 @@ public sealed class SmbServerOptions
     /// to delegate to a cluster/cross-protocol coordinator (e.g. TrueNAS SMB+NFS).
     /// </summary>
     public IShareModeManager ShareModeManager { get; set; } = new InMemoryShareModeManager();
+
+    /// <summary>
+    /// Durable/persistent handle storage (Phase 4). Default <see cref="InMemoryDurableHandleStore"/>
+    /// (survives transport drops but not a process restart). Replace with a serializable store to also
+    /// survive server restarts for persistent (CA) handles.
+    /// </summary>
+    public IDurableHandleStore DurableHandleStore { get; set; } = new InMemoryDurableHandleStore();
+
+    /// <summary>
+    /// How long a durable open is preserved after a transport drop before it is scavenged (MS-SMB2
+    /// §3.3.5.9.6 durable v1 default; a durable-v2 client can request a shorter/longer value). Windows
+    /// caps this around 16 minutes; the library default is a conservative 60 seconds.
+    /// </summary>
+    public TimeSpan DurableHandleTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Upper bound the server clamps a durable-v2 client's requested timeout to (§2.2.13.2.11). Windows
+    /// caps around 16 minutes; a client value of 0 means "server decides" → <see cref="DurableHandleTimeout"/>.
+    /// </summary>
+    public TimeSpan MaxDurableHandleTimeout { get; set; } = TimeSpan.FromMinutes(16);
+
+    /// <summary>
+    /// Time source for durable-handle deadlines/scavenging (and future timeouts). Default
+    /// <see cref="System.TimeProvider.System"/>; inject a fake in tests for deterministic expiry.
+    /// </summary>
+    public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
 
     /// <summary>Validates the configuration and throws on misconfiguration.</summary>
     public void Validate()

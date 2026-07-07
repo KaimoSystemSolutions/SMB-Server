@@ -11,13 +11,33 @@ namespace Smb.Server.State;
 /// </summary>
 public sealed class SmbOpen
 {
-    public required ulong PersistentFileId { get; init; }
+    /// <summary>
+    /// Persistent FileId. Zero for a non-durable open; a durable open (Phase 4) is assigned a stable,
+    /// server-unique non-zero value so the client can reconnect to it after a transport drop.
+    /// </summary>
+    public ulong PersistentFileId { get; set; }
     public required ulong VolatileFileId { get; init; }
-    public required SmbSession Session { get; init; }
-    public required SmbTreeConnect TreeConnect { get; init; }
+
+    /// <summary>Owning session/tree. Settable so a durable reconnect can re-attach the open to a new session.</summary>
+    public SmbSession Session { get; set; } = null!;
+    public SmbTreeConnect TreeConnect { get; set; } = null!;
 
     /// <summary>Backend handle (<c>Open.LocalOpen</c>).</summary>
     public IFileHandle? LocalOpen { get; set; }
+
+    // --- Durable / persistent handles (Phase 4) ---
+
+    /// <summary>True once a durable-handle request has been granted (survives a transport drop).</summary>
+    public bool IsDurable { get; set; }
+
+    /// <summary>How long the open is preserved after a disconnect before being scavenged (v1 default / v2 requested).</summary>
+    public TimeSpan DurableTimeout { get; set; }
+
+    /// <summary>Durable-v2 create GUID (<see cref="System.Guid.Empty"/> for v1). Matched on a v2 reconnect.</summary>
+    public Guid DurableCreateGuid { get; set; }
+
+    /// <summary>Persistent handle (v2 CA share): survives across sessions and never times out.</summary>
+    public bool IsPersistentHandle { get; set; }
 
     public uint GrantedAccess { get; set; }
     public SmbFileAttributes FileAttributes { get; set; }

@@ -13,6 +13,7 @@ public sealed class SmbServerState
 {
     private long _sessionIdCounter;
     private long _sessionGlobalIdCounter;
+    private long _persistentIdCounter;
 
     public SmbServerState(SmbServerOptions options)
     {
@@ -56,4 +57,10 @@ public sealed class SmbServerState
     }
 
     public ulong AllocateSessionGlobalId() => (ulong)Interlocked.Increment(ref _sessionGlobalIdCounter);
+
+    /// <summary>
+    /// Allocates a stable, server-unique non-zero persistent FileId for a durable/persistent open
+    /// (Phase 4). The high bit is set so it never collides with a per-connection volatile id space.
+    /// </summary>
+    public ulong AllocatePersistentId() => 0x8000_0000_0000_0000UL | (ulong)Interlocked.Increment(ref _persistentIdCounter);
 }

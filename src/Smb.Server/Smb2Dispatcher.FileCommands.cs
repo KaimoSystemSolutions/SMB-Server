@@ -6,6 +6,7 @@ using Smb.Protocol.Messages;
 using Smb.Protocol.Messages.Fscc;
 using Smb.Protocol.Security;
 using Smb.Protocol.Wire;
+using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Oplocks;
 using Smb.Server.Rpc;
@@ -66,6 +67,15 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.NotSupported);
 
         CreateRequest request = CreateRequest.Parse(segment.Span, Smb2Header.Size);
+
+        // [M4.1/M4.2] Durable-handle reconnect ("DHnC"/"DH2C"): restore an open preserved across a
+        // transport drop instead of opening a new backend handle (§3.3.5.9.7).
+        CreateContext? reconnectV2Ctx = CreateContextList.Find(request.Contexts, CreateContextNames.DurableHandleReconnectV2);
+        if (reconnectV2Ctx is not null)
+            return await HandleDurableReconnectV2Async(header, session, tree, reconnectV2Ctx).ConfigureAwait(false);
+        CreateContext? reconnectCtx = CreateContextList.Find(request.Contexts, CreateContextNames.DurableHandleReconnect);
+        if (reconnectCtx is not null)
+            return await HandleDurableReconnectAsync(header, session, tree, reconnectCtx).ConfigureAwait(false);
 
         // [AUDIT-2026-06] Enforce DesiredAccess against the MaximalAccess granted by the
         // authorization policy (§3.3.5.9). Previously DesiredAccess was granted unfiltered →
@@ -162,7 +172,7 @@ public sealed partial class Smb2Dispatcher
         // The two are mutually exclusive per open — grant whichever was asked for, mirror it in the
         // response (and, for a lease, echo the granted state back in a response context).
         OplockLevel grantedOplock;
-        byte[]? responseContexts = null;
+        var responseCtxList = new List<CreateContext>();
 
         CreateContext? leaseContext = CreateContextList.Find(request.Contexts, CreateContextNames.Lease);
         if (leaseContext is not null)
@@ -177,13 +187,10 @@ public sealed partial class Smb2Dispatcher
             DispatchLeaseBreaks(leaseGrant.Breaks);
 
             grantedOplock = OplockLevel.Lease;
-            responseContexts = CreateContextList.Serialize(new CreateContext[]
+            responseCtxList.Add(new CreateContext
             {
-                new()
-                {
-                    Name = leaseContext.Name,
-                    Data = leaseReq.SerializeResponse(leaseGrant.GrantedState, leaseGrant.Epoch),
-                },
+                Name = leaseContext.Name,
+                Data = leaseReq.SerializeResponse(leaseGrant.GrantedState, leaseGrant.Epoch),
             });
         }
         else
@@ -196,11 +203,44 @@ public sealed partial class Smb2Dispatcher
         }
         open.OplockLevel = grantedOplock;
 
+        // [M4.1/M4.2] Durable-handle request ("DHnQ"/"DH2Q"): grant durability only when the open holds a
+        // caching guarantee that lets the client safely reconnect (a batch/exclusive oplock or a lease
+        // with handle caching, §3.3.5.9.6). The open then gets a stable persistent FileId and is preserved
+        // on a transport drop instead of being released. A request without such a guarantee is ignored
+        // (the client falls back to a normal handle), which is spec-compliant. v2 additionally carries a
+        // create GUID (matched on reconnect), a client-requested timeout, and an optional persistent flag
+        // (honored only on a continuously-available share).
+        CreateContext? durableV2 = CreateContextList.Find(request.Contexts, CreateContextNames.DurableHandleRequestV2);
+        CreateContext? durableV1 = CreateContextList.Find(request.Contexts, CreateContextNames.DurableHandleRequest);
+        if ((durableV2 is not null || durableV1 is not null) && DurabilityAllowed(grantedOplock, open.LeaseState))
+        {
+            session.Opens.TryRemove(open.Key, out _);          // re-key: persistent id changes from 0
+            open.PersistentFileId = _server.AllocatePersistentId();
+            open.IsDurable = true;
+
+            if (durableV2 is not null)
+            {
+                DurableHandleMessages.V2Request v2 = DurableHandleMessages.ParseV2Request(durableV2.Data);
+                open.DurableCreateGuid = v2.CreateGuid;
+                open.IsPersistentHandle = v2.IsPersistent && tree.Share.ContinuousAvailability;
+                open.DurableTimeout = ResolveDurableTimeout(v2.TimeoutMs);
+                responseCtxList.Add(DurableHandleMessages.BuildV2ResponseContext(
+                    (uint)open.DurableTimeout.TotalMilliseconds, open.IsPersistentHandle));
+            }
+            else
+            {
+                open.DurableTimeout = _server.Options.DurableHandleTimeout;
+                responseCtxList.Add(DurableHandleMessages.BuildV1ResponseContext());
+            }
+            session.Opens[open.Key] = open;
+        }
+
         // A newly created entry changes its parent directory's listing → break any directory lease
         // cached on the parent so the holder re-enumerates (directory leasing, M1.3).
         if (outcome == CreateOutcome.Created)
             BreakParentDirectoryLease(handle.PhysicalPath);
 
+        byte[]? responseContexts = responseCtxList.Count > 0 ? CreateContextList.Serialize(responseCtxList) : null;
         FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
         var response = new CreateResponse
         {
@@ -742,6 +782,24 @@ public sealed partial class Smb2Dispatcher
     {
         foreach (SmbOpen open in session.Opens.Values)
         {
+            // [M4.1] A durable open is preserved across the transport drop: register it in the durable
+            // store with a deadline and keep its backend handle, locks, oplock/lease and share-mode
+            // reservation intact. It is restored on reconnect or released by the scavenger on expiry.
+            if (open.IsDurable && open.LocalOpen is not null)
+            {
+                _server.Options.DurableHandleStore.Add(new DurableHandle
+                {
+                    PersistentId = open.PersistentFileId,
+                    VolatileId = open.VolatileFileId,
+                    Open = open,
+                    Deadline = _server.Options.TimeProvider.GetUtcNow() + open.DurableTimeout,
+                    OwnerKey = OwnerKey(session.Identity),
+                    CreateGuid = open.DurableCreateGuid,
+                    IsPersistent = open.IsPersistentHandle,
+                });
+                continue;
+            }
+
             _server.Options.LockManager.ReleaseOwner(open);
             _server.Options.OplockManager.ReleaseOwner(open);
             _server.Options.LeaseManager.ReleaseOwner(open);
@@ -749,6 +807,143 @@ public sealed partial class Smb2Dispatcher
             open.LocalOpen?.Dispose();
         }
         session.Opens.Clear();
+    }
+
+    // --- Durable / persistent handles (Phase 4, M4.1) ---
+
+    /// <summary>
+    /// Restores a durable open (preserved across a transport drop) into the reconnecting session
+    /// (§3.3.5.9.7). Validates the FileId is registered, not yet expired, and owned by the same
+    /// principal, then re-attaches the existing open (backend handle, locks, oplock/lease, share-mode
+    /// reservation are all intact) to the new session/tree and answers as an ordinary CREATE.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleDurableReconnectAsync(
+        Smb2Header header, SmbSession session, SmbTreeConnect tree, CreateContext reconnectCtx)
+    {
+        (ulong persistentId, ulong volatileId) = DurableHandleMessages.ParseReconnect(reconnectCtx.Data);
+        if (!TryClaimForReconnect(header, session, persistentId, volatileId, expectedGuid: null, out DurableHandle dh, out ResponseSegment error))
+            return error;
+        return await RestoreDurableOpenAsync(header, session, tree, dh, DurableHandleMessages.BuildV1ResponseContext()).ConfigureAwait(false);
+    }
+
+    private async ValueTask<ResponseSegment> HandleDurableReconnectV2Async(
+        Smb2Header header, SmbSession session, SmbTreeConnect tree, CreateContext reconnectCtx)
+    {
+        DurableHandleMessages.V2Reconnect rc = DurableHandleMessages.ParseV2Reconnect(reconnectCtx.Data);
+        if (!TryClaimForReconnect(header, session, rc.PersistentId, rc.VolatileId, rc.CreateGuid, out DurableHandle dh, out ResponseSegment error))
+            return error;
+        CreateContext responseCtx = DurableHandleMessages.BuildV2ResponseContext(
+            (uint)dh.Open.DurableTimeout.TotalMilliseconds, dh.IsPersistent);
+        return await RestoreDurableOpenAsync(header, session, tree, dh, responseCtx).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Claims a durable open for a reconnect and validates it: exists, not expired, matching create GUID
+    /// (v2) and owned by the same principal. On any failure the handle is left intact (re-added when it
+    /// was claimed) and <paramref name="error"/> carries the status to return.
+    /// </summary>
+    private bool TryClaimForReconnect(
+        Smb2Header header, SmbSession session, ulong persistentId, ulong volatileId, Guid? expectedGuid,
+        out DurableHandle dh, out ResponseSegment error)
+    {
+        error = default;
+        if (!_server.Options.DurableHandleStore.TryClaim(persistentId, volatileId, out dh))
+        {
+            error = BuildError(header, NtStatus.ObjectNameNotFound); // unknown or already scavenged
+            return false;
+        }
+
+        // Expired but not yet scavenged → release it now and report as gone.
+        if (!dh.IsPersistent && dh.Deadline <= _server.Options.TimeProvider.GetUtcNow())
+        {
+            ReleaseDurable(dh);
+            error = BuildError(header, NtStatus.ObjectNameNotFound);
+            return false;
+        }
+
+        // A v2 reconnect must present the create GUID the handle was granted with (§3.3.5.9.12).
+        if (expectedGuid is { } guid && dh.CreateGuid != guid)
+        {
+            _server.Options.DurableHandleStore.Add(dh);
+            error = BuildError(header, NtStatus.ObjectNameNotFound);
+            return false;
+        }
+
+        // The reconnect must come from the same principal; otherwise keep the handle and refuse.
+        if (!string.Equals(dh.OwnerKey, OwnerKey(session.Identity), StringComparison.Ordinal))
+        {
+            _server.Options.DurableHandleStore.Add(dh);
+            error = BuildError(header, NtStatus.AccessDenied);
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>Re-attaches a validated durable open to the reconnecting session and answers as a CREATE.</summary>
+    private async ValueTask<ResponseSegment> RestoreDurableOpenAsync(
+        Smb2Header header, SmbSession session, SmbTreeConnect tree, DurableHandle dh, CreateContext responseContext)
+    {
+        SmbOpen open = dh.Open;
+        open.Session = session;
+        open.TreeConnect = tree;
+        session.Opens[open.Key] = open;
+        Interlocked.Increment(ref tree.OpenCount);
+
+        FileEntryInfo info = await open.LocalOpen!.GetInfoAsync().ConfigureAwait(false);
+        var response = new CreateResponse
+        {
+            OplockLevel = open.OplockLevel,
+            CreateAction = CreateAction.Opened,
+            CreationTime = info.CreationTime,
+            LastAccessTime = info.LastAccessTime,
+            LastWriteTime = info.LastWriteTime,
+            ChangeTime = info.ChangeTime,
+            AllocationSize = info.AllocationSize,
+            EndOfFile = info.EndOfFile,
+            FileAttributes = (uint)info.Attributes,
+            PersistentFileId = open.PersistentFileId,
+            VolatileFileId = open.VolatileFileId,
+        };
+        byte[] responseContexts = CreateContextList.Serialize(new[] { responseContext });
+        return MaybeSigned(session, RespHeader(header, session), response.ToBody(responseContexts));
+    }
+
+    /// <summary>Resolves a durable-v2 client's requested timeout (0 = server default, clamped to the max).</summary>
+    private TimeSpan ResolveDurableTimeout(uint requestedMs)
+    {
+        if (requestedMs == 0)
+            return _server.Options.DurableHandleTimeout;
+        var requested = TimeSpan.FromMilliseconds(requestedMs);
+        return requested > _server.Options.MaxDurableHandleTimeout ? _server.Options.MaxDurableHandleTimeout : requested;
+    }
+
+    /// <summary>Durability is only granted with a batch/exclusive oplock or a handle-caching lease (§3.3.5.9.6).</summary>
+    private static bool DurabilityAllowed(OplockLevel oplock, LeaseState lease)
+        => oplock is OplockLevel.Batch or OplockLevel.Exclusive || lease.HasFlag(LeaseState.Handle);
+
+    /// <summary>Stable identity key used to bind a durable handle to its owner (SID preferred, else Domain\User).</summary>
+    private static string OwnerKey(SecurityIdentity? identity)
+        => identity?.UserSid ?? (identity is null ? "<none>" : $"{identity.DomainName}\\{identity.UserName}");
+
+    /// <summary>
+    /// Releases every durable open whose timeout has elapsed (the scavenger). A host calls this
+    /// periodically; expiry is measured against <see cref="SmbServerOptions.TimeProvider"/>.
+    /// </summary>
+    public void ScavengeDurableHandles()
+    {
+        foreach (DurableHandle dh in _server.Options.DurableHandleStore.TakeExpired(_server.Options.TimeProvider.GetUtcNow()))
+            ReleaseDurable(dh);
+    }
+
+    /// <summary>Fully releases a durable open's server-side state (backend handle, locks, oplock/lease, share mode).</summary>
+    private void ReleaseDurable(DurableHandle dh)
+    {
+        SmbOpen open = dh.Open;
+        _server.Options.LockManager.ReleaseOwner(open);
+        _server.Options.OplockManager.ReleaseOwner(open);
+        _server.Options.LeaseManager.ReleaseOwner(open);
+        if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
+        open.LocalOpen?.Dispose();
     }
 
     /// <summary>
