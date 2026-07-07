@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- OPT-IN LDAP binding: concrete ILdapSearcher over System.DirectoryServices.Protocols.
+       Kept in its own assembly so the external LDAP dependency is never forced on consumers
+       of the core Smb.Auth (which stays dependency-free behind the ILdapSearcher seam). -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Auth.Ldap</RootNamespace>
+    <AssemblyName>Smb.Auth.DirectoryServices</AssemblyName>
+    <Description>Opt-in System.DirectoryServices.Protocols (LDAP/LDAPS) binding for the Smb.Auth LDAP identity backend. Implements ILdapSearcher against a domain controller. Part of the Smb.* server library.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.DirectoryServices.Protocols" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Auth\Smb.Auth.csproj" />
+  </ItemGroup>
+</Project>

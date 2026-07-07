@@ -128,14 +128,44 @@ SMB integration.
 > `IKerberosTicketValidator` implementation the library user provides — it is intentionally out of the
 > core so there is no platform lock-in and the seam stays fully testable with a fake validator.
 
-### M2.2 — LDAP/AD identity backend
+### M2.2 — LDAP/AD identity backend ✅
 
-- [ ] Implement `LdapIdentityBackend : IIdentityBackend` that resolves users and
-      groups against Active Directory via LDAP(S).
-- [ ] Support SID ↔ sAMAccountName resolution for ACL display.
-- [ ] Connection pooling and caching for LDAP queries.
-- [ ] Configuration: domain controller address, bind credentials, search base.
-- [ ] Tests: identity resolution, group membership, cache invalidation.
+**Design for modularity + dependency isolation:** the identity-resolution logic (LDAP attribute →
+`SecurityIdentity` mapping, caching, SID conversion) lives in the dependency-free core `Smb.Auth`
+behind a tiny **`ILdapSearcher`** seam, so it is fully unit-testable with a fake directory and free of
+any platform LDAP dependency. The concrete `System.DirectoryServices.Protocols` searcher (the actual
+network binding to a DC) goes in a **separate opt-in project** so the LDAP dependency is never forced
+on consumers who do not need it (the single-package embed stays clean).
+
+Incremental plan (each step self-contained + tested):
+
+- [x] **A** — `SidConverter` (`src/Smb.Auth/Ldap/`): binary ↔ string SID (MS-DTYP §2.4.2.2) and the
+      `\HH`-escaped form for LDAP `objectSid` filters. Pure, no dependency. *(done)*
+- [x] **B** — `ILdapSearcher` + `LdapEntry` (multi-valued, binary-safe, case-insensitive attrs) +
+      `LdapIdentityBackendOptions` (base DN, filter/attribute names, cache TTL). Connection/bind config
+      is intentionally left to the concrete searcher. *(done)*
+- [x] **C** — `LdapIdentityBackend : IIdentityBackend`: `Resolve` maps `objectSid` + transitive group
+      SIDs (`tokenGroups`, with a `memberOf`-DN fallback) + UPN to `SecurityIdentity` (new
+      `SecurityIdentity.UserPrincipalName`); RFC 4515 filter escaping (`LdapFilter.Escape`);
+      `TryGetNtHash` returns false (AD does not expose NT hashes over LDAP — NTLM needs Kerberos or a
+      Netlogon secure channel). 5 tests. *(done)*
+- [x] **D** — `TtlCache` (via `TimeProvider` for deterministic expiry) for identity + SID↔name lookups;
+      `ISidResolver` seam (`TryGetAccountName` / `TryGetSid`) implemented by the backend for ACL display
+      (Phase 3); `ClearCache()`. AD correctness fix: `tokenGroups` is read with a **Base-scope** lookup
+      on the user DN (it is empty on a subtree search). 4 tests. *(done)*
+- [x] **E** — `DirectoryServicesLdapSearcher` + `LdapConnectionOptions` in the separate opt-in project
+      **`Smb.Auth.DirectoryServices`** (assembly `Smb.Auth.DirectoryServices`, namespace `Smb.Auth.Ldap`)
+      wrapping `System.DirectoryServices.Protocols` (LDAP/LDAPS, Negotiate/Basic bind, connection reuse,
+      raw-byte attribute extraction). The external dependency lives only here, never in core `Smb.Auth`.
+      4 wiring/validation tests; the live round-trip is an integration test against a real DC. *(done)*
+
+**Modularity summary:** core `Smb.Auth` gains LDAP identity resolution with **zero** external
+dependency (behind `ILdapSearcher`); consumers who want the real network binding opt into the
+`Smb.Auth.DirectoryServices` assembly, or implement `ILdapSearcher` themselves.
+
+> **Packaging follow-up:** `Smb.Auth.DirectoryServices` is intentionally *not* embedded in the
+> single `SMB-Server` package (that would force `System.DirectoryServices.Protocols` on everyone). To
+> ship it to external consumers it needs its own NuGet package (or the consumer references the source).
 
 ### M2.3 — NTLM hardening (deferred audit items)
 
@@ -517,6 +547,7 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-06 | Phase 1 / M1.2 | Complete (break-before-grant deferred) | Lease grant on the wire (CREATE parses "RqLs", echoes granted state), LEASE_BREAK notification + acknowledgment + response, release at CLOSE/teardown; 5 dispatcher tests, full suite 180 green. Blocking break-before-grant wait deferred (same simplification as classic oplocks). |
 | 2026-07-07 | Phase 1 / M1.3 | Complete | Directory leases: `LeaseHolder.IsDirectory` tracking, `ILeaseManager.BreakDirectoryLease` + dispatcher `BreakParentDirectoryLease`, hooked into CREATE (add), CLOSE/DeleteOnClose (remove) and SET_INFO rename; RH→R downgrade + epoch bump + out-of-band LEASE_BREAK. `SmbOpen.DeleteOnClose` now kept in sync. 5 dispatcher tests (`DirectoryLeaseTests.cs`), full suite 187 green. |
 | 2026-07-07 | Phase 2 / M2.1 | Complete (platform binding = user seam) | Composable `SpnegoNegotiator` (ordered `IGssMechanismFactory` list, mech selection + SPNEGO wrap/unwrap, raw-NTLM path); `NtlmSpnegoNegotiator` now delegates to it. `KerberosServerMechanism` + `KerberosGssToken` framing delegating ticket crypto to injectable `IKerberosTicketValidator`; `Kerberos`/`NtlmMechanismFactory`, `DelegatingKerberosTicketValidator`. SPNEGO parser gained `SupportedMech`; added `SpnegoTokens.CreateNegTokenInit`. 11 tests (`Phase2AuthTests.cs`), full suite 198 green. |
+| 2026-07-07 | Phase 2 / M2.2 | Complete | LDAP/AD identity backend, built in 5 tested increments. Core (dependency-free, in `Smb.Auth/Ldap/`): `SidConverter`, `ILdapSearcher`/`LdapEntry`, `LdapIdentityBackendOptions`, `LdapIdentityBackend` (`Resolve`→SID/UPN/tokenGroups, `ISidResolver` reverse lookup, `TtlCache`), `LdapFilter`; `SecurityIdentity.UserPrincipalName` added. Opt-in binding: `Smb.Auth.DirectoryServices` (`DirectoryServicesLdapSearcher` over `System.DirectoryServices.Protocols`). 30 tests (SidConverter 17, backend 9, searcher 4), full suite 228 green. |
 | | Phase 2 / M2.2 | Not started | |
 | | Phase 2 / M2.3 | Not started | |
 | | Phase 3 / M3.1 | Not started | |

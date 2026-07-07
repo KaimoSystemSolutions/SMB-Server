@@ -20,6 +20,7 @@
     <ProjectReference Include="..\..\src\Smb.Protocol\Smb.Protocol.csproj" />
     <ProjectReference Include="..\..\src\Smb.Crypto\Smb.Crypto.csproj" />
     <ProjectReference Include="..\..\src\Smb.Auth\Smb.Auth.csproj" />
+    <ProjectReference Include="..\..\src\Smb.Auth.DirectoryServices\Smb.Auth.DirectoryServices.csproj" />
     <ProjectReference Include="..\..\src\Smb.FileSystem\Smb.FileSystem.csproj" />
     <ProjectReference Include="..\..\src\Smb.Server\Smb.Server.csproj" />
     <ProjectReference Include="..\..\src\Smb.Host\Smb.Host.csproj" />

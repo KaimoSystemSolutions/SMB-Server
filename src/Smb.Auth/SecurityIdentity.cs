@@ -9,6 +9,9 @@ public sealed class SecurityIdentity
     public required string DomainName { get; init; }
     public required string UserName { get; init; }
 
+    /// <summary>User principal name (e.g. <c>alice@corp.example.com</c>) when known (Kerberos/AD). Optional.</summary>
+    public string? UserPrincipalName { get; init; }
+
     /// <summary>String form of the primary user SID (e.g. S-1-5-21-…). Optional in phase 1.</summary>
     public string? UserSid { get; init; }
 
