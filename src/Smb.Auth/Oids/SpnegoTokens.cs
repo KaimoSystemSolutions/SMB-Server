@@ -11,6 +11,9 @@ public sealed class SpnegoParseResult
     /// <summary>The embedded mech token (e.g. NTLMSSP blob), if present.</summary>
     public byte[]? MechToken { get; init; }
 
+    /// <summary>The mechanism the server selected (<c>supportedMech</c> [1] of a NegTokenResp), if present.</summary>
+    public string? SupportedMech { get; init; }
+
     /// <summary>negState for NegTokenResp (0=accept-completed, 1=accept-incomplete, 2=reject, 3=request-mic).</summary>
     public int? NegState { get; init; }
 
@@ -75,6 +78,39 @@ public static class SpnegoTokens
                         writer.WriteEncodedValue(EncodeGeneralString(hintName));
                     }
                 }
+            }
+        }
+
+        return writer.Encode();
+    }
+
+    /// <summary>
+    /// Builds a client-style NegTokenInit (Context §9.2): <c>[APPLICATION 0] { SPNEGO-OID,
+    /// [0] NegTokenInit { mechTypes [0], mechToken [2] } }</c>. This is the initial token a client sends
+    /// (offered mechanisms in preference order plus an optimistic mech token). Symmetric to
+    /// <see cref="CreateNegTokenInit2"/> (the server-initial token); useful for client-side and tests.
+    /// </summary>
+    public static byte[] CreateNegTokenInit(IReadOnlyList<string> mechTypes, byte[]? mechToken = null)
+    {
+        var writer = new AsnWriter(AsnEncodingRules.DER);
+
+        using (writer.PushSequence(ApplicationTag0))
+        {
+            writer.WriteObjectIdentifier(GssOids.Spnego);
+
+            using (writer.PushSequence(ContextTag0)) // innerContextToken [0] NegTokenInit
+            using (writer.PushSequence())            // NegTokenInit ::= SEQUENCE
+            {
+                using (writer.PushSequence(ContextTag0)) // mechTypes [0] MechTypeList
+                using (writer.PushSequence())
+                {
+                    foreach (string oid in mechTypes)
+                        writer.WriteObjectIdentifier(oid);
+                }
+
+                if (mechToken is not null)
+                    using (writer.PushSequence(ContextTag2)) // mechToken [2] OCTET STRING
+                        writer.WriteOctetString(mechToken);
             }
         }
 
@@ -201,6 +237,7 @@ public static class SpnegoTokens
     {
         AsnReader resp = reader.ReadSequence(ContextTag1).ReadSequence();
         int? negState = null;
+        string? supportedMech = null;
         byte[]? responseToken = null;
 
         while (resp.HasData)
@@ -217,6 +254,9 @@ public static class SpnegoTokens
                 case 0: // negState [0] ENUMERATED
                     negState = (int)resp.ReadSequence(ContextTag0).ReadEnumeratedValue<NegStateValue>();
                     break;
+                case 1: // supportedMech [1] OBJECT IDENTIFIER
+                    supportedMech = resp.ReadSequence(ContextTag1).ReadObjectIdentifier();
+                    break;
                 case 2: // responseToken [2] OCTET STRING
                     responseToken = resp.ReadSequence(ContextTag2).ReadOctetString();
                     break;
@@ -226,6 +266,12 @@ public static class SpnegoTokens
             }
         }
 
-        return new SpnegoParseResult { MechToken = responseToken, NegState = negState, IsResponseToken = true };
+        return new SpnegoParseResult
+        {
+            MechToken = responseToken,
+            SupportedMech = supportedMech,
+            NegState = negState,
+            IsResponseToken = true,
+        };
     }
 }

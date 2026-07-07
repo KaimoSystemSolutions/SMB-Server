@@ -99,15 +99,34 @@ NTLM alone is insufficient for enterprise environments. Active Directory domains
 require Kerberos. The `IGssMechanism` / `IIdentityBackend` seam is already
 designed for this.
 
-### M2.1 — Kerberos GSS mechanism
+### M2.1 — Kerberos GSS mechanism ✅ (platform ticket-crypto binding is the user's seam)
 
-- [ ] Implement `KerberosServerMechanism : IGssMechanism` wrapping the platform
-      SSPI/GSSAPI (Negotiate package on Windows, `System.Net.Security` on Linux).
-- [ ] Parse AP-REQ, validate ticket, extract session key and principal.
-- [ ] Return `SecurityIdentity` with UPN, SID, and group SIDs from the PAC.
-- [ ] Register in `ISpnegoNegotiator` as preferred mechanism (Kerberos before NTLM).
-- [ ] Tests: mock KDC ticket validation, identity resolution, fallback to NTLM
-      when Kerberos unavailable.
+Designed for **full modularity**: the library user composes the SPNEGO stack from mechanism factories
+and plugs in their own Kerberos ticket crypto — the framework owns only the SPNEGO/GSS framing and the
+SMB integration.
+
+- [x] Composable **`SpnegoNegotiator`** (`src/Smb.Auth/SpnegoNegotiator.cs`): built from an ordered
+      list of `IGssMechanismFactory` (server preference). Advertises all mech OIDs in NegTokenInit2,
+      selects the client's mechanism (SPNEGO optimistic model + resend on mismatch), wraps/unwraps the
+      envelope, and still routes raw NTLMSSP unwrapped. `NtlmSpnegoNegotiator` is now a thin wrapper
+      over it (single NTLM factory) — proven back-compatible by the whole existing suite.
+- [x] **`KerberosServerMechanism : IGssMechanism`** (`src/Smb.Auth/Kerberos/`): one-leg AP-REQ →
+      (optional) AP-REP. Owns **no** Kerberos crypto — it strips the GSS-API wrapper
+      (`KerberosGssToken`, RFC 1964/4121 framing) and delegates ticket decryption / authenticator
+      verification / PAC extraction to the injected **`IKerberosTicketValidator`** seam. `SecurityIdentity`
+      already carries UPN/SID/group SIDs for the validator to fill.
+- [x] Factories `KerberosMechanismFactory` + `NtlmMechanismFactory` (both `IGssMechanismFactory`);
+      `DelegatingKerberosTicketValidator` for lambda/closure wiring. Register Kerberos before NTLM to
+      make it preferred with NTLM fallback.
+- [x] Tests (`tests/Smb.Tests/Phase2AuthTests.cs`, 11): advertising order, Kerberos one-leg success +
+      identity, mutual-auth AP-REP wrapping, validation failure → reject, unsupported-first-mech
+      fallback + resend, no-common-mech reject, full NTLM-over-SPNEGO handshake, raw NTLMSSP, GSS token
+      round-trip, delegating validator.
+
+> **User-supplied binding:** the actual platform Kerberos (Windows SSPI `AcceptSecurityContext` +
+> `SECPKG_ATTR_SESSION_KEY`, or MIT/Heimdal `gss_accept_sec_context` with a keytab) is an
+> `IKerberosTicketValidator` implementation the library user provides — it is intentionally out of the
+> core so there is no platform lock-in and the seam stays fully testable with a fake validator.
 
 ### M2.2 — LDAP/AD identity backend
 
@@ -497,7 +516,7 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-06 | Phase 1 / M1.1 | Complete | Lease state model, context parse/serialize, InMemoryLeaseManager; 18 tests, full suite 175 green |
 | 2026-07-06 | Phase 1 / M1.2 | Complete (break-before-grant deferred) | Lease grant on the wire (CREATE parses "RqLs", echoes granted state), LEASE_BREAK notification + acknowledgment + response, release at CLOSE/teardown; 5 dispatcher tests, full suite 180 green. Blocking break-before-grant wait deferred (same simplification as classic oplocks). |
 | 2026-07-07 | Phase 1 / M1.3 | Complete | Directory leases: `LeaseHolder.IsDirectory` tracking, `ILeaseManager.BreakDirectoryLease` + dispatcher `BreakParentDirectoryLease`, hooked into CREATE (add), CLOSE/DeleteOnClose (remove) and SET_INFO rename; RH→R downgrade + epoch bump + out-of-band LEASE_BREAK. `SmbOpen.DeleteOnClose` now kept in sync. 5 dispatcher tests (`DirectoryLeaseTests.cs`), full suite 187 green. |
-| | Phase 2 / M2.1 | Not started | |
+| 2026-07-07 | Phase 2 / M2.1 | Complete (platform binding = user seam) | Composable `SpnegoNegotiator` (ordered `IGssMechanismFactory` list, mech selection + SPNEGO wrap/unwrap, raw-NTLM path); `NtlmSpnegoNegotiator` now delegates to it. `KerberosServerMechanism` + `KerberosGssToken` framing delegating ticket crypto to injectable `IKerberosTicketValidator`; `Kerberos`/`NtlmMechanismFactory`, `DelegatingKerberosTicketValidator`. SPNEGO parser gained `SupportedMech`; added `SpnegoTokens.CreateNegTokenInit`. 11 tests (`Phase2AuthTests.cs`), full suite 198 green. |
 | | Phase 2 / M2.2 | Not started | |
 | | Phase 2 / M2.3 | Not started | |
 | | Phase 3 / M3.1 | Not started | |
