@@ -183,6 +183,20 @@ public sealed class SmbServerBuilder
         return this;
     }
 
+    /// <summary>
+    /// [M10.3] Advertises SMB2 compression: a 3.1.1 client that offers a supported algorithm negotiates
+    /// it, and the server then compresses large enough responses and decodes compressed requests.
+    /// <paramref name="minSize"/> is the smallest response (bytes) worth compressing (default 4096);
+    /// <paramref name="preference"/> overrides the algorithm preference (default LZ77).
+    /// </summary>
+    public SmbServerBuilder UseCompression(int minSize = 4096, IReadOnlyList<SmbCompressionAlgorithm>? preference = null)
+    {
+        _options.EnableCompression = true;
+        _options.CompressionMinSize = minSize;
+        if (preference is not null) _options.CompressionPreference = preference;
+        return this;
+    }
+
     /// <summary>Configures options directly (for fine-grained settings).</summary>
     public SmbServerBuilder Configure(Action<SmbServerOptions> configure)
     {

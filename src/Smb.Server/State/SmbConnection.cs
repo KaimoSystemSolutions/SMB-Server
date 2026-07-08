@@ -94,6 +94,15 @@ public sealed class SmbConnection
     public SmbCipherId CipherId { get; set; } = SmbCipherId.None;
     public SmbSigningAlgorithmId SigningAlgorithmId { get; set; } = SmbSigningAlgorithmId.HmacSha256;
 
+    /// <summary>
+    /// Negotiated SMB2 compression algorithm (3.1.1, Phase 10 / M10.3).
+    /// <see cref="SmbCompressionAlgorithm.None"/> = compression not negotiated; the host then neither
+    /// compresses responses nor expects a compressed request. Set to the server's preferred algorithm
+    /// (from the intersection of the client's list, the server preference and the codecs this build
+    /// implements) when a COMPRESSION_CAPABILITIES context is exchanged.
+    /// </summary>
+    public SmbCompressionAlgorithm CompressionAlgorithm { get; set; } = SmbCompressionAlgorithm.None;
+
     /// <summary>Running preauth integrity hash (3.1.1 only, Context §6.4, §8.2).</summary>
     public PreauthIntegrityHash PreauthHash { get; } = new();
 

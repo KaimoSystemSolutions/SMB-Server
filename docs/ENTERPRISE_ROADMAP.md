@@ -714,15 +714,51 @@ SMB3 signing/encryption, which still apply to the plaintext SMB frames.
 - [ ] Certificate-based client authentication (QUIC mandates TLS 1.3).
 - [ ] Tests: QUIC transport, stream multiplexing, connection migration.
 
-### M10.3 — SMB compression
+### M10.3 — SMB compression ✅ (LZ77; LZNT1/Huffman codecs are a documented follow-up)
 
-- [ ] Parse `SMB2_COMPRESSION_CAPABILITIES` negotiate context (§2.2.3.1.3).
-- [ ] Implement `SMB2_COMPRESSION_TRANSFORM_HEADER` framing (chained/unchained).
-- [ ] Support algorithms: LZ77, LZ77+Huffman, LZNT1 (Pattern_V1 optional).
-- [ ] Compression thresholds: only compress payloads > configurable minimum size.
-- [ ] Tests: compress/decompress round-trip, algorithm negotiation, threshold behavior.
+Compression is a pure transport concern, layered like encryption: the codecs and wire framing are
+pure in `Smb.Protocol.Compression`, negotiation lives in `NegotiateProcessor`, and the host
+compresses/decodes frames in `SmbConnectionHandler` (beneath SMB3 signing, which still covers the
+plaintext SMB2 message).
 
-**Estimated scope:** ~2,500 LOC production + ~800 LOC tests.
+- [x] Parse **SMB2_COMPRESSION_CAPABILITIES** negotiate context (§2.2.3.1.3): the `CompressionContext`
+      parse/serialize already existed; `NegotiateProcessor` now intersects the client's list with the
+      server preference (`SmbServerOptions.CompressionPreference`) and the codecs this build implements
+      (`SmbCompressor.SupportedAlgorithms`), stores the choice on `SmbConnection.CompressionAlgorithm`
+      and echoes a response context. Gated on `SmbServerOptions.EnableCompression` (off by default;
+      fluent `SmbServerBuilder.UseCompression`). Advertised only for 3.1.1.
+- [x] Implement **SMB2_COMPRESSION_TRANSFORM_HEADER** framing (`CompressionTransformHeader`,
+      `CompressionPayloadHeader`): unchained (§2.2.42.1) end-to-end, plus chained (§2.2.42.2) decode of
+      `None` / `Pattern_V1` (§2.2.42.2.1) / single compressed links. The server negotiates **unchained
+      only** (never sets the CHAINED capability), so the inbound surface stays a single algorithm.
+- [x] **Plain LZ77** (MS-XCA §2.4) codec — `PlainLz77.Compress`/`Decompress`: 8 KiB window, 3-byte
+      minimum match, full escape chain (extra byte → u16 → u32) on decode; the compressor caps a match
+      at 264 bytes so it only emits the unambiguous single-byte length escape (its output is decodable
+      by a stock Windows decompressor). `SmbCompressor` orchestrates frame build/decode.
+- [x] Compression **threshold**: `SmbServerOptions.CompressionMinSize` (default 4096) — smaller
+      responses are sent uncompressed; `TryCompressUnchained` also declines when the frame would not be
+      smaller than the plaintext (incompressible data). Encryption takes priority: the host never
+      combines the two (compressing is always the sender's choice), so a compressed response is only
+      produced when the frame is not being encrypted.
+- [x] Tests (`tests/Smb.Tests/Phase10CompressionTests.cs`, 21 incl. theory cases): LZ77 round-trips
+      (compressible/long-run+overlap/random/edge sizes), unchained + payload header wire round-trips,
+      orchestrator threshold + incompressible → null, chained decode (None+Pattern_V1+LZ77),
+      negotiation (preference pick / disabled / all-unsupported), and end-to-end over the host —
+      a large compressible READ comes back as a compression frame and decodes, no compression when the
+      client did not negotiate, and a compressed inbound request is decoded.
+
+> **LZNT1 / LZ77+Huffman follow-up:** the enum, negotiation intersection and chained framing already
+> accommodate the other algorithms, but only **LZ77** ships with a codec. LZNT1 (§ chunked NTFS
+> compression) and LZ77+Huffman (MS-XCA §2.1–2.3, canonical 512-symbol table + bit stream) require
+> byte-exact, spec-conformant codecs validated against a live Windows client before they can be
+> advertised — an advertised algorithm can arrive inbound and *must* decode any conformant frame, so a
+> merely round-trip-consistent implementation is not sufficient. They plug into `SmbCompressor` behind
+> `SupportedAlgorithms` when added (same honesty stance as the Kerberos ticket-crypto and LDAP
+> live-round-trip seams).
+
+**Estimated scope:** ~2,500 LOC production + ~800 LOC tests. *(Actual for the LZ77 milestone: ~420 LOC
+production + ~340 LOC tests — the negotiate-context parse, IOCTL/transform infrastructure and the
+encryption-style host encode/decode seam were already in place.)*
 
 ---
 
@@ -836,7 +872,7 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Phase 10 / M10.1 | Complete | SMB over TLS. Transport-layer TLS in the host: `SmbTlsOptions` (`Smb.Host`) + `SmbServerBuilder.UseTls(cert, configure?)`; `SmbConnectionHandler.EstablishTlsAsync` wraps the `NetworkStream` in an `SslStream` and completes the handshake (bounded by `HandshakeTimeout`) before any NBSS byte — the stream field generalized `NetworkStream`→`Stream`, no TLS = unchanged. Mutual TLS via `RequireClientCertificate` + `ClientCertificateValidation` (a realistic validator must reject a null cert — TLS 1.3 surfaces a certificate-less client as a null cert to the callback); `EnabledProtocols` (TLS 1.2/1.3 default), `ConfigureAuthentication` escape hatch; `SmbConnection.IsTransportSecured`. Cert must carry a private key (validated at `Build()`). 4 tests (`TlsTransportTests.cs`, self-signed loopback cert per test; TLS-1.3-robust assertions via a full NEGOTIATE round-trip + a TCS-synchronized client-cert observation). **Full suite 383 green on net9.0.** |
 | 2026-07-08 | Build | Complete | Target framework bumped **net8.0 → net9.0** (`Directory.Build.props` + `Smb.Tests.csproj`) to enable Phase 10 / M10.2 SMB-over-QUIC (`System.Net.Quic` is stable public API from .NET 9). CI (`.github/workflows/ci.yml`) now installs the 9.0.x runtime. Test cert helpers switched to `X509CertificateLoader` (the `X509Certificate2` byte[] ctors are `[Obsolete]` SYSLIB0057 in .NET 9). No code changes required by the bump; suite 383 green. |
 | | Phase 10 / M10.2 | Not started | |
-| | Phase 10 / M10.3 | Not started | |
+| 2026-07-08 | Phase 10 / M10.3 | Complete (LZ77; LZNT1/Huffman follow-up) | SMB compression. Pure `Smb.Protocol.Compression`: `PlainLz77` (MS-XCA §2.4, 8 KiB window, capped-match spec-safe output), `CompressionTransformHeader`/`CompressionPayloadHeader` (unchained §2.2.42.1 + chained §2.2.42.2 decode incl. None/Pattern_V1), `SmbCompressor` orchestrator (`SupportedAlgorithms` = LZ77). `NegotiateProcessor` intersects client list ∩ server preference ∩ codecs, stores `SmbConnection.CompressionAlgorithm`, echoes context; gated on `EnableCompression` (off by default, 3.1.1 only, unchained). Host (`SmbConnectionHandler`) compresses responses ≥ `CompressionMinSize` (4096) when not encrypting and decodes inbound compression frames (`EncodeOutbound`/`DecodeInboundFrame`). Options `EnableCompression`/`CompressionPreference`/`CompressionMinSize` + fluent `SmbServerBuilder.UseCompression`. 21 tests (`Phase10CompressionTests.cs`), full suite 383 → **404 green**. LZNT1 + LZ77+Huffman codecs deferred (need spec-exact validation against a live client before being advertised). |
 | | Phase 11 / M11.1 | Not started | |
 | | Phase 11 / M11.2 | Not started | |
 | | Phase 11 / M11.3 | Not started | |

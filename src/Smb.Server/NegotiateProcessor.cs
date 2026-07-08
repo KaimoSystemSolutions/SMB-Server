@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using Smb.Protocol.Compression;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Server.State;
@@ -165,6 +166,35 @@ public static class NegotiateProcessor
         {
             connection.SigningAlgorithmId = SmbSigningAlgorithmId.AesCmac; // Default without context.
         }
+
+        // --- COMPRESSION (M10.3): advertise the algorithms we can actually produce/decode that the
+        //     client also offered, in server-preference order. The first becomes the outbound choice;
+        //     any advertised algorithm may arrive inbound and is decodable. Unchained framing only
+        //     (SMB2_COMPRESSION_FLAG_NONE) — chaining is not advertised. ---
+        CompressionContext? clientComp = request.NegotiateContexts.OfType<CompressionContext>().FirstOrDefault();
+        if (options.EnableCompression && clientComp is not null)
+        {
+            List<SmbCompressionAlgorithm> agreed = PickCompression(options.CompressionPreference, clientComp.Algorithms);
+            if (agreed.Count > 0)
+            {
+                connection.CompressionAlgorithm = agreed[0];
+                responseContexts.Add(new CompressionContext { Flags = 0, Algorithms = agreed });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Intersects the server preference, the client's offered algorithms and the codecs this build
+    /// implements (<see cref="SmbCompressor.SupportedAlgorithms"/>), preserving server-preference order.
+    /// </summary>
+    private static List<SmbCompressionAlgorithm> PickCompression(
+        IReadOnlyList<SmbCompressionAlgorithm> serverPref, IReadOnlyList<SmbCompressionAlgorithm> clientList)
+    {
+        var agreed = new List<SmbCompressionAlgorithm>();
+        foreach (SmbCompressionAlgorithm pref in serverPref)
+            if (SmbCompressor.IsSupported(pref) && clientList.Contains(pref) && !agreed.Contains(pref))
+                agreed.Add(pref);
+        return agreed;
     }
 
     private static SmbCipherId PickByPreference(IReadOnlyList<SmbCipherId> serverPref, IReadOnlyList<SmbCipherId> clientList)

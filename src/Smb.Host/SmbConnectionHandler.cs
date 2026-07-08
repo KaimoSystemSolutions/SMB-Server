@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using Smb.Crypto;
+using Smb.Protocol.Compression;
 using Smb.Protocol.Constants;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
@@ -108,8 +109,9 @@ internal sealed class SmbConnectionHandler
                 var payload = new byte[length];
                 if (!await TryReadExactAsync(stream, payload, readCt)) break;
 
-                // 3. Decrypt (if transform frame). null = discard (unknown session, auth tag error).
-                (ReadOnlyMemory<byte> Message, bool Encrypted)? decoded = DecryptFrame(connection, payload);
+                // 3. Decode transport wrappers: decompress (M10.3) and/or decrypt (transform frame).
+                //    null = discard (unknown session, auth tag error, malformed compression).
+                (ReadOnlyMemory<byte> Message, bool Encrypted)? decoded = DecodeInboundFrame(connection, payload);
                 if (decoded is null) continue;
                 (ReadOnlyMemory<byte> message, bool transportEncrypted) = decoded.Value;
 
@@ -253,12 +255,20 @@ internal sealed class SmbConnectionHandler
     }
 
     /// <summary>
-    /// Decrypts a frame (if transform header). Returns the SMB2 plaintext message
-    /// plus encrypted flag — or <c>null</c> if the frame should be discarded (unknown
-    /// session, auth tag error).
+    /// Decodes the transport wrappers of an inbound frame — a compression transform frame (M10.3) is
+    /// decompressed, an encryption transform frame is decrypted (and, if it wraps a compressed message,
+    /// decompressed). Returns the SMB2 plaintext message plus the encrypted flag — or <c>null</c> if the
+    /// frame should be discarded (unknown session, auth tag error, malformed compression).
     /// </summary>
-    private (ReadOnlyMemory<byte> Message, bool Encrypted)? DecryptFrame(SmbConnection connection, byte[] payload)
+    private (ReadOnlyMemory<byte> Message, bool Encrypted)? DecodeInboundFrame(SmbConnection connection, byte[] payload)
     {
+        // Compression transform frame (unencrypted path)? → decompress (Context §11, MS-SMB2 §3.1.4.4).
+        if (SmbProtocolIds.IsCompression(payload))
+        {
+            try { return (SmbCompressor.Decompress(payload), false); }
+            catch { return null; } // malformed compression → discard.
+        }
+
         // Transform frame? → decrypt (Context §11, §19.1 step 1).
         if (!SmbProtocolIds.IsTransform(payload))
             return (payload, false);
@@ -271,10 +281,14 @@ internal sealed class SmbConnectionHandler
         try
         {
             message = Smb2Transform.Decrypt(connection.CipherId, session.DecryptionKey, payload);
+            // A sender may compress first, then encrypt: the decrypted payload can itself be a
+            // compression transform frame (§3.1.4.4). Decompress it before dispatch.
+            if (SmbProtocolIds.IsCompression(message))
+                message = SmbCompressor.Decompress(message);
         }
         catch
         {
-            return null; // auth tag error → discard.
+            return null; // auth tag error / malformed compression → discard.
         }
 
         // The client has enabled encryption (e.g. smbprotocol with the default
@@ -292,10 +306,10 @@ internal sealed class SmbConnectionHandler
         return (message, true);
     }
 
-    /// <summary>Encrypts the response if needed, frames it as NBSS and writes it in serialized fashion.</summary>
+    /// <summary>Encrypts or compresses the response if needed, frames it as NBSS and writes it in serialized fashion.</summary>
     private async Task SendFramedAsync(Stream stream, SmbConnection connection, byte[] rawResponse, bool forceEncrypt, CancellationToken ct)
     {
-        byte[] outBytes = MaybeEncrypt(connection, rawResponse, forceEncrypt);
+        byte[] outBytes = EncodeOutbound(connection, rawResponse, forceEncrypt);
         byte[] framed = NbssFrame.Wrap(outBytes);
 
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -311,25 +325,45 @@ internal sealed class SmbConnectionHandler
     }
 
     /// <summary>
-    /// Encrypts the response if the addressed session requires encryption globally,
-    /// OR if the response belongs to a tree that requires encryption (per-share encryption,
-    /// §3.3.4.1.4 — includes the TREE_CONNECT response of an encrypted share).
+    /// Applies the outbound transport wrappers. Encryption takes priority: the response is encrypted
+    /// when the addressed session requires it globally, when its tree requires it (per-share encryption,
+    /// §3.3.4.1.4 — includes the TREE_CONNECT response of an encrypted share), or when forced (ASYNC).
+    /// Otherwise, if compression was negotiated (M10.3) and the frame is large enough to benefit, the
+    /// response is compressed. The two are never combined — compressing is always the sender's choice.
     /// </summary>
-    private byte[] MaybeEncrypt(SmbConnection connection, byte[] response, bool forceEncrypt = false)
+    private byte[] EncodeOutbound(SmbConnection connection, byte[] response, bool forceEncrypt)
     {
         ulong sessionId = ReadResponseSessionId(response);
-        if (sessionId == 0 || !_server.SessionGlobalList.TryGetValue(sessionId, out SmbSession? outSession))
+        if (sessionId != 0 && _server.SessionGlobalList.TryGetValue(sessionId, out SmbSession? outSession))
+        {
+            bool encrypt = forceEncrypt
+                || outSession.EncryptData
+                || (TryReadResponseTreeId(response, out uint treeId)
+                    && outSession.TreeConnects.TryGetValue(treeId, out SmbTreeConnect? tree)
+                    && tree.EncryptData);
+            if (encrypt)
+            {
+                byte[] nonce = BuildNonce(connection.CipherId, outSession.NextEncryptionNonce());
+                return Smb2Transform.Encrypt(connection.CipherId, outSession.EncryptionKey, sessionId, nonce, response);
+            }
+        }
+
+        return MaybeCompress(connection, response);
+    }
+
+    /// <summary>
+    /// Compresses the response into an unchained compression transform frame when an algorithm was
+    /// negotiated and the plaintext is at least <see cref="SmbServerOptions.CompressionMinSize"/> bytes
+    /// and actually shrinks; otherwise the response is returned unchanged.
+    /// </summary>
+    private byte[] MaybeCompress(SmbConnection connection, byte[] response)
+    {
+        SmbCompressionAlgorithm algorithm = connection.CompressionAlgorithm;
+        if (algorithm == SmbCompressionAlgorithm.None)
             return response;
 
-        bool encrypt = forceEncrypt
-            || outSession.EncryptData
-            || (TryReadResponseTreeId(response, out uint treeId)
-                && outSession.TreeConnects.TryGetValue(treeId, out SmbTreeConnect? tree)
-                && tree.EncryptData);
-        if (!encrypt) return response;
-
-        byte[] nonce = BuildNonce(connection.CipherId, outSession.NextEncryptionNonce());
-        return Smb2Transform.Encrypt(connection.CipherId, outSession.EncryptionKey, sessionId, nonce, response);
+        byte[]? frame = SmbCompressor.TryCompressUnchained(algorithm, response, _server.Options.CompressionMinSize);
+        return frame ?? response;
     }
 
     private static ulong ReadResponseSessionId(ReadOnlySpan<byte> response)

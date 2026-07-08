@@ -69,6 +69,34 @@ public sealed class SmbServerOptions
     public uint MaxReadSize { get; set; } = 8 * 1024 * 1024;
     public uint MaxWriteSize { get; set; } = 8 * 1024 * 1024;
 
+    /// <summary>
+    /// Advertise SMB2 compression (Phase 10 / M10.3): when on, a 3.1.1 NEGOTIATE that carries a
+    /// COMPRESSION_CAPABILITIES context is answered with the server's chosen algorithm, and the host
+    /// then compresses large enough responses and decodes compressed requests. Off by default —
+    /// compression is a throughput optimization and is opt-in until validated against the target
+    /// clients; the negotiated algorithm is always taken from <see cref="CompressionPreference"/>
+    /// intersected with the client list and the codecs this build implements
+    /// (<see cref="Smb.Protocol.Compression.SmbCompressor.SupportedAlgorithms"/>).
+    /// </summary>
+    public bool EnableCompression { get; set; }
+
+    /// <summary>
+    /// Compression algorithm preference (descending) when <see cref="EnableCompression"/> is on. Only
+    /// algorithms with a codec in this build take effect (currently
+    /// <see cref="SmbCompressionAlgorithm.Lz77"/>). Default: LZ77.
+    /// </summary>
+    public IReadOnlyList<SmbCompressionAlgorithm> CompressionPreference { get; set; } =
+    [
+        SmbCompressionAlgorithm.Lz77,
+    ];
+
+    /// <summary>
+    /// Minimum plaintext size (bytes) before a response is compressed (Phase 10 / M10.3). Small frames
+    /// do not benefit and only add header overhead, so they are sent uncompressed regardless of the
+    /// negotiated algorithm. Default 4096.
+    /// </summary>
+    public int CompressionMinSize { get; set; } = 4096;
+
     /// <summary>Maximum credits granted per response (cap, Context §7).</summary>
     public ushort MaxCreditsPerResponse { get; set; } = 512;
 
