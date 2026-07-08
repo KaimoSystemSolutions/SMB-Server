@@ -24,6 +24,8 @@ public sealed class SmbServerBuilder
     private IPEndPoint _endpoint = new(IPAddress.Any, 445);
     private Action<string>? _log;
     private SmbTlsOptions? _tls;
+    private SmbQuicOptions? _quic;
+    private int _quicPort = 443;
 
     public static SmbServerBuilder Create() => new();
 
@@ -197,6 +199,23 @@ public sealed class SmbServerBuilder
         return this;
     }
 
+    /// <summary>
+    /// [M10.2] Adds an SMB-over-QUIC listener (UDP, conventionally port 443) alongside TCP. Every QUIC
+    /// connection completes a mandatory TLS 1.3 handshake using <paramref name="serverCertificate"/>
+    /// (which must carry a private key), and each inbound bidirectional stream is served as one SMB2
+    /// connection. QUIC needs the platform's MsQuic (Windows 11 / Server 2022+ built-in; <c>libmsquic</c>
+    /// on Linux) — the listener throws at start if it is unavailable, while TCP keeps working. Use
+    /// <paramref name="configure"/> for mutual TLS (client certificates), stream limits or the idle timeout.
+    /// </summary>
+    public SmbServerBuilder UseQuic(X509Certificate2 serverCertificate, int port = 443, Action<SmbQuicOptions>? configure = null)
+    {
+        var quic = new SmbQuicOptions { ServerCertificate = serverCertificate };
+        configure?.Invoke(quic);
+        _quic = quic;
+        _quicPort = port;
+        return this;
+    }
+
     /// <summary>Configures options directly (for fine-grained settings).</summary>
     public SmbServerBuilder Configure(Action<SmbServerOptions> configure)
     {
@@ -211,5 +230,5 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    public SmbServer Build() => new(_options, _endpoint, _log, _tls);
+    public SmbServer Build() => new(_options, _endpoint, _log, _tls, _quic, _quicPort);
 }

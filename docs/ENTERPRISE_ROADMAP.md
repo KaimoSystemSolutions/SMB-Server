@@ -707,12 +707,41 @@ SMB3 signing/encryption, which still apply to the plaintext SMB frames.
 > non-TLS deployment pays nothing. The client-certificate *identity* is validated at the transport but
 > not yet surfaced to the SMB auth layer — binding it to the SMB session identity is a noted follow-up.
 
-### M10.2 — SMB over QUIC (Windows Server 2022+ parity)
+### M10.2 — SMB over QUIC (Windows Server 2022+ parity) ✅
 
-- [ ] Implement QUIC listener using `System.Net.Quic` (.NET 9+).
-- [ ] Map QUIC streams to SMB connections.
-- [ ] Certificate-based client authentication (QUIC mandates TLS 1.3).
-- [ ] Tests: QUIC transport, stream multiplexing, connection migration.
+Like TLS, QUIC is a pure transport concern and lives entirely in the **host** layer — `Smb.Server` /
+`Smb.Protocol` stay transport-agnostic and fully cross-platform. Only `SmbQuicListener` /
+`SmbQuicOptions` touch the native-MsQuic-backed `System.Net.Quic` API. QUIC carries the *same*
+4-byte-length-prefixed SMB2 framing as direct TCP, so the entire dispatcher / frame loop is reused
+unchanged: the transport-specific parts of `SmbConnectionHandler` were factored into a
+`ServeAsync(stream, …)` core that both the TCP and QUIC entry points drive.
+
+- [x] QUIC listener via `System.Net.Quic` (`SmbQuicListener`, .NET 9 stable API): `QuicListener.ListenAsync`
+      on a dedicated UDP endpoint (conventionally port 443), an accept loop per connection, guarded by
+      `QuicListener.IsSupported` — an **additional** listener, TCP always remains available. Started
+      from `SmbServer.StartAsync` and drained by `StopAsync` (shares the graceful-drain + hard-cancel
+      tokens with TCP).
+- [x] Map QUIC streams to SMB connections: each inbound **bidirectional** `QuicStream` is served as one
+      SMB2 connection by its own `SmbConnectionHandler` (its own write lock / IO gate), exactly like a
+      TCP connection; the owning `QuicConnection` is disposed once all its streams end. `transportPreSecured`
+      marks the connection `IsTransportSecured` (QUIC's built-in TLS 1.3).
+- [x] Certificate-based auth (QUIC mandates TLS 1.3): `SmbQuicOptions` (required server cert with private
+      key, ALPN `"smb"`, `MaxInboundStreams`, `IdleTimeout`, `RequireClientCertificate` +
+      `ClientCertificateValidation` for mutual TLS, `ConfigureAuthentication` escape hatch); fluent
+      `SmbServerBuilder.UseQuic(cert, port, configure?)`. Validated at `Build()`.
+- [x] Tests (`tests/Smb.Tests/Phase10QuicTests.cs`, 5; gated on `QuicListener.IsSupported`): QUIC
+      handshake + NEGOTIATE over a stream, a full NEGOTIATE→SESSION_SETUP→TREE_CONNECT→CREATE→READ flow
+      over one QUIC stream (proves the stream→connection mapping + full dispatch), mutual-TLS accept
+      (client cert observed + thumbprint-matched), required-client-cert reject when none is presented,
+      and `UseQuic` with a private-key-less certificate throwing at `Build()`.
+
+> **Connection migration** (QUIC's address-mobility feature) is handled transparently by MsQuic beneath
+> `QuicConnection` — the SMB layer sees a stable stream across a client path change, so no SMB-level work
+> is required. Stream *multiplexing* (multiple SMB connections over one QUIC connection) is supported by
+> accepting each inbound stream independently, though Windows uses a single stream per connection.
+
+**Estimated scope:** ~2,500 LOC production + ~800 LOC tests. *(Actual for M10.2: ~230 LOC production +
+~200 LOC tests — the `ServeAsync` refactor let the QUIC listener reuse the entire TCP frame loop.)*
 
 ### M10.3 — SMB compression ✅ (LZ77; LZNT1/Huffman codecs are a documented follow-up)
 
@@ -871,7 +900,7 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Phase 9 / M9.2 | Complete | Extended attributes. Opt-in `IExtendedAttributeStore` seam (`Get/SetExtendedAttributesAsync`); QUERY/SET_INFO `FileFullEaInformation` (§2.4.15) via `HandleQueryEaAsync` (FILE_READ_EA) / `HandleSetEaAsync` (FILE_WRITE_EA), zero-length value = delete. Pure `FullEaInformation` builder/parser + `ComputeEaSize`. `LocalFileStore` in-process EA table (physical-path keyed, add/replace/delete merge); non-EA backend → no EAs / `NOT_SUPPORTED` on write. 7 tests (`Phase9StreamsAndEaTests`). **Phase 9 complete — suite 379 green.** |
 | 2026-07-08 | Phase 10 / M10.1 | Complete | SMB over TLS. Transport-layer TLS in the host: `SmbTlsOptions` (`Smb.Host`) + `SmbServerBuilder.UseTls(cert, configure?)`; `SmbConnectionHandler.EstablishTlsAsync` wraps the `NetworkStream` in an `SslStream` and completes the handshake (bounded by `HandshakeTimeout`) before any NBSS byte — the stream field generalized `NetworkStream`→`Stream`, no TLS = unchanged. Mutual TLS via `RequireClientCertificate` + `ClientCertificateValidation` (a realistic validator must reject a null cert — TLS 1.3 surfaces a certificate-less client as a null cert to the callback); `EnabledProtocols` (TLS 1.2/1.3 default), `ConfigureAuthentication` escape hatch; `SmbConnection.IsTransportSecured`. Cert must carry a private key (validated at `Build()`). 4 tests (`TlsTransportTests.cs`, self-signed loopback cert per test; TLS-1.3-robust assertions via a full NEGOTIATE round-trip + a TCS-synchronized client-cert observation). **Full suite 383 green on net9.0.** |
 | 2026-07-08 | Build | Complete | Target framework bumped **net8.0 → net9.0** (`Directory.Build.props` + `Smb.Tests.csproj`) to enable Phase 10 / M10.2 SMB-over-QUIC (`System.Net.Quic` is stable public API from .NET 9). CI (`.github/workflows/ci.yml`) now installs the 9.0.x runtime. Test cert helpers switched to `X509CertificateLoader` (the `X509Certificate2` byte[] ctors are `[Obsolete]` SYSLIB0057 in .NET 9). No code changes required by the bump; suite 383 green. |
-| | Phase 10 / M10.2 | Not started | |
+| 2026-07-08 | Phase 10 / M10.2 | Complete | SMB over QUIC. Host-layer only (`Smb.Server`/`Smb.Protocol` stay transport-agnostic + cross-platform): `SmbQuicListener` + `SmbQuicOptions` over `System.Net.Quic` (native MsQuic, guarded by `QuicListener.IsSupported`; CA1416 suppressed behind that runtime check). QUIC reuses the direct-TCP SMB2 framing, so `SmbConnectionHandler` was refactored into a transport-agnostic `ServeAsync(stream,…)` core driven by both the TCP entry (`RunAsync(TcpClient)`, keeps TLS) and QUIC (each inbound bidirectional `QuicStream` = one SMB2 connection, `transportPreSecured`→`IsTransportSecured`). Mandatory TLS 1.3 with ALPN `"smb"`, required-server-cert, optional mutual TLS. Fluent `SmbServerBuilder.UseQuic(cert, port, configure?)`; `SmbServer` runs it as an additional UDP listener alongside TCP (shared drain/hard tokens), `SmbServer.QuicEndpoint`. 5 tests (`Phase10QuicTests.cs`, gated on IsSupported): handshake+NEGOTIATE, full READ flow over a stream, mTLS accept/reject, no-private-key→Build throws. **Suite 404 → 409 green. Phase 10 complete (M10.1 TLS + M10.2 QUIC + M10.3 LZ77 compression).** |
 | 2026-07-08 | Phase 10 / M10.3 | Complete (LZ77; LZNT1/Huffman follow-up) | SMB compression. Pure `Smb.Protocol.Compression`: `PlainLz77` (MS-XCA §2.4, 8 KiB window, capped-match spec-safe output), `CompressionTransformHeader`/`CompressionPayloadHeader` (unchained §2.2.42.1 + chained §2.2.42.2 decode incl. None/Pattern_V1), `SmbCompressor` orchestrator (`SupportedAlgorithms` = LZ77). `NegotiateProcessor` intersects client list ∩ server preference ∩ codecs, stores `SmbConnection.CompressionAlgorithm`, echoes context; gated on `EnableCompression` (off by default, 3.1.1 only, unchained). Host (`SmbConnectionHandler`) compresses responses ≥ `CompressionMinSize` (4096) when not encrypting and decodes inbound compression frames (`EncodeOutbound`/`DecodeInboundFrame`). Options `EnableCompression`/`CompressionPreference`/`CompressionMinSize` + fluent `SmbServerBuilder.UseCompression`. 21 tests (`Phase10CompressionTests.cs`), full suite 383 → **404 green**. LZNT1 + LZ77+Huffman codecs deferred (need spec-exact validation against a live client before being advertised). |
 | | Phase 11 / M11.1 | Not started | |
 | | Phase 11 / M11.2 | Not started | |

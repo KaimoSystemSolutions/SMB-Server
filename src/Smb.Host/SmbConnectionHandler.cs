@@ -51,12 +51,50 @@ internal sealed class SmbConnectionHandler
         _ioGate = maxOps > 1 ? new SemaphoreSlim(maxOps, maxOps) : null;
     }
 
-    public async Task RunAsync(TcpClient client, CancellationToken hardCt, CancellationToken drainToken = default)
+    /// <summary>
+    /// Serves a plain-TCP (or TCP+TLS) connection. Establishes the transport stream — wrapping it in
+    /// TLS when configured (M10.1) — and runs the SMB2 frame loop. Thin adapter over
+    /// <see cref="ServeAsync"/>; the QUIC listener (M10.2) drives the same core with an already-secure
+    /// <see cref="System.Net.Quic.QuicStream"/>.
+    /// </summary>
+    public Task RunAsync(TcpClient client, CancellationToken hardCt, CancellationToken drainToken = default)
+    {
+        string? clientAddress = (client.Client.RemoteEndPoint as IPEndPoint)?.ToString();
+        return ServeAsync(
+            clientAddress,
+            establishStream: async (connection, ct) =>
+            {
+                // [M10.1] SMB over TLS: wrap the transport in an SslStream and complete the handshake
+                // before any NBSS/SMB2 byte is read. A plain-TCP client fails the handshake here and is
+                // dropped. Without TLS configured the raw NetworkStream is used unchanged.
+                Stream s = client.GetStream();
+                if (_tls is null) return s;
+                return await EstablishTlsAsync((NetworkStream)s, connection, ct).ConfigureAwait(false);
+            },
+            transportPreSecured: false, // TLS (when configured) sets IsTransportSecured on success itself
+            disposeTransport: () => { client.Dispose(); return ValueTask.CompletedTask; },
+            hardCt, drainToken);
+    }
+
+    /// <summary>
+    /// Transport-agnostic core: creates the connection state, obtains the ready-to-use SMB2 byte stream
+    /// via <paramref name="establishStream"/> (null return = the transport handshake failed → drop),
+    /// runs the frame loop, and tears everything down. <paramref name="transportPreSecured"/> marks a
+    /// transport that is already encrypted/authenticated at its own layer (QUIC's mandatory TLS 1.3);
+    /// <paramref name="disposeTransport"/> releases the underlying transport object after the stream.
+    /// </summary>
+    internal async Task ServeAsync(
+        string? clientAddress,
+        Func<SmbConnection, CancellationToken, Task<Stream?>> establishStream,
+        bool transportPreSecured,
+        Func<ValueTask> disposeTransport,
+        CancellationToken hardCt,
+        CancellationToken drainToken)
     {
         long nowTicks = _server.Options.TimeProvider.GetUtcNow().Ticks;
         var connection = new SmbConnection
         {
-            ClientAddress = (client.Client.RemoteEndPoint as IPEndPoint)?.ToString(),
+            ClientAddress = clientAddress,
             CreatedTicks = nowTicks,
             LastActivityTicks = nowTicks,
         };
@@ -80,15 +118,9 @@ internal sealed class SmbConnectionHandler
         Stream? stream = null;
         try
         {
-            // [M10.1] SMB over TLS: wrap the transport in an SslStream and complete the handshake
-            // before any NBSS/SMB2 byte is read. A plain-TCP client fails the handshake here and is
-            // dropped. Without TLS configured the raw NetworkStream is used unchanged.
-            stream = client.GetStream();
-            if (_tls is not null)
-            {
-                stream = await EstablishTlsAsync((NetworkStream)stream, connection, readCt).ConfigureAwait(false);
-                if (stream is null) return; // handshake failed / timed out → connection dropped
-            }
+            stream = await establishStream(connection, readCt).ConfigureAwait(false);
+            if (stream is null) return; // handshake failed / timed out → connection dropped
+            if (transportPreSecured) connection.IsTransportSecured = true;
 
             var prefix = new byte[NbssFrame.HeaderLength];
 
@@ -168,7 +200,7 @@ internal sealed class SmbConnectionHandler
             _writeLock.Dispose();
             _ioGate?.Dispose();
             if (stream is not null) { try { await stream.DisposeAsync().ConfigureAwait(false); } catch { /* ignore */ } }
-            client.Dispose();
+            try { await disposeTransport().ConfigureAwait(false); } catch { /* ignore */ }
         }
     }
 

@@ -25,27 +25,38 @@ public sealed class SmbServer : IAsyncDisposable
     private readonly Action<string>? _log;
     private readonly ConnectionLimiter _limiter;
     private readonly SmbTlsOptions? _tls;
+    private readonly SmbQuicOptions? _quicOptions;
+    private readonly IPEndPoint? _quicEndpoint;
     private TcpListener? _listener;
+    private SmbQuicListener? _quicListener;
     private CancellationTokenSource? _hardCts;
     private CancellationTokenSource? _drainCts;
     private Task? _acceptLoop;
     private Task? _sweepLoop;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
-    internal SmbServer(SmbServerOptions options, IPEndPoint endpoint, Action<string>? log, SmbTlsOptions? tls = null)
+    internal SmbServer(SmbServerOptions options, IPEndPoint endpoint, Action<string>? log,
+        SmbTlsOptions? tls = null, SmbQuicOptions? quic = null, int quicPort = 443)
     {
         options.Validate();
         tls?.Validate();
+        quic?.Validate();
         EnsureIpcShare(options.Shares);
         _state = new SmbServerState(options);
         _endpoint = endpoint;
         _log = log;
         _tls = tls;
+        _quicOptions = quic;
+        // [M10.2] QUIC runs on its own UDP endpoint (same bind address as TCP, conventionally port 443).
+        _quicEndpoint = quic is not null ? new IPEndPoint(endpoint.Address, quicPort) : null;
         _limiter = new ConnectionLimiter(options.MaxConnections, options.MaxConnectionsPerClient);
     }
 
-    /// <summary>The local endpoint on which the server is listening (after <see cref="StartAsync"/> with the actual port).</summary>
+    /// <summary>The local TCP endpoint on which the server is listening (after <see cref="StartAsync"/> with the actual port).</summary>
     public IPEndPoint Endpoint => (IPEndPoint)(_listener?.LocalEndpoint ?? _endpoint);
+
+    /// <summary>[M10.2] The local UDP endpoint of the SMB-over-QUIC listener, or <c>null</c> when QUIC is not configured.</summary>
+    public IPEndPoint? QuicEndpoint => _quicListener?.LocalEndPoint ?? _quicEndpoint;
 
     /// <summary>Server state (shares, sessions) — for tests/diagnostics.</summary>
     public SmbServerState State => _state;
@@ -70,7 +81,7 @@ public sealed class SmbServer : IAsyncDisposable
     public bool RemoveShare(string name) => _state.Shares.Remove(name);
 
     /// <summary>Starts the listener and the accept loop (Context §3.3.3: open listener on 445).</summary>
-    public Task StartAsync(CancellationToken ct = default)
+    public async Task StartAsync(CancellationToken ct = default)
     {
         if (_listener is not null) throw new InvalidOperationException("Server is already running.");
 
@@ -81,7 +92,14 @@ public sealed class SmbServer : IAsyncDisposable
         _log?.Invoke($"SMB server listening on {_listener.LocalEndpoint}.");
         _acceptLoop = AcceptLoopAsync(_hardCts.Token);
         _sweepLoop = SweepLoopAsync(_hardCts.Token);
-        return Task.CompletedTask;
+
+        // [M10.2] Optional additional SMB-over-QUIC listener (UDP). TCP above always works; QUIC is only
+        // started when configured and supported by the platform's MsQuic.
+        if (_quicOptions is not null)
+        {
+            _quicListener = new SmbQuicListener(_state, _quicOptions, _quicEndpoint!, _log);
+            await _quicListener.StartAsync(_hardCts.Token, _drainCts.Token).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -185,6 +203,10 @@ public sealed class SmbServer : IAsyncDisposable
         {
             await _hardCts.CancelAsync();
         }
+
+        // 4b. [M10.2] Stop the QUIC listener and drain its connections (they already observe the drain
+        //     token from step 3 and the hard token from step 4).
+        if (_quicListener is not null) { try { await _quicListener.StopAsync(); } catch { /* ignore */ } }
 
         // 5. Wind down the background loops.
         if (_acceptLoop is not null) { try { await _acceptLoop; } catch { /* ignore */ } }
