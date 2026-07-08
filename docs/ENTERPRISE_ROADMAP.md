@@ -674,12 +674,38 @@ place; both features landed behind opt-in seams with no change to `IFileStore` o
 
 ## Phase 10 — Transport hardening
 
-### M10.1 — TLS wrapping (SMB over TLS)
+### M10.1 — TLS wrapping (SMB over TLS) ✅
 
-- [ ] Accept TLS connections on a configurable port (default 445 plain, 8445 TLS).
-- [ ] Wrap `NetworkStream` in `SslStream` with server certificate configuration.
-- [ ] Support mutual TLS (client certificate) for additional authentication.
-- [ ] Tests: TLS handshake, encrypted transport, certificate validation.
+TLS is a pure transport concern, so the config lives in the **host** layer (`Smb.Host`), not in
+`SmbServerOptions` — `Smb.Server` stays unaware of transport TLS. The tunnel is layered *beneath*
+SMB3 signing/encryption, which still apply to the plaintext SMB frames.
+
+- [x] Wrap the per-connection `NetworkStream` in an `SslStream` and complete the handshake before any
+      NBSS/SMB2 byte is exchanged (`SmbConnectionHandler.EstablishTlsAsync`). A plain-TCP client that
+      sends NBSS immediately fails the handshake and is dropped. Without TLS configured the raw
+      `NetworkStream` is used unchanged (zero overhead, full back-compat — the stream field was
+      generalized `NetworkStream` → `Stream`).
+- [x] Server-certificate configuration via `SmbTlsOptions` (`ServerCertificate` required, must carry a
+      private key — validated at `Build()`), enabled with the fluent
+      `SmbServerBuilder.UseTls(cert, configure?)`. Run TLS on a dedicated port (445 stays plain SMB;
+      convention for SMB-over-TLS is a separate port such as 8445 — `WithEndpoint(addr, 8445)`).
+- [x] Mutual TLS (client certificate) for additional authentication: `RequireClientCertificate` +
+      an optional `ClientCertificateValidation` callback (pin a CA / thumbprint / accept a self-signed
+      client cert). A required-but-absent or rejected client cert fails the handshake → connection
+      dropped. `SmbConnection.IsTransportSecured` records that the transport is TLS (audit/diagnostics).
+- [x] Configurable `EnabledProtocols` (default TLS 1.2 + 1.3), a `HandshakeTimeout` (default 15 s,
+      slow-loris protection at the transport layer), and a `ConfigureAuthentication` escape hatch over
+      the derived `SslServerAuthenticationOptions` (ALPN, cipher policy, cert-selection callback, …).
+- [x] Tests (`tests/Smb.Tests/TlsTransportTests.cs`, 4): TLS handshake + NEGOTIATE over the encrypted
+      tunnel, mutual-TLS accept (client cert observed by the validator + matched by thumbprint),
+      required-client-cert reject when the client presents none, and `UseTls` with a private-key-less
+      certificate throwing at `Build()`. A self-signed loopback cert is generated per test (RSA-2048,
+      round-tripped through PFX so Windows SChannel can use the key).
+
+> **Modularity:** the certificate, trust and mutual-TLS policy are all the deployment's
+> (`SmbTlsOptions` / the validation callback + escape hatch); the core stays transport-agnostic and a
+> non-TLS deployment pays nothing. The client-certificate *identity* is validated at the transport but
+> not yet surfaced to the SMB auth layer — binding it to the SMB session identity is a noted follow-up.
 
 ### M10.2 — SMB over QUIC (Windows Server 2022+ parity)
 
@@ -807,7 +833,8 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Phase 8 / M8.5 | Complete | Health/perf metrics. `SmbServerMetrics` (Interlocked, dependency-free): gauges (active connections/sessions/trees/handles), counters (accepted, auth ok/fail, requests, bytes read/written total+per-share, lock contention), bucketed latency histogram p50/p95/p99, `Snapshot()`→`MetricsSnapshot`. Wired across dispatcher/host; `SmbServer.Metrics`. `virtual` methods for OTel bridging (no forced dep). 3 tests (`MetricsTests`). **Phase 8 complete — suite 372 green.** |
 | 2026-07-08 | Phase 9 / M9.1 | Complete | Alternate data streams. Opt-in `INamedStreamStore` seam (`OpenNamedStreamAsync` + `QueryStreamsAsync`) instead of widening `IFileStore.CreateAsync`; dispatcher `TrySplitStreamName` splits `file:stream[:$DATA]` and routes named streams (empty name = default data stream → normal open), `NamedStreamHandle` flows through READ/WRITE/SET_INFO. QUERY_INFO `FileStreamInformation` (§2.4.43) via `HandleQueryStreamsAsync` (non-ADS backend → default `::$DATA` only). `LocalFileStore` in-process stream table (base path + case-folded name), delete-on-close removes only the stream, streams share the base file's SD. Pure `StreamInformation` builder. |
 | 2026-07-08 | Phase 9 / M9.2 | Complete | Extended attributes. Opt-in `IExtendedAttributeStore` seam (`Get/SetExtendedAttributesAsync`); QUERY/SET_INFO `FileFullEaInformation` (§2.4.15) via `HandleQueryEaAsync` (FILE_READ_EA) / `HandleSetEaAsync` (FILE_WRITE_EA), zero-length value = delete. Pure `FullEaInformation` builder/parser + `ComputeEaSize`. `LocalFileStore` in-process EA table (physical-path keyed, add/replace/delete merge); non-EA backend → no EAs / `NOT_SUPPORTED` on write. 7 tests (`Phase9StreamsAndEaTests`). **Phase 9 complete — suite 379 green.** |
-| | Phase 10 / M10.1 | Not started | |
+| 2026-07-08 | Phase 10 / M10.1 | Complete | SMB over TLS. Transport-layer TLS in the host: `SmbTlsOptions` (`Smb.Host`) + `SmbServerBuilder.UseTls(cert, configure?)`; `SmbConnectionHandler.EstablishTlsAsync` wraps the `NetworkStream` in an `SslStream` and completes the handshake (bounded by `HandshakeTimeout`) before any NBSS byte — the stream field generalized `NetworkStream`→`Stream`, no TLS = unchanged. Mutual TLS via `RequireClientCertificate` + `ClientCertificateValidation` (a realistic validator must reject a null cert — TLS 1.3 surfaces a certificate-less client as a null cert to the callback); `EnabledProtocols` (TLS 1.2/1.3 default), `ConfigureAuthentication` escape hatch; `SmbConnection.IsTransportSecured`. Cert must carry a private key (validated at `Build()`). 4 tests (`TlsTransportTests.cs`, self-signed loopback cert per test; TLS-1.3-robust assertions via a full NEGOTIATE round-trip + a TCS-synchronized client-cert observation). **Full suite 383 green on net9.0.** |
+| 2026-07-08 | Build | Complete | Target framework bumped **net8.0 → net9.0** (`Directory.Build.props` + `Smb.Tests.csproj`) to enable Phase 10 / M10.2 SMB-over-QUIC (`System.Net.Quic` is stable public API from .NET 9). CI (`.github/workflows/ci.yml`) now installs the 9.0.x runtime. Test cert helpers switched to `X509CertificateLoader` (the `X509Certificate2` byte[] ctors are `[Obsolete]` SYSLIB0057 in .NET 9). No code changes required by the bump; suite 383 green. |
 | | Phase 10 / M10.2 | Not started | |
 | | Phase 10 / M10.3 | Not started | |
 | | Phase 11 / M11.1 | Not started | |

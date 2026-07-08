@@ -4,7 +4,9 @@
     Siehe SMB2-3_Server_Context.md §2 (Architektur) und §20 (Sicherheits-Defaults).
   -->
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- net9.0: required for SMB-over-QUIC (System.Net.Quic became stable public API in .NET 9,
+         Phase 10 / M10.2). See docs/ENTERPRISE_ROADMAP.md. -->
+    <TargetFramework>net9.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

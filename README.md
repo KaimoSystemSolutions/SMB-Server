@@ -1,6 +1,6 @@
 # SMB-Server
 
-**A SMB 2/3 server library - written in C# (.NET 8)**
+**A SMB 2/3 server library - written in C# (.NET 9)**
 
 This is a library specifically build, for implementing / creating your own SMB Fileserver.
 The library was created based on the official Microsoft Specifications (MS-ERREF, MS-FSCC, MS-NLMP, MS-SMB2, ...)
@@ -75,7 +75,7 @@ ISpnegoNegotiator  ──>  IGssMechanism (NTLM today, Kerberos later)
 
 ## Verification
 
-The suite (379 tests) covers, among others:
+The suite (383 tests) covers, among others:
 
 - **Official crypto vectors:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5), NTOWFv2 (MS-NLMP §4.2 example).
 - Wire roundtrips: header (sync/async), NBSS (big-endian length prefix), negotiate contexts
@@ -121,7 +121,8 @@ The suite (379 tests) covers, among others:
 | **Phase 7 DFS referrals** ✅ (FSCTL_DFS_GET_REFERRALS / _EX via pluggable `IDfsNamespace` + `StandaloneDfsNamespace`; DFS TREE_CONNECT/NEGOTIATE flags; link resolution → `STATUS_PATH_NOT_COVERED`) | ✅ |
 | **Phase 8 Operational readiness** ✅ (structured audit logging `ISmbAuditLogger`; idle/auth timeouts; connection admission control `ConnectionLimiter`; graceful draining shutdown; health/perf metrics `SmbServerMetrics`) | ✅ |
 | **Phase 9 Alternate data streams & extended attributes** ✅ (named streams `file.txt:stream` + FileStreamInformation via opt-in `INamedStreamStore`; FileFullEaInformation via opt-in `IExtendedAttributeStore`) | ✅ |
-| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅, ADS/EA ✅; QUIC, RDMA | 🟡 |
+| **Phase 10 Transport hardening** 🟡 (**M10.1 SMB over TLS** ✅ — `SslStream` transport wrapper via `SmbServerBuilder.UseTls(cert)`, mutual TLS, configurable protocols/handshake timeout; QUIC + compression open) | 🟡 |
+| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅, ADS/EA ✅, SMB-over-TLS ✅; QUIC, RDMA | 🟡 |
 
 ## License note
 

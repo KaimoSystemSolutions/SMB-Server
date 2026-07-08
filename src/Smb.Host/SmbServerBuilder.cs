@@ -1,4 +1,5 @@
 using System.Net;
+using System.Security.Cryptography.X509Certificates;
 using Smb.Auth;
 using Smb.FileSystem;
 using Smb.FileSystem.Local;
@@ -22,6 +23,7 @@ public sealed class SmbServerBuilder
     private readonly SmbServerOptions _options = new();
     private IPEndPoint _endpoint = new(IPAddress.Any, 445);
     private Action<string>? _log;
+    private SmbTlsOptions? _tls;
 
     public static SmbServerBuilder Create() => new();
 
@@ -166,6 +168,21 @@ public sealed class SmbServerBuilder
         return this;
     }
 
+    /// <summary>
+    /// [M10.1] Wraps the transport in TLS (SMB over TLS): every connection completes a TLS handshake
+    /// before any SMB2 bytes are exchanged, using <paramref name="serverCertificate"/> (which must
+    /// carry a private key). Layer this beneath SMB3 signing/encryption on a dedicated port (e.g.
+    /// <c>.WithEndpoint(IPAddress.Any, 8445)</c>). Use <paramref name="configure"/> for mutual TLS
+    /// (client certificates), protocol versions, or the handshake timeout.
+    /// </summary>
+    public SmbServerBuilder UseTls(X509Certificate2 serverCertificate, Action<SmbTlsOptions>? configure = null)
+    {
+        var tls = new SmbTlsOptions { ServerCertificate = serverCertificate };
+        configure?.Invoke(tls);
+        _tls = tls;
+        return this;
+    }
+
     /// <summary>Configures options directly (for fine-grained settings).</summary>
     public SmbServerBuilder Configure(Action<SmbServerOptions> configure)
     {
@@ -180,5 +197,5 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    public SmbServer Build() => new(_options, _endpoint, _log);
+    public SmbServer Build() => new(_options, _endpoint, _log, _tls);
 }

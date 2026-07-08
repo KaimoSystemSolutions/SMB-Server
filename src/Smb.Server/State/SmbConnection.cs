@@ -33,6 +33,12 @@ public sealed class SmbConnection
     /// logging and per-IP rate limiting (Phase 8). Null when hosted outside the TCP listener (tests).</summary>
     public string? ClientAddress { get; set; }
 
+    /// <summary>[M10.1] True when the transport is wrapped in TLS (SMB over TLS); the whole SMB
+    /// conversation runs inside a TLS tunnel underneath any SMB3 signing/encryption. Set by the host
+    /// after the TLS handshake succeeds. Informational (audit/diagnostics); does not by itself relax
+    /// the SMB3 encryption policy.</summary>
+    public bool IsTransportSecured { get; set; }
+
     /// <summary>Timestamp (UTC ticks from the server's TimeProvider) of the last frame received on this
     /// connection. Drives the idle-connection timeout (Phase 8 / M8.2).</summary>
     public long LastActivityTicks { get; set; }

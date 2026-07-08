@@ -27,13 +27,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # The solution uses the .slnx format (needs the .NET 9.0.200+/10 SDK), while the projects
-      # target net8.0 (needs the .NET 8 runtime to execute the tests). Install both.
+      # The solution uses the .slnx format (needs the .NET 9.0.200+/10 SDK), and the projects
+      # target net9.0 (needs the .NET 9 runtime to execute the tests — Phase 10 / M10.2 QUIC
+      # requires .NET 9). Install the net9 runtime plus the current SDK.
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: |
-            8.0.x
+            9.0.x
             10.0.x
 
       - name: Restore

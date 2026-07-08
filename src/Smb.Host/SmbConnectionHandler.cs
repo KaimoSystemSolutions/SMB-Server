@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using Smb.Crypto;
 using Smb.Protocol.Constants;
@@ -31,17 +32,19 @@ internal sealed class SmbConnectionHandler
     private readonly SmbServerState _server;
     private readonly Smb2Dispatcher _dispatcher;
     private readonly Action<string>? _log;
+    private readonly SmbTlsOptions? _tls;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     /// <summary>Cap for concurrent READ/WRITE frames; <c>null</c> = feature off (option ≤ 1).</summary>
     private readonly SemaphoreSlim? _ioGate;
     private readonly List<Task> _inflight = [];
 
-    public SmbConnectionHandler(SmbServerState server, Action<string>? log)
+    public SmbConnectionHandler(SmbServerState server, Action<string>? log, SmbTlsOptions? tls = null)
     {
         _server = server;
         _dispatcher = new Smb2Dispatcher(server, log);
         _log = log;
+        _tls = tls;
 
         int maxOps = server.Options.MaxConcurrentFileOpsPerConnection;
         _ioGate = maxOps > 1 ? new SemaphoreSlim(maxOps, maxOps) : null;
@@ -73,15 +76,26 @@ internal sealed class SmbConnectionHandler
         _server.Options.Metrics.OnConnectionAccepted();
         AuditConnection(SmbAuditEventType.ConnectionAccepted, connection);
 
+        Stream? stream = null;
         try
         {
-            using NetworkStream stream = client.GetStream();
+            // [M10.1] SMB over TLS: wrap the transport in an SslStream and complete the handshake
+            // before any NBSS/SMB2 byte is read. A plain-TCP client fails the handshake here and is
+            // dropped. Without TLS configured the raw NetworkStream is used unchanged.
+            stream = client.GetStream();
+            if (_tls is not null)
+            {
+                stream = await EstablishTlsAsync((NetworkStream)stream, connection, readCt).ConfigureAwait(false);
+                if (stream is null) return; // handshake failed / timed out → connection dropped
+            }
+
             var prefix = new byte[NbssFrame.HeaderLength];
 
             // Provide an out-of-band send channel: asynchronously completed responses (e.g. a
             // blocking LOCK that was granted/cancelled) go through the same serialized
             // writer. Encryption/framing happen centrally in SendFramedAsync.
-            connection.SendRawAsync = (raw, forceEncrypt) => SendFramedAsync(stream, connection, raw, forceEncrypt, connCt);
+            Stream sendStream = stream;
+            connection.SendRawAsync = (raw, forceEncrypt) => SendFramedAsync(sendStream, connection, raw, forceEncrypt, connCt);
 
             while (!readCt.IsCancellationRequested)
             {
@@ -151,7 +165,34 @@ internal sealed class SmbConnectionHandler
             AuditConnection(SmbAuditEventType.ConnectionClosed, connection);
             _writeLock.Dispose();
             _ioGate?.Dispose();
+            if (stream is not null) { try { await stream.DisposeAsync().ConfigureAwait(false); } catch { /* ignore */ } }
             client.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// [M10.1] Performs the server-side TLS handshake for a new connection, bounded by
+    /// <see cref="SmbTlsOptions.HandshakeTimeout"/>. Returns the authenticated <see cref="SslStream"/>
+    /// on success, or <c>null</c> if the handshake failed/timed out (the caller then drops the
+    /// connection). The <see cref="SslStream"/> owns and disposes the inner network stream.
+    /// </summary>
+    private async Task<Stream?> EstablishTlsAsync(NetworkStream inner, SmbConnection connection, CancellationToken ct)
+    {
+        var ssl = new SslStream(inner, leaveInnerStreamOpen: false);
+        try
+        {
+            SslServerAuthenticationOptions authOptions = _tls!.BuildAuthenticationOptions();
+            using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            handshakeCts.CancelAfter(_tls.HandshakeTimeout);
+            await ssl.AuthenticateAsServerAsync(authOptions, handshakeCts.Token).ConfigureAwait(false);
+            connection.IsTransportSecured = true;
+            return ssl;
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"[conn {connection.ConnectionId:N}] TLS handshake failed: {ex.GetType().Name}: {ex.Message}");
+            await ssl.DisposeAsync().ConfigureAwait(false);
+            return null;
         }
     }
 
@@ -174,7 +215,7 @@ internal sealed class SmbConnectionHandler
     /// Executes a prepared READ/WRITE frame and sends the response. Errors stay in the
     /// task (connection drops are handled by the read loop itself); the I/O slot is always released.
     /// </summary>
-    private async Task RunConcurrentFrameAsync(NetworkStream stream, SmbConnection connection,
+    private async Task RunConcurrentFrameAsync(Stream stream, SmbConnection connection,
         Smb2Dispatcher.PreparedFrame frame, CancellationToken ct)
     {
         try
@@ -252,7 +293,7 @@ internal sealed class SmbConnectionHandler
     }
 
     /// <summary>Encrypts the response if needed, frames it as NBSS and writes it in serialized fashion.</summary>
-    private async Task SendFramedAsync(NetworkStream stream, SmbConnection connection, byte[] rawResponse, bool forceEncrypt, CancellationToken ct)
+    private async Task SendFramedAsync(Stream stream, SmbConnection connection, byte[] rawResponse, bool forceEncrypt, CancellationToken ct)
     {
         byte[] outBytes = MaybeEncrypt(connection, rawResponse, forceEncrypt);
         byte[] framed = NbssFrame.Wrap(outBytes);

@@ -24,6 +24,7 @@ public sealed class SmbServer : IAsyncDisposable
     private readonly IPEndPoint _endpoint;
     private readonly Action<string>? _log;
     private readonly ConnectionLimiter _limiter;
+    private readonly SmbTlsOptions? _tls;
     private TcpListener? _listener;
     private CancellationTokenSource? _hardCts;
     private CancellationTokenSource? _drainCts;
@@ -31,13 +32,15 @@ public sealed class SmbServer : IAsyncDisposable
     private Task? _sweepLoop;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
-    internal SmbServer(SmbServerOptions options, IPEndPoint endpoint, Action<string>? log)
+    internal SmbServer(SmbServerOptions options, IPEndPoint endpoint, Action<string>? log, SmbTlsOptions? tls = null)
     {
         options.Validate();
+        tls?.Validate();
         EnsureIpcShare(options.Shares);
         _state = new SmbServerState(options);
         _endpoint = endpoint;
         _log = log;
+        _tls = tls;
         _limiter = new ConnectionLimiter(options.MaxConnections, options.MaxConnectionsPerClient);
     }
 
@@ -131,7 +134,7 @@ public sealed class SmbServer : IAsyncDisposable
                     continue;
                 }
 
-                var handler = new SmbConnectionHandler(_state, _log);
+                var handler = new SmbConnectionHandler(_state, _log, _tls);
                 Task run = handler.RunAsync(client, _hardCts!.Token, _drainCts!.Token);
                 _connectionTasks.TryAdd(run, 0);
                 _ = run.ContinueWith(t =>
