@@ -79,7 +79,7 @@ public class AdditionalFsctlTests : IDisposable
         byte[] resp = Ioctl(d, conn, sid, tid, p, v, FsctlMessage.FsctlSetSparse, [1]);
 
         Assert.Equal(NtStatus.Success, Smb2Header.Read(resp).Status);
-        Assert.True(store.SparsePaths.Contains("f.bin"));
+        Assert.Contains("f.bin", store.SparsePaths);
     }
 
     [Fact]

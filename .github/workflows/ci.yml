@@ -25,12 +25,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # The solution uses the .slnx format (needs the .NET 9.0.200+/10 SDK), while the projects
       # target net8.0 (needs the .NET 8 runtime to execute the tests). Install both.
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: |
             8.0.x

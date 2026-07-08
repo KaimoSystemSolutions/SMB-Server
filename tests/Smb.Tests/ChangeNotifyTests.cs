@@ -71,10 +71,12 @@ public class ChangeNotifyTests : IDisposable
         Assert.Equal(NtStatus.Pending, ih.Status);
         Assert.True(ih.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand));
 
-        // Trigger a filesystem change.
-        File.WriteAllText(Path.Combine(_shareDir, "watched", "new.txt"), "y");
-
-        byte[] final = await WaitForSend(sent);
+        // Trigger a filesystem change. Re-trigger on every poll (with a fresh name) so a slow or
+        // loaded CI runner — where the FileSystemWatcher may not be armed yet, or drops the first
+        // event — still produces a notification instead of a spurious timeout.
+        int n = 0;
+        byte[] final = await WaitForSend(sent,
+            () => File.WriteAllText(Path.Combine(_shareDir, "watched", $"new{n++}.txt"), "y"));
         Smb2Header fh = Smb2Header.Read(final);
         Assert.Equal(NtStatus.Success, fh.Status);
         Assert.True(fh.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand));
@@ -153,11 +155,13 @@ public class ChangeNotifyTests : IDisposable
         return len == 0 ? [] : response.AsSpan(off, len).ToArray();
     }
 
-    private static async Task<byte[]> WaitForSend(System.Collections.Concurrent.ConcurrentQueue<byte[]> queue)
+    private static async Task<byte[]> WaitForSend(
+        System.Collections.Concurrent.ConcurrentQueue<byte[]> queue, Action? retrigger = null)
     {
         for (int i = 0; i < 250; i++)
         {
             if (queue.TryDequeue(out byte[]? msg)) return msg;
+            retrigger?.Invoke();
             await Task.Delay(20);
         }
         throw new Xunit.Sdk.XunitException("No out-of-band CHANGE_NOTIFY response received within the time limit.");
