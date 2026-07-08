@@ -10,6 +10,7 @@ using Smb.Server.Locking;
 using Smb.Server.Multichannel;
 using Smb.Server.Notification;
 using Smb.Server.Oplocks;
+using Smb.Server.Quota;
 using Smb.Server.Sharing;
 
 namespace Smb.Server;
@@ -279,6 +280,15 @@ public sealed class SmbServerOptions
     /// holders are sent an oplock/lease break first.
     /// </summary>
     public TimeSpan ShutdownDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Disk-quota provider (Phase 11 / M11.1): serves QUERY_QUOTA_INFO / SET_QUOTA_INFO and enforces
+    /// per-owner limits on write (over-limit → <c>STATUS_DISK_FULL</c>). Default
+    /// <see cref="NullQuotaProvider"/> (no quotas: QUERY/SET report not-supported, writes are never
+    /// limited). Set an <see cref="InMemoryQuotaProvider"/> or a custom <see cref="IQuotaProvider"/> that
+    /// delegates to the OS quota system (NTFS/ZFS).
+    /// </summary>
+    public IQuotaProvider QuotaProvider { get; set; } = NullQuotaProvider.Instance;
 
     /// <summary>Validates the configuration and throws on misconfiguration.</summary>
     public void Validate()

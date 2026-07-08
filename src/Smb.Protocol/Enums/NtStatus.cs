@@ -12,6 +12,7 @@ public enum NtStatus : uint
 
     BufferOverflow = 0x80000005,
     NoMoreFiles = 0x80000006,
+    NoMoreEntries = 0x8000001A,
 
     MoreProcessingRequired = 0xC0000016,
     InvalidParameter = 0xC000000D,

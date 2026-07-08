@@ -795,12 +795,31 @@ encryption-style host encode/decode seam were already in place.)*
 
 Lower priority features that complete the enterprise feature matrix.
 
-### M11.1 — Quota support
+### M11.1 — Quota support ✅
 
-- [ ] Implement `QUERY_QUOTA_INFO` / `SET_QUOTA_INFO` (§2.2.37/39).
-- [ ] Define `IQuotaProvider` interface for quota enforcement.
-- [ ] Implement `FileSystemQuotaProvider` (delegates to OS quota on NTFS/ZFS).
-- [ ] Tests: query quota, exceed quota → `STATUS_DISK_FULL`.
+Wire structures are pure in `Smb.Protocol.Messages.QuotaMessage`; the semantics sit behind the
+`IQuotaProvider` seam in `Smb.Server.Quota`, so the core stays dependency-free and a deployment maps it
+onto the real OS quota system.
+
+- [x] `QUERY_QUOTA_INFO` (§2.2.37 `InfoType.Quota`) and `SET_QUOTA_INFO` (§2.2.39): `QuotaMessage` parses
+      the SMB2_QUERY_QUOTA_INFO input (§2.2.37.1, return-single / restart-scan / SID filter) and
+      builds/parses the FILE_QUOTA_INFORMATION list (MS-FSCC §2.4.33, 8-byte-aligned chain). `QueryInfoMessage`
+      now also captures the request InputBuffer. Dispatched via `HandleQueryQuota` / `HandleSetQuota`
+      (output capped to the client buffer → `BUFFER_TOO_SMALL`; empty result → `NO_MORE_ENTRIES`).
+- [x] `IQuotaProvider` seam (`Query` / `Set` / `TryReserve` / `Release` + `IsSupported`) with the default
+      `NullQuotaProvider` (not supported: QUERY/SET → `NOT_SUPPORTED`, writes never limited) and a portable,
+      testable `InMemoryQuotaProvider` (per-share, per-owner-SID used/threshold/limit). Wired via
+      `SmbServerOptions.QuotaProvider` / `SmbServerBuilder.UseQuotaProvider`.
+- [x] Enforcement on write: the bytes by which a WRITE grows the file are reserved against the
+      authenticated owner's quota before the store write; over-limit → `STATUS_DISK_FULL`, and the
+      reservation is released if the write then fails. Anonymous callers (no resolvable SID) are not
+      charged; a `NotSupported` provider is a no-op (existing behavior unchanged).
+- [x] The concrete OS-backed provider (NTFS quotas / ZFS user quotas) is the deployment's `IQuotaProvider`
+      implementation — the same modularity stance as the security-descriptor / lock / DFS seams.
+- [x] Tests (`tests/Smb.Tests/Phase11QuotaTests.cs`, 9): query-input + FILE_QUOTA_INFORMATION wire
+      round-trips, provider reserve-until-limit/release, null-provider unsupported, QUERY on an
+      unsupported provider → `NOT_SUPPORTED`, QUERY returns a seeded entry, SET updates the provider, and a
+      write exceeding the owner's quota → `STATUS_DISK_FULL` (the prior within-limit write succeeds).
 
 ### M11.2 — Reparse point / symlink responses
 
@@ -902,6 +921,6 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Build | Complete | Target framework bumped **net8.0 → net9.0** (`Directory.Build.props` + `Smb.Tests.csproj`) to enable Phase 10 / M10.2 SMB-over-QUIC (`System.Net.Quic` is stable public API from .NET 9). CI (`.github/workflows/ci.yml`) now installs the 9.0.x runtime. Test cert helpers switched to `X509CertificateLoader` (the `X509Certificate2` byte[] ctors are `[Obsolete]` SYSLIB0057 in .NET 9). No code changes required by the bump; suite 383 green. |
 | 2026-07-08 | Phase 10 / M10.2 | Complete | SMB over QUIC. Host-layer only (`Smb.Server`/`Smb.Protocol` stay transport-agnostic + cross-platform): `SmbQuicListener` + `SmbQuicOptions` over `System.Net.Quic` (native MsQuic, guarded by `QuicListener.IsSupported`; CA1416 suppressed behind that runtime check). QUIC reuses the direct-TCP SMB2 framing, so `SmbConnectionHandler` was refactored into a transport-agnostic `ServeAsync(stream,…)` core driven by both the TCP entry (`RunAsync(TcpClient)`, keeps TLS) and QUIC (each inbound bidirectional `QuicStream` = one SMB2 connection, `transportPreSecured`→`IsTransportSecured`). Mandatory TLS 1.3 with ALPN `"smb"`, required-server-cert, optional mutual TLS. Fluent `SmbServerBuilder.UseQuic(cert, port, configure?)`; `SmbServer` runs it as an additional UDP listener alongside TCP (shared drain/hard tokens), `SmbServer.QuicEndpoint`. 5 tests (`Phase10QuicTests.cs`, gated on IsSupported): handshake+NEGOTIATE, full READ flow over a stream, mTLS accept/reject, no-private-key→Build throws. **Suite 404 → 409 green. Phase 10 complete (M10.1 TLS + M10.2 QUIC + M10.3 LZ77 compression).** |
 | 2026-07-08 | Phase 10 / M10.3 | Complete (LZ77; LZNT1/Huffman follow-up) | SMB compression. Pure `Smb.Protocol.Compression`: `PlainLz77` (MS-XCA §2.4, 8 KiB window, capped-match spec-safe output), `CompressionTransformHeader`/`CompressionPayloadHeader` (unchained §2.2.42.1 + chained §2.2.42.2 decode incl. None/Pattern_V1), `SmbCompressor` orchestrator (`SupportedAlgorithms` = LZ77). `NegotiateProcessor` intersects client list ∩ server preference ∩ codecs, stores `SmbConnection.CompressionAlgorithm`, echoes context; gated on `EnableCompression` (off by default, 3.1.1 only, unchained). Host (`SmbConnectionHandler`) compresses responses ≥ `CompressionMinSize` (4096) when not encrypting and decodes inbound compression frames (`EncodeOutbound`/`DecodeInboundFrame`). Options `EnableCompression`/`CompressionPreference`/`CompressionMinSize` + fluent `SmbServerBuilder.UseCompression`. 21 tests (`Phase10CompressionTests.cs`), full suite 383 → **404 green**. LZNT1 + LZ77+Huffman codecs deferred (need spec-exact validation against a live client before being advertised). |
-| | Phase 11 / M11.1 | Not started | |
+| 2026-07-08 | Phase 11 / M11.1 | Complete | Disk quota. Pure `QuotaMessage` (SMB2_QUERY_QUOTA_INFO §2.2.37.1 parse + FILE_QUOTA_INFORMATION §2.4.33 list build/parse) in `Smb.Protocol`; `IQuotaProvider` seam (`Query`/`Set`/`TryReserve`/`Release`) + `NullQuotaProvider` (default) + `InMemoryQuotaProvider` (per-share per-owner-SID) in `Smb.Server.Quota`, injectable via `SmbServerOptions.QuotaProvider` / `SmbServerBuilder.UseQuotaProvider`. `HandleQueryQuota`/`HandleSetQuota` (InfoType.Quota in QUERY/SET_INFO; output capped→BUFFER_TOO_SMALL, empty→NO_MORE_ENTRIES). Write enforcement: reserve file-growth bytes against the owner's quota → over-limit `STATUS_DISK_FULL`, release on write failure; anonymous/NotSupported = no-op. `QueryInfoMessage` now captures the request InputBuffer; new `NtStatus.NoMoreEntries`. 9 tests (`Phase11QuotaTests.cs`), suite 409 → **418 green**. |
 | | Phase 11 / M11.2 | Not started | |
 | | Phase 11 / M11.3 | Not started | |

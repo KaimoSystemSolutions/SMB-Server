@@ -11,6 +11,7 @@ using Smb.Server.Diagnostics;
 using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Oplocks;
+using Smb.Server.Quota;
 using Smb.Server.Rpc;
 using Smb.Server.Sharing;
 using Smb.Server.State;
@@ -912,9 +913,29 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.FileLockConflict);
         }
 
+        // [M11.1] Quota enforcement: reserve the bytes by which this write grows the file against the
+        // owner's (authenticated user's) quota; over-limit → STATUS_DISK_FULL. Only when a provider is
+        // active and the caller has a resolvable SID (anonymous writes are not charged).
+        IQuotaProvider quota = _server.Options.QuotaProvider;
+        IShare quotaShare = open.TreeConnect.Share;
+        long quotaReserved = 0;
+        Sid? quotaOwner = null;
+        if (quota.IsSupported && Sid.TryParse(session.Identity?.UserSid, out Sid owner))
+        {
+            quotaOwner = owner;
+            long currentSize = ToStat(await open.LocalOpen.GetInfoAsync().ConfigureAwait(false)).EndOfFile;
+            long endOfWrite = (long)req.Offset + req.Data.Length;
+            quotaReserved = Math.Max(0, endOfWrite - currentSize);
+            if (quotaReserved > 0 && !quota.TryReserve(quotaShare, owner, quotaReserved))
+                return BuildError(header, NtStatus.DiskFull);
+        }
+
         FileStoreResult<int> result = await store.WriteAsync(open.LocalOpen, (long)req.Offset, req.Data).ConfigureAwait(false);
         if (!result.IsSuccess)
+        {
+            if (quotaReserved > 0 && quotaOwner is not null) quota.Release(quotaShare, quotaOwner, quotaReserved);
             return BuildError(header, result.Status);
+        }
 
         _server.Options.Metrics.OnBytesWritten(open.TreeConnect.Share.Name, result.Value);
         return MaybeSigned(session, RespHeader(header, session),
@@ -989,6 +1010,10 @@ public sealed partial class Smb2Dispatcher
         if (req.InfoType == InfoType.Security)
             return await HandleQuerySecurityAsync(session, header, open, req).ConfigureAwait(false);
 
+        // [M11.1] Disk quota (QUERY_QUOTA_INFO, §2.2.37 InfoType.Quota).
+        if (req.InfoType == InfoType.Quota)
+            return HandleQueryQuota(session, header, open, req);
+
         // [M9.1/M9.2] Stream enumeration and extended attributes need the backend, not just the stat.
         if (req.InfoType == InfoType.File)
         {
@@ -1031,6 +1056,10 @@ public sealed partial class Smb2Dispatcher
 
         if (req.InfoType == InfoType.Security)
             return await HandleSetSecurityAsync(connection, session, header, store, open, req).ConfigureAwait(false);
+
+        // [M11.1] Disk quota (SET_QUOTA_INFO, §2.2.39 InfoType.Quota).
+        if (req.InfoType == InfoType.Quota)
+            return HandleSetQuota(session, header, open, req);
 
         if (req.InfoType != InfoType.File)
             return BuildError(header, NtStatus.NotSupported);
@@ -1322,6 +1351,49 @@ public sealed partial class Smb2Dispatcher
     /// and the well-known Everyone group; an authenticated (non-anonymous) caller additionally carries
     /// Authenticated Users. Unparseable SID strings are skipped rather than failing the whole check.
     /// </summary>
+    /// <summary>
+    /// [M11.1] QUERY_INFO with InfoType Quota (§2.2.37.1): returns the share's FILE_QUOTA_INFORMATION
+    /// records (optionally filtered to the requested SIDs), capped to the client's output buffer. An
+    /// unsupported provider → NOT_SUPPORTED; an empty result → NO_MORE_ENTRIES (scan exhausted).
+    /// </summary>
+    private ResponseSegment HandleQueryQuota(SmbSession session, Smb2Header header, SmbOpen open, QueryInfoMessage.Request req)
+    {
+        IQuotaProvider quota = _server.Options.QuotaProvider;
+        if (!quota.IsSupported)
+            return BuildError(header, NtStatus.NotSupported);
+
+        QuotaMessage.QueryRequest qr = QuotaMessage.ParseQueryInfo(req.InputBuffer);
+        IReadOnlyList<FileQuotaInformation> entries = quota.Query(open.TreeConnect.Share, qr.SidFilter);
+        if (entries.Count == 0)
+            return BuildError(header, NtStatus.NoMoreEntries);
+        if (qr.ReturnSingle && entries.Count > 1)
+            entries = [entries[0]];
+
+        byte[] buffer = QuotaMessage.BuildQuotaInformation(entries, (int)req.OutputBufferLength);
+        if (buffer.Length == 0)
+            return BuildError(header, NtStatus.BufferTooSmall);
+
+        return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(buffer));
+    }
+
+    /// <summary>
+    /// [M11.1] SET_INFO with InfoType Quota (§2.2.39): applies the supplied FILE_QUOTA_INFORMATION
+    /// records (per-owner threshold/limit) to the share via the quota provider.
+    /// </summary>
+    private ResponseSegment HandleSetQuota(SmbSession session, Smb2Header header, SmbOpen open, SetInfoMessage.Request req)
+    {
+        IQuotaProvider quota = _server.Options.QuotaProvider;
+        if (!quota.IsSupported)
+            return BuildError(header, NtStatus.NotSupported);
+
+        IReadOnlyList<FileQuotaInformation> entries = QuotaMessage.ParseQuotaInformation(req.Buffer);
+        NtStatus status = quota.Set(open.TreeConnect.Share, entries);
+        if (status != NtStatus.Success)
+            return BuildError(header, status);
+
+        return MaybeSigned(session, RespHeader(header, session), SetInfoMessage.BuildResponseBody());
+    }
+
     private static IReadOnlyList<Sid> BuildCallerSids(SecurityIdentity? identity)
     {
         var sids = new List<Sid> { WellKnownSids.Everyone };

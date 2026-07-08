@@ -60,7 +60,7 @@ public static class QueryInfoMessage
 
     public readonly record struct Request(
         InfoType InfoType, byte FileInfoClass, uint OutputBufferLength,
-        uint AdditionalInformation, ulong PersistentId, ulong VolatileId);
+        uint AdditionalInformation, ulong PersistentId, ulong VolatileId, byte[] InputBuffer);
 
     public static Request ParseRequest(ReadOnlySpan<byte> message, int bodyOffset)
     {
@@ -71,14 +71,20 @@ public static class QueryInfoMessage
         var infoType = (InfoType)r.ReadByte();
         byte fileInfoClass = r.ReadByte();
         uint outputBufferLength = r.ReadUInt32();
-        r.ReadUInt16(); // InputBufferOffset
+        ushort inputBufferOffset = r.ReadUInt16(); // relative to the SMB2 header start
         r.ReadUInt16(); // Reserved
-        r.ReadUInt32(); // InputBufferLength
+        uint inputBufferLength = r.ReadUInt32();
         uint additionalInformation = r.ReadUInt32();
         r.ReadUInt32(); // Flags
         ulong persistent = r.ReadUInt64();
         ulong vol = r.ReadUInt64();
-        return new Request(infoType, fileInfoClass, outputBufferLength, additionalInformation, persistent, vol);
+
+        // Input buffer (e.g. SMB2_QUERY_QUOTA_INFO for InfoType.Quota) — offset is absolute in the message.
+        byte[] input = [];
+        if (inputBufferLength > 0 && inputBufferOffset + inputBufferLength <= message.Length)
+            input = message.Slice(inputBufferOffset, (int)inputBufferLength).ToArray();
+
+        return new Request(infoType, fileInfoClass, outputBufferLength, additionalInformation, persistent, vol, input);
     }
 
     /// <summary>Builds the response. OutputBufferOffset = header(64) + fixed body(8) = 72.</summary>

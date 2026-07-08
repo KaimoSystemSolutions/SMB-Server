@@ -216,6 +216,18 @@ public sealed class SmbServerBuilder
         return this;
     }
 
+    /// <summary>
+    /// [M11.1] Sets the disk-quota provider (QUERY/SET_QUOTA_INFO + per-owner write enforcement). Default
+    /// is no quotas (<see cref="Smb.Server.Quota.NullQuotaProvider"/>); supply an
+    /// <see cref="Smb.Server.Quota.InMemoryQuotaProvider"/> or a custom
+    /// <see cref="Smb.Server.Quota.IQuotaProvider"/> that delegates to NTFS/ZFS quotas.
+    /// </summary>
+    public SmbServerBuilder UseQuotaProvider(Smb.Server.Quota.IQuotaProvider provider)
+    {
+        _options.QuotaProvider = provider;
+        return this;
+    }
+
     /// <summary>Configures options directly (for fine-grained settings).</summary>
     public SmbServerBuilder Configure(Action<SmbServerOptions> configure)
     {
