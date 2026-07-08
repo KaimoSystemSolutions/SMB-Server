@@ -45,6 +45,9 @@ public enum NtStatus : uint
     NotFound = 0xC0000225,
     NotAReparsePoint = 0xC0000275,
     RequestNotAccepted = 0xC00000D0,
+
+    /// <summary>The path is a DFS link; the client must request a referral (MS-DFSC, §3.3.5.9).</summary>
+    PathNotCovered = 0xC0000257,
 }
 
 /// <summary>NTSTATUS evaluation via the severity field (Context §17).</summary>

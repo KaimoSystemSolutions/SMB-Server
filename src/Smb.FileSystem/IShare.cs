@@ -26,6 +26,13 @@ public interface IShare
 
     /// <summary>Optional comment/remark (TREE_CONNECT info).</summary>
     string Remark { get; }
+
+    /// <summary>
+    /// This share is a DFS root (Phase 7). When set, the TREE_CONNECT response carries the DFS share
+    /// flags/capability so the client issues FSCTL_DFS_GET_REFERRALS for paths under it (resolved via
+    /// <c>SmbServerOptions.DfsNamespace</c>). Off by default.
+    /// </summary>
+    bool IsDfs => false;
 }
 
 /// <summary>Default share implementation over an <see cref="IFileStore"/>.</summary>
@@ -37,6 +44,7 @@ public sealed class Share : IShare
     public bool EncryptData { get; init; }
     public bool ContinuousAvailability { get; init; }
     public string Remark { get; init; } = string.Empty;
+    public bool IsDfs { get; init; }
 
     /// <summary>Creates the mandatory <c>IPC$</c> share (PIPE) that many clients connect first (Context §12, §23).</summary>
     public static Share CreateIpc() => new()

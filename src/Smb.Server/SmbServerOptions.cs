@@ -2,6 +2,7 @@ using Smb.Auth;
 using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Server.Authorization;
+using Smb.Server.Dfs;
 using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Locking;
@@ -179,6 +180,16 @@ public sealed class SmbServerOptions
     /// a custom provider to control exactly which interfaces (and capabilities) are advertised.
     /// </summary>
     public INetworkInterfaceProvider NetworkInterfaceProvider { get; set; } = new SystemNetworkInterfaceProvider();
+
+    /// <summary>
+    /// Optional DFS namespace served via FSCTL_DFS_GET_REFERRALS (Phase 7). <c>null</c> (default) → the
+    /// server hosts no DFS namespace and answers referral requests with <c>STATUS_NOT_FOUND</c>, so
+    /// clients use the literal path. Set a <see cref="StandaloneDfsNamespace"/> (or a custom
+    /// <see cref="IDfsNamespace"/>) to publish DFS links; <c>SMB2_GLOBAL_CAP_DFS</c> is then advertised
+    /// at NEGOTIATE so clients issue referral requests. Mark the DFS-root share
+    /// <see cref="Smb.FileSystem.Share.IsDfs"/> so its TREE_CONNECT response carries the DFS flags.
+    /// </summary>
+    public IDfsNamespace? DfsNamespace { get; set; }
 
     /// <summary>Validates the configuration and throws on misconfiguration.</summary>
     public void Validate()

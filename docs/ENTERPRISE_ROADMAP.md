@@ -492,23 +492,48 @@ landed with 11 tests (4 + 5 + 2), suite 324 → **335 green**.
 DFS allows a single namespace to span multiple servers. Required for enterprise
 environments with distributed storage.
 
-### M7.1 — DFS referral responses
+### M7.1 — DFS referral responses ✅
 
-- [ ] Implement `FSCTL_DFS_GET_REFERRALS` / `_V2` in the IOCTL handler.
-- [ ] Define `IDfsNamespace` interface: resolve DFS path → target server/share.
-- [ ] Implement `StandaloneDfsNamespace` (single-server DFS root, static mapping).
-- [ ] Set `SMB2_SHARE_CAP_DFS` and `SMB2_SHAREFLAG_DFS` / `_DFS_ROOT` flags on
-      DFS-enabled shares in TREE_CONNECT response.
-- [ ] Tests: client requests referral, receives target list, follows referral.
+Wire structures are pure in `Smb.Protocol.Messages.DfsReferralMessage`; the namespace (path → targets)
+sits behind the `IDfsNamespace` seam in `Smb.Server.Dfs`, so the core stays dependency-free and a
+deployment can back the namespace with a static map, a database, or a real DFS coordinator.
 
-### M7.2 — DFS link resolution
+- [x] `FSCTL_DFS_GET_REFERRALS` (0x00060194) and `_EX` (0x000601B0) handled in the IOCTL dispatcher
+      (`HandleDfsGetReferrals`, issued on IPC$ without a file handle). Parses REQ_GET_DFS_REFERRAL
+      (§2.2.2) and REQ_GET_DFS_REFERRAL_EX (§2.2.3); builds RESP_GET_DFS_REFERRAL (§2.2.4) with
+      **DFS_REFERRAL_V4** non-name-list entries (§2.2.5.4), string offsets relative to each entry with a
+      de-duplicated string pool. Output capped to `MaxOutputResponse` (`STATUS_BUFFER_TOO_SMALL`).
+- [x] `IDfsNamespace` seam (`Resolve(requestFileName) → DfsReferralResult?`) + `SmbServerOptions.DfsNamespace`
+      (null default → `STATUS_NOT_FOUND`, client uses the literal path, §3.3.5.15.2).
+- [x] `StandaloneDfsNamespace` (single-server, static link table). `AddLink`/`AddRoot`; `Resolve` returns
+      the **longest matching link prefix** (component-boundary, case-insensitive) so sub-paths and nested
+      links resolve correctly; `PathConsumed` = the matched prefix, targets in preference order, TTL.
+- [x] TREE_CONNECT of a DFS-root share (`IShare.IsDfs`, default false via a default interface member)
+      sets `SMB2_SHAREFLAG_DFS` / `_DFS_ROOT` and `SMB2_SHARE_CAP_DFS` (new `ShareCapabilities` enum).
+      NEGOTIATE advertises `SMB2_GLOBAL_CAP_DFS` whenever a namespace is configured.
+- [x] Tests (`tests/Smb.Tests/DfsReferralTests.cs`): request/response wire round-trips (single + multi
+      target), longest-prefix / sub-path / non-boundary resolution, referral over the dispatcher, path
+      outside the namespace → NOT_FOUND, DFS vs. plain share TREE_CONNECT flags, NEGOTIATE cap gating.
 
-- [ ] Intercept `STATUS_PATH_NOT_COVERED` from the file store and return a DFS
-      referral instead.
-- [ ] Support referral TTL and priority/ordering for load balancing.
-- [ ] Tests: access through DFS link, expired referral triggers re-request.
+### M7.2 — DFS link resolution ✅
 
-**Estimated scope:** ~800 LOC production + ~400 LOC tests.
+- [x] On CREATE against a DFS-root share, a path at or below a DFS link is intercepted and answered
+      with `STATUS_PATH_NOT_COVERED` (new `NtStatus.PathNotCovered` = 0xC0000257) so the client requests
+      a referral and reconnects to the target (§3.3.5.9). The candidate DFS path is reconstructed as
+      `\Server\Share\relative` (`BuildDfsPath`) — the same shape the client sends in a referral request,
+      keeping link resolution and referral serving consistent — and checked via `IDfsNamespace.IsLinkCovered`
+      (default: `Resolve` returns a non-root referral). A plain share ignores the namespace entirely.
+- [x] Referral TTL and target ordering for load balancing: targets are returned in insertion (preference)
+      order and each referral carries the namespace's TTL (`DfsReferralResult.TimeToLiveSeconds`), so the
+      client caches and load-balances per MS-DFSC.
+- [x] Tests: CREATE under a link → PATH_NOT_COVERED, a file directly in the DFS root served locally, a
+      link path on a non-DFS share served locally (never PATH_NOT_COVERED).
+
+**Estimated scope:** ~800 LOC production + ~400 LOC tests. *(Actual: ~230 LOC production + ~300 LOC
+tests — the IOCTL dispatch, CREATE prologue and access-check infrastructure were already in place.)*
+
+**Phase 7 complete.** DFS referral responses (M7.1) and link resolution (M7.2) landed with 14 tests,
+suite 335 → **349 green**.
 
 ---
 
@@ -724,8 +749,8 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 6 / M6.1 | Complete | Session binding (multichannel). `SmbChannel` + `SmbSession.Channels`/`SigningKeyFor`, primary channel registered on login; `HandleSessionBinding` validates (dialect/ClientGuid/Valid/not-already-bound), verifies the request signature under the session key, re-runs GSS on a per-connection context (`ChannelBindInProgress`), matches identity, derives a per-channel signing key (3.1.1 uses the channel preauth hash, §3.3.5.5.3). Per-channel sign/verify at `AssembleResponse`/`VerifyInboundSignature`. Channel-aware teardown keeps the session until the last channel closes. New `NtStatus.RequestNotAccepted`. 4 tests (`Phase6BindingTests.cs`), full suite 328 green. |
 | 2026-07-07 | Phase 6 / M6.2 | Complete | FSCTL_QUERY_NETWORK_INTERFACE_INFO. Pure `NetworkInterfaceInfoMessage.Build` (152-byte chained entries, IPv4/IPv6 SOCKADDR_STORAGE) in `Smb.Protocol`; seam `INetworkInterfaceProvider` + default `SystemNetworkInterfaceProvider` (NIC enumeration) in `Smb.Server.Multichannel`, injectable via `SmbServerOptions.NetworkInterfaceProvider`. Handler `HandleQueryNetworkInterfaceInfo` (NOT_SUPPORTED when disabled/<3.0, output capped to MaxOutputResponse). `SMB2_GLOBAL_CAP_MULTICHANNEL` advertised on 3.x NEGOTIATE (`EnableMultichannel`, default on). 5 tests (`Phase6InterfaceInfoTests.cs`), suite 333 green. |
 | 2026-07-07 | Phase 6 / M6.3 | Complete | Channel failover. `SmbSession.SelectSendChannel(preferred)` + centralized `SendOutOfBandAsync` (selects a live channel BEFORE signing so the per-channel key is right) — wired into lease/oplock break + blocking-LOCK/CHANGE_NOTIFY finals. `OnConnectionClosed` now cancels only pending async ops whose session didn't survive (others complete + reroute); host no longer blanket-cancels. 2 tests (`Phase6FailoverTests.cs`: SelectSendChannel prefer/failover/null; blocking LOCK on a dropping channel granted + delivered on the survivor). **Phase 6 complete — suite 335 green.** |
-| | Phase 7 / M7.1 | Not started | |
-| | Phase 7 / M7.2 | Not started | |
+| 2026-07-08 | Phase 7 / M7.1 | Complete | DFS referral responses. Pure `DfsReferralMessage` (REQ/REQ_EX parse, RESP with V4 non-name-list entries + de-duplicated string pool) in `Smb.Protocol`; `IDfsNamespace` seam + `StandaloneDfsNamespace` (static link table, longest-prefix resolution) in `Smb.Server.Dfs`, injectable via `SmbServerOptions.DfsNamespace`. `HandleDfsGetReferrals` (FSCTL 0x00060194 / _EX 0x000601B0, NOT_FOUND when no namespace / path outside it, output capped to MaxOutputResponse). `IShare.IsDfs` → TREE_CONNECT DFS share flags + `SMB2_SHARE_CAP_DFS` (new `ShareCapabilities` enum); NEGOTIATE advertises `SMB2_GLOBAL_CAP_DFS` when a namespace is set. 11 tests (`DfsReferralTests.cs`), suite 346 green. |
+| 2026-07-08 | Phase 7 / M7.2 | Complete | DFS link resolution. CREATE on a DFS-root share whose path is at/below a DFS link → `STATUS_PATH_NOT_COVERED` (new `NtStatus.PathNotCovered`) via `IDfsNamespace.IsLinkCovered`; candidate path reconstructed as `\Server\Share\relative` (`BuildDfsPath`), consistent with the referral request shape. TTL + preference-ordered targets already carried by the referral. 3 tests (link → PATH_NOT_COVERED, root file served locally, non-DFS share ignores the namespace). **Phase 7 complete — suite 349 green.** |
 | | Phase 8 / M8.1 | Not started | |
 | | Phase 8 / M8.2 | Not started | |
 | | Phase 8 / M8.3 | Not started | |

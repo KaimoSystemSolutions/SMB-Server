@@ -709,11 +709,20 @@ public sealed partial class Smb2Dispatcher
         var shareFlags = ShareFlags.ManualCaching;
         if (tree.EncryptData) shareFlags |= ShareFlags.EncryptData;
 
+        // [M7.1] DFS root shares advertise the DFS flags/capability so the client resolves paths under
+        // them via FSCTL_DFS_GET_REFERRALS instead of accessing them literally.
+        var shareCaps = ShareCapabilities.None;
+        if (share.IsDfs)
+        {
+            shareFlags |= ShareFlags.Dfs | ShareFlags.DfsRoot;
+            shareCaps |= ShareCapabilities.Dfs;
+        }
+
         var response = new TreeConnectResponse
         {
             ShareType = (byte)share.Type,
             ShareFlags = shareFlags,
-            Capabilities = 0,
+            Capabilities = (uint)shareCaps,
             MaximalAccess = tree.MaximalAccess,
         };
 

@@ -57,6 +57,19 @@ public enum ShareFlags : uint
     EncryptData = 0x00008000,
 }
 
+/// <summary>SMB2_SHARE_CAP_* share capabilities (MS-SMB2 §2.2.10, TREE_CONNECT response <c>Capabilities</c>).</summary>
+[Flags]
+public enum ShareCapabilities : uint
+{
+    None = 0x00000000,
+    Dfs = 0x00000008,
+    ContinuousAvailability = 0x00000010,
+    Scaleout = 0x00000020,
+    Cluster = 0x00000040,
+    Asymmetric = 0x00000080,
+    RedirectToOwner = 0x00000100,
+}
+
 /// <summary>SMB2 TREE_CONNECT Response (Context §12, MS-SMB2 §2.2.10). <c>StructureSize=16</c>.</summary>
 public sealed class TreeConnectResponse
 {

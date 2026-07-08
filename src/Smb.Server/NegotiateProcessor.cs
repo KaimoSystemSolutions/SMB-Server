@@ -79,6 +79,11 @@ public static class NegotiateProcessor
         if (options.EnableMultichannel && dialect.IsSmb3OrLater())
             caps |= Smb2Capabilities.MultiChannel;
 
+        // DFS (Phase 7): when a namespace is configured, advertise SMB2_GLOBAL_CAP_DFS so clients issue
+        // FSCTL_DFS_GET_REFERRALS for paths under a DFS-flagged share. Valid for all SMB2 dialects.
+        if (options.DfsNamespace is not null)
+            caps |= Smb2Capabilities.Dfs;
+
         var responseContexts = new List<NegotiateContext>();
 
         if (dialect == SmbDialect.Smb311)

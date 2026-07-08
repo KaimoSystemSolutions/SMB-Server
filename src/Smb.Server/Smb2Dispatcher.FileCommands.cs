@@ -6,6 +6,7 @@ using Smb.Protocol.Messages;
 using Smb.Protocol.Messages.Fscc;
 using Smb.Protocol.Security;
 using Smb.Protocol.Wire;
+using Smb.Server.Dfs;
 using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Oplocks;
@@ -76,6 +77,13 @@ public sealed partial class Smb2Dispatcher
         CreateContext? reconnectCtx = CreateContextList.Find(request.Contexts, CreateContextNames.DurableHandleReconnect);
         if (reconnectCtx is not null)
             return await HandleDurableReconnectAsync(header, session, tree, reconnectCtx).ConfigureAwait(false);
+
+        // [M7.2] DFS link resolution: on a DFS-root share a path at or below a DFS link is not served
+        // locally — the server answers STATUS_PATH_NOT_COVERED so the client requests a referral
+        // (FSCTL_DFS_GET_REFERRALS, M7.1) and reconnects to the target (§3.3.5.9 / MS-DFSC).
+        if (tree.Share.IsDfs && _server.Options.DfsNamespace is { } dfsNamespace
+            && dfsNamespace.IsLinkCovered(BuildDfsPath(tree.Share.Name, request.Name)))
+            return BuildError(header, NtStatus.PathNotCovered);
 
         // [AUDIT-2026-06] Enforce DesiredAccess against the MaximalAccess granted by the
         // authorization policy (§3.3.5.9). Previously DesiredAccess was granted unfiltered →
@@ -351,8 +359,7 @@ public sealed partial class Smb2Dispatcher
                 return await HandleReparseFsctlAsync(header, session, req).ConfigureAwait(false);
             case FsctlMessage.FsctlDfsGetReferrals:
             case FsctlMessage.FsctlDfsGetReferralsEx:
-                // No DFS namespace configured — the client falls back to the plain path (§3.3.5.15.2).
-                return BuildError(header, NtStatus.NotFound);
+                return HandleDfsGetReferrals(header, session, req);
         }
 
         return BuildError(header, NtStatus.InvalidDeviceRequest);
@@ -658,6 +665,66 @@ public sealed partial class Smb2Dispatcher
 
         return MaybeSigned(session, RespHeader(header, session),
             IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
+    }
+
+    /// <summary>
+    /// [M7.1] FSCTL_DFS_GET_REFERRALS / _EX (MS-DFSC §3.3.5.4): resolves the requested path against the
+    /// configured DFS namespace and returns a referral (target list). Issued on IPC$ without a file
+    /// handle. With no namespace configured, or a path outside it, the answer is <c>STATUS_NOT_FOUND</c>
+    /// so the client uses the literal path (§3.3.5.15.2).
+    /// </summary>
+    private ResponseSegment HandleDfsGetReferrals(Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        IDfsNamespace? ns = _server.Options.DfsNamespace;
+        if (ns is null)
+            return BuildError(header, NtStatus.NotFound);
+
+        DfsReferralMessage.Request dfsReq = req.CtlCode == FsctlMessage.FsctlDfsGetReferralsEx
+            ? DfsReferralMessage.ParseRequestEx(req.Input)
+            : DfsReferralMessage.ParseRequest(req.Input);
+
+        DfsReferralResult? result = ns.Resolve(dfsReq.RequestFileName);
+        if (result is null || result.Targets.Count == 0)
+            return BuildError(header, NtStatus.NotFound);
+
+        ushort serverType = result.IsRootReferral
+            ? DfsReferralMessage.ServerTypeRoot
+            : DfsReferralMessage.ServerTypeLink;
+        var entries = result.Targets
+            .Select(t => new DfsReferralMessage.ReferralEntry
+            {
+                DfsPath = result.ConsumedPath,
+                TargetPath = t.TargetPath,
+                TimeToLive = result.TimeToLiveSeconds,
+                ServerType = serverType,
+            })
+            .ToList();
+
+        uint headerFlags = result.IsRootReferral
+            ? DfsReferralMessage.HeaderFlagReferralServers
+            : DfsReferralMessage.HeaderFlagStorageServers;
+        var pathConsumed = (ushort)(result.ConsumedPath.Length * 2);
+
+        byte[] output = DfsReferralMessage.BuildResponse(pathConsumed, headerFlags, entries);
+
+        // Honour the client's output cap (§3.3.5.15): if the referral list doesn't fit, ask it to retry.
+        if (output.Length > req.MaxOutputResponse)
+            return BuildError(header, NtStatus.BufferTooSmall);
+
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
+    }
+
+    /// <summary>
+    /// [M7.2] Builds the full DFS namespace path (<c>\Server\Share\relative</c>) for a share-relative
+    /// CREATE name, so it can be checked against the DFS namespace. Matches the path a client sends in a
+    /// referral request for the same share, keeping link resolution and referral serving consistent.
+    /// </summary>
+    private string BuildDfsPath(string shareName, string relativeName)
+    {
+        string rel = relativeName.Replace('/', '\\').Trim('\\');
+        string basePath = $"\\{_server.Options.ServerName}\\{shareName}";
+        return rel.Length == 0 ? basePath : $"{basePath}\\{rel}";
     }
 
     /// <summary>Greatest dialect this server supports among the client-offered list (0 = none common).</summary>
