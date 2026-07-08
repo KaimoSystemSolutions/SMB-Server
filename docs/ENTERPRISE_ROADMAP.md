@@ -627,22 +627,48 @@ draining shutdown and health/perf metrics landed with 23 tests (8 + 5 + 5 + 2 + 
 macOS clients use alternate data streams for resource forks and Finder metadata.
 Windows tools may use named streams for thumbnails and zone identifiers.
 
-### M9.1 — Named stream support in IFileStore
+Wire structures are pure in `Smb.Protocol.Messages.Fscc` (`StreamInformation`, `FullEaInformation`);
+the semantics sit behind two opt-in seams (`INamedStreamStore`, `IExtendedAttributeStore`, checked with
+`is` like `ISparseFileStore`) so the core stays dependency-free and a backend maps them onto real NTFS
+ADS / OS xattr. The default `LocalFileStore` backing is in-process (portable + testable).
 
-- [ ] Extend `IFileStore.CreateAsync` to accept stream names (`file.txt:stream`).
-- [ ] Implement stream enumeration (`FileStreamInformation`, §2.4.43).
-- [ ] Implement in `LocalFileStore`: delegate to OS stream support (NTFS on Windows,
-      xattr on Linux/macOS, or user-space sidecar files for ZFS).
-- [ ] Tests: create/read/write/delete named streams, enumerate streams.
+### M9.1 — Named stream support in IFileStore ✅
 
-### M9.2 — Extended attribute support
+- [x] `INamedStreamStore` seam (`OpenNamedStreamAsync` + `QueryStreamsAsync`) instead of widening
+      `IFileStore.CreateAsync` — the dispatcher splits a CREATE name of the form `file.txt:stream[:$DATA]`
+      (`TrySplitStreamName`, leaf-component colon; the `$DATA` type is ignored, an empty stream name =
+      the file's default data stream served as a normal open) and routes a named stream to the seam. The
+      returned `NamedStreamHandle` flows through the normal READ/WRITE/SET_INFO path.
+- [x] Stream enumeration: QUERY_INFO `FileStreamInformation` (§2.4.43) via `HandleQueryStreamsAsync` —
+      an ADS backend reports the default `::$DATA` plus every named stream; any other backend reports
+      just the default stream from the file size. Output capped to the client's buffer
+      (`STATUS_BUFFER_TOO_SMALL`).
+- [x] `LocalFileStore` implements `INamedStreamStore` with an in-process stream table keyed by base
+      physical path + case-folded stream name; content I/O (`StreamRead`/`StreamWrite`/`StreamSetLength`)
+      routes through the store, `DeleteOnClose` on a stream handle removes just that stream. A named
+      stream shares the base file's security descriptor. (Real NTFS ADS / xattr is the deployment's
+      `INamedStreamStore` — the default backing is intentionally in-memory.)
+- [x] Tests: create/write/read a named stream, enumerate (default + named), delete-on-close removes only
+      the stream (base file intact), and stream open on a non-ADS backend → `STATUS_NOT_SUPPORTED`, plus
+      the pure wire round-trip.
 
-- [ ] Implement `QUERY_INFO` / `SET_INFO` for `FileFullEaInformation` (§2.4.15).
-- [ ] Extend `IFileStore` with `GetExtendedAttributesAsync` / `SetExtendedAttributesAsync`.
-- [ ] Implement in `LocalFileStore` via OS xattr APIs.
-- [ ] Tests: set/get/list/delete EA entries.
+### M9.2 — Extended attribute support ✅
 
-**Estimated scope:** ~800 LOC production + ~400 LOC tests.
+- [x] QUERY_INFO / SET_INFO `FileFullEaInformation` (§2.4.15): `HandleQueryEaAsync` (needs FILE_READ_EA)
+      / `HandleSetEaAsync` (needs FILE_WRITE_EA); a SET entry with a zero-length value deletes that EA.
+      Pure `FullEaInformation` builder/parser (4-byte-aligned chain) + `ComputeEaSize`.
+- [x] `IExtendedAttributeStore` seam (`Get/SetExtendedAttributesAsync`); `LocalFileStore` implements it
+      with an in-process EA table keyed by physical path (add/replace/delete merge). A backend without
+      the seam reports no EAs and rejects EA writes with `STATUS_NOT_SUPPORTED`.
+- [x] Tests: set two EAs, read them back, delete one by zero-length value, and query on a backend with
+      no EAs → empty, plus the pure wire round-trip.
+
+**Estimated scope:** ~800 LOC production + ~400 LOC tests. *(Actual: ~360 LOC production + ~290 LOC
+tests — the QUERY/SET_INFO dispatch, CREATE prologue and access-check infrastructure were already in
+place; both features landed behind opt-in seams with no change to `IFileStore` or existing backends.)*
+
+**Phase 9 complete.** Named streams (M9.1) and extended attributes (M9.2) landed with 7 tests, suite
+372 → **379 green**.
 
 ---
 
@@ -779,8 +805,8 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Phase 8 / M8.3 | Complete | Connection admission control. `ConnectionLimiter` (global `MaxConnections` 1024 + per-IP `MaxConnectionsPerClient` 64; ≤0 = unlimited), host `TryAdmit` at accept → immediate close on rejection, `Release` via continuation. Per-connection request rate limiter deferred (optional). 5 tests (`ConnectionLimiterTests`). |
 | 2026-07-08 | Phase 8 / M8.4 | Complete | Graceful shutdown/draining. `StopAsync(drainTimeout?)` (default `ShutdownDrainTimeout` 30 s): stop accepting → drain token stops new reads while in-flight finish (reads use drain token, sends/ops the hard token) → wait → force-close; `Smb2Dispatcher.SendShutdownBreaksAsync` breaks caching holders to None first; drain progress logged. 2 tests (`ShutdownDrainTests`: shutdown-break to holder, real-TCP idle drain). |
 | 2026-07-08 | Phase 8 / M8.5 | Complete | Health/perf metrics. `SmbServerMetrics` (Interlocked, dependency-free): gauges (active connections/sessions/trees/handles), counters (accepted, auth ok/fail, requests, bytes read/written total+per-share, lock contention), bucketed latency histogram p50/p95/p99, `Snapshot()`→`MetricsSnapshot`. Wired across dispatcher/host; `SmbServer.Metrics`. `virtual` methods for OTel bridging (no forced dep). 3 tests (`MetricsTests`). **Phase 8 complete — suite 372 green.** |
-| | Phase 9 / M9.1 | Not started | |
-| | Phase 9 / M9.2 | Not started | |
+| 2026-07-08 | Phase 9 / M9.1 | Complete | Alternate data streams. Opt-in `INamedStreamStore` seam (`OpenNamedStreamAsync` + `QueryStreamsAsync`) instead of widening `IFileStore.CreateAsync`; dispatcher `TrySplitStreamName` splits `file:stream[:$DATA]` and routes named streams (empty name = default data stream → normal open), `NamedStreamHandle` flows through READ/WRITE/SET_INFO. QUERY_INFO `FileStreamInformation` (§2.4.43) via `HandleQueryStreamsAsync` (non-ADS backend → default `::$DATA` only). `LocalFileStore` in-process stream table (base path + case-folded name), delete-on-close removes only the stream, streams share the base file's SD. Pure `StreamInformation` builder. |
+| 2026-07-08 | Phase 9 / M9.2 | Complete | Extended attributes. Opt-in `IExtendedAttributeStore` seam (`Get/SetExtendedAttributesAsync`); QUERY/SET_INFO `FileFullEaInformation` (§2.4.15) via `HandleQueryEaAsync` (FILE_READ_EA) / `HandleSetEaAsync` (FILE_WRITE_EA), zero-length value = delete. Pure `FullEaInformation` builder/parser + `ComputeEaSize`. `LocalFileStore` in-process EA table (physical-path keyed, add/replace/delete merge); non-EA backend → no EAs / `NOT_SUPPORTED` on write. 7 tests (`Phase9StreamsAndEaTests`). **Phase 9 complete — suite 379 green.** |
 | | Phase 10 / M10.1 | Not started | |
 | | Phase 10 / M10.2 | Not started | |
 | | Phase 10 / M10.3 | Not started | |

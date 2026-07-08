@@ -104,6 +104,17 @@ public sealed partial class Smb2Dispatcher
         bool dirRequired = request.Options.HasFlag(CreateOptions.DirectoryFile);
         bool nonDirRequired = request.Options.HasFlag(CreateOptions.NonDirectoryFile);
 
+        // [M9.1] Alternate data stream: a CREATE name of the form "path\file:stream[:$DATA]" opens a
+        // named data stream of the base file. An empty stream name ("file::$DATA") is just the file's
+        // default data stream — served as a normal open of the base path. A non-empty stream needs a
+        // backend that implements INamedStreamStore; otherwise the object name has no valid stream
+        // (STATUS_NOT_SUPPORTED, as on a non-ADS file system).
+        bool hasStreamSuffix = TrySplitStreamName(request.Name, out string baseName, out string streamName);
+        string effectiveName = hasStreamSuffix ? baseName : request.Name;
+        bool namedStream = hasStreamSuffix && streamName.Length > 0;
+        if (namedStream && store is not INamedStreamStore)
+            return BuildError(header, NtStatus.NotSupported);
+
         // Allocate the open up front so the share-mode reservation can be keyed to it.
         ulong volatileId = connection.AllocateFileId();
         var open = new SmbOpen
@@ -123,8 +134,11 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.SharingViolation);
         open.ShareModeKey = shareKey;
 
-        FileStoreResult<FileCreateResult> result = await store.CreateAsync(
-            request.Name, access, disposition, dirRequired, nonDirRequired).ConfigureAwait(false);
+        FileStoreResult<FileCreateResult> result = namedStream
+            ? await ((INamedStreamStore)store).OpenNamedStreamAsync(
+                baseName, streamName, access, disposition).ConfigureAwait(false)
+            : await store.CreateAsync(
+                effectiveName, access, disposition, dirRequired, nonDirRequired).ConfigureAwait(false);
         if (!result.IsSuccess)
         {
             _server.Options.ShareModeManager.Close(shareKey, open);
@@ -245,8 +259,9 @@ public sealed partial class Smb2Dispatcher
         }
 
         // A newly created entry changes its parent directory's listing → break any directory lease
-        // cached on the parent so the holder re-enumerates (directory leasing, M1.3).
-        if (outcome == CreateOutcome.Created)
+        // cached on the parent so the holder re-enumerates (directory leasing, M1.3). Creating a named
+        // stream adds no directory entry, so it does not trigger a break.
+        if (outcome == CreateOutcome.Created && !namedStream)
             BreakParentDirectoryLease(handle.PhysicalPath);
 
         _server.Options.Metrics.OnHandleOpened();
@@ -974,6 +989,18 @@ public sealed partial class Smb2Dispatcher
         if (req.InfoType == InfoType.Security)
             return await HandleQuerySecurityAsync(session, header, open, req).ConfigureAwait(false);
 
+        // [M9.1/M9.2] Stream enumeration and extended attributes need the backend, not just the stat.
+        if (req.InfoType == InfoType.File)
+        {
+            switch ((FileInformationClass)req.FileInfoClass)
+            {
+                case FileInformationClass.FileStreamInformation:
+                    return await HandleQueryStreamsAsync(session, header, open, req).ConfigureAwait(false);
+                case FileInformationClass.FileFullEaInformation:
+                    return await HandleQueryEaAsync(session, header, open, req).ConfigureAwait(false);
+            }
+        }
+
         FsccFileStat stat = ToStat(await open.LocalOpen.GetInfoAsync().ConfigureAwait(false));
 
         byte[]? buffer = req.InfoType switch
@@ -1009,6 +1036,10 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.NotSupported);
 
         var infoClass = (FileInformationClass)req.FileInfoClass;
+
+        // [M9.2] Extended attributes are backend state, handled via the IExtendedAttributeStore seam.
+        if (infoClass == FileInformationClass.FileFullEaInformation)
+            return await HandleSetEaAsync(session, header, store, open, req).ConfigureAwait(false);
 
         // [M3.3] Enforce the handle's granted access for state-changing SET_INFO classes: truncation is a
         // write, delete-disposition and rename both require DELETE. Other classes (times/attributes) are
@@ -1136,6 +1167,89 @@ public sealed partial class Smb2Dispatcher
             which.HasFlag(SecurityInformation.Dacl) ? incoming.Dacl : existing.Dacl,
             which.HasFlag(SecurityInformation.Sacl) ? incoming.Sacl : existing.Sacl);
 
+    /// <summary>
+    /// [M9.1] QUERY_INFO FileStreamInformation (§2.4.43): enumerates the file's data streams. A backend
+    /// with <see cref="INamedStreamStore"/> reports the default plus every named stream; any other
+    /// backend reports just the default unnamed <c>::$DATA</c> stream from the file size.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleQueryStreamsAsync(
+        SmbSession session, Smb2Header header, SmbOpen open, QueryInfoMessage.Request req)
+    {
+        if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
+            return BuildError(header, err);
+
+        IReadOnlyList<FsccStreamEntry> entries;
+        if (store is INamedStreamStore streams)
+        {
+            FileStoreResult<IReadOnlyList<StreamInfo>> res = await streams.QueryStreamsAsync(open.LocalOpen!).ConfigureAwait(false);
+            if (!res.IsSuccess)
+                return BuildError(header, res.Status);
+            entries = res.Value!.Select(s => new FsccStreamEntry(s.Name, s.Size, s.AllocationSize)).ToList();
+        }
+        else
+        {
+            FileEntryInfo info = await open.LocalOpen!.GetInfoAsync().ConfigureAwait(false);
+            entries = info.IsDirectory
+                ? Array.Empty<FsccStreamEntry>()
+                : [new FsccStreamEntry(string.Empty, info.EndOfFile, info.AllocationSize)];
+        }
+
+        byte[] buffer = StreamInformation.Build(entries);
+        if ((uint)buffer.Length > req.OutputBufferLength)
+            return BuildError(header, NtStatus.BufferTooSmall);
+        return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(buffer));
+    }
+
+    /// <summary>
+    /// [M9.2] QUERY_INFO FileFullEaInformation (§2.4.15): returns the file's extended attributes. Needs
+    /// <see cref="IExtendedAttributeStore"/> (else an empty list) and the FILE_READ_EA right on the open.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleQueryEaAsync(
+        SmbSession session, Smb2Header header, SmbOpen open, QueryInfoMessage.Request req)
+    {
+        if (!TryGetFileStore(session, header.TreeId, out IFileStore store, out NtStatus err))
+            return BuildError(header, err);
+
+        IReadOnlyList<FsccEaEntry> eas = [];
+        if (store is IExtendedAttributeStore eaStore)
+        {
+            if ((open.GrantedAccess & AccessMask.FileReadEa) == 0)
+                return BuildError(header, NtStatus.AccessDenied);
+            FileStoreResult<IReadOnlyList<ExtendedAttribute>> res = await eaStore.GetExtendedAttributesAsync(open.LocalOpen!).ConfigureAwait(false);
+            if (!res.IsSuccess)
+                return BuildError(header, res.Status);
+            eas = res.Value!.Select(e => new FsccEaEntry(e.Flags, e.Name, e.Value)).ToList();
+        }
+
+        byte[] buffer = FullEaInformation.Build(eas);
+        if ((uint)buffer.Length > req.OutputBufferLength)
+            return BuildError(header, NtStatus.BufferTooSmall);
+        return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(buffer));
+    }
+
+    /// <summary>
+    /// [M9.2] SET_INFO FileFullEaInformation (§2.4.15): applies an EA change set (add/replace; a
+    /// zero-length value deletes). Needs <see cref="IExtendedAttributeStore"/> and FILE_WRITE_EA.
+    /// </summary>
+    private async ValueTask<ResponseSegment> HandleSetEaAsync(
+        SmbSession session, Smb2Header header, IFileStore store, SmbOpen open, SetInfoMessage.Request req)
+    {
+        if (store is not IExtendedAttributeStore eaStore)
+            return BuildError(header, NtStatus.NotSupported);
+        if ((open.GrantedAccess & AccessMask.FileWriteEa) == 0)
+            return BuildError(header, NtStatus.AccessDenied);
+
+        IReadOnlyList<FsccEaEntry> parsed;
+        try { parsed = FullEaInformation.Parse(req.Buffer); }
+        catch (SmbWireFormatException) { return BuildError(header, NtStatus.InvalidParameter); }
+
+        var entries = parsed.Select(e => new ExtendedAttribute(e.Name, e.Value, e.Flags)).ToList();
+        NtStatus status = await eaStore.SetExtendedAttributesAsync(open.LocalOpen!, entries).ConfigureAwait(false);
+        if (status != NtStatus.Success)
+            return BuildError(header, status);
+        return MaybeSigned(session, RespHeader(header, session), SetInfoMessage.BuildResponseBody());
+    }
+
     private async ValueTask<ResponseSegment> HandleFlushAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
@@ -1176,6 +1290,31 @@ public sealed partial class Smb2Dispatcher
         if ((desiredAccess & (Delete | GenericAll)) != 0)
             intent |= FileAccessIntent.Delete;
         return intent;
+    }
+
+    /// <summary>
+    /// [M9.1] Splits an SMB CREATE name into its base path and (alternate-data-stream) name. The stream
+    /// suffix has the form <c>:streamname[:$DATA]</c> on the leaf component; the stream <b>type</b> after
+    /// the second colon is ignored (only <c>$DATA</c> streams are modeled). Returns <c>true</c> when a
+    /// colon (stream suffix) is present — the returned <paramref name="streamName"/> is empty for the
+    /// default unnamed stream (<c>file::$DATA</c>). Paths are backslash-separated and drive-less, so a
+    /// colon can only introduce a stream.
+    /// </summary>
+    internal static bool TrySplitStreamName(string name, out string baseName, out string streamName)
+    {
+        baseName = name;
+        streamName = string.Empty;
+
+        int slash = name.LastIndexOf('\\');
+        int colon = name.IndexOf(':', slash + 1);
+        if (colon < 0)
+            return false;
+
+        baseName = name[..colon];
+        string rest = name[(colon + 1)..];
+        int typeColon = rest.IndexOf(':');            // ":$DATA" type suffix, if any
+        streamName = typeColon >= 0 ? rest[..typeColon] : rest;
+        return true;
     }
 
     /// <summary>

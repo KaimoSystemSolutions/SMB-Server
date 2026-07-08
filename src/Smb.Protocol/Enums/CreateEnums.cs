@@ -65,6 +65,7 @@ public enum FileInformationClass : byte
     FileInternalInformation = 6,
     FileEaInformation = 7,
     FileNameInformation = 9,
+    FileFullEaInformation = 15,
     FileRenameInformation = 10,
     FileNamesInformation = 12,
     FileDispositionInformation = 13,

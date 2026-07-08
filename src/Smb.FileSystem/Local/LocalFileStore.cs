@@ -11,12 +11,21 @@ namespace Smb.FileSystem.Local;
 /// root directory (no <c>..</c> escape, Context §13.4). Read/Write/List/Stat.
 /// Synchronously attached via <see cref="SyncFileStore"/>.
 /// </summary>
-public sealed class LocalFileStore : SyncFileStore
+public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtendedAttributeStore
 {
     private readonly string _root;
     private readonly string _realRoot;
     private readonly bool _readOnly;
     private readonly ISecurityDescriptorStore _securityStore;
+
+    // [Phase 9] Alternate data streams (M9.1) and extended attributes (M9.2). The default backing is
+    // in-process (portable + testable, enough for SMB-level semantics); a deployment that needs real
+    // NTFS ADS / OS xattr provides its own IFileStore. Streams are keyed by base physical path + the
+    // case-folded stream name; EAs by physical path. Guarded by a single lock (operations are short).
+    private sealed class StreamData { public required string Name; public byte[] Content = []; }
+    private readonly object _adsLock = new();
+    private readonly Dictionary<string, StreamData> _streams = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<ExtendedAttribute>> _eas = new(StringComparer.Ordinal);
 
     public LocalFileStore(string rootDirectory, bool readOnly = true, ISecurityDescriptorStore? securityStore = null)
     {
@@ -171,6 +180,7 @@ public sealed class LocalFileStore : SyncFileStore
 
     protected override FileStoreResult<int> Read(IFileHandle handle, long offset, Span<byte> buffer)
     {
+        if (handle is NamedStreamHandle ns) return StreamRead(ns.BaseFullPath, ns.StreamName, offset, buffer);
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
         return h.ReadAt(offset, buffer); // EOF → Ok(0) (handler maps to STATUS_END_OF_FILE)
@@ -185,6 +195,7 @@ public sealed class LocalFileStore : SyncFileStore
     public override async ValueTask<FileStoreResult<int>> ReadAsync(
         IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        if (handle is NamedStreamHandle ns) return StreamRead(ns.BaseFullPath, ns.StreamName, offset, buffer.Span);
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
         try
@@ -201,6 +212,7 @@ public sealed class LocalFileStore : SyncFileStore
 
     protected override FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data)
     {
+        if (handle is NamedStreamHandle ns) return StreamWrite(ns.BaseFullPath, ns.StreamName, offset, data);
         if (_readOnly) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
@@ -211,6 +223,7 @@ public sealed class LocalFileStore : SyncFileStore
     public override async ValueTask<FileStoreResult<int>> WriteAsync(
         IFileHandle handle, long offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
+        if (handle is NamedStreamHandle ns) return StreamWrite(ns.BaseFullPath, ns.StreamName, offset, data.Span);
         if (_readOnly) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
         var h = (LocalFileHandle)handle;
         if (h.IsDirectory) return FileStoreResult<int>.Fail(NtStatus.FileIsADirectory);
@@ -254,12 +267,14 @@ public sealed class LocalFileStore : SyncFileStore
     protected override NtStatus SetEndOfFile(IFileHandle handle, long length)
     {
         if (_readOnly) return NtStatus.AccessDenied;
+        if (handle is NamedStreamHandle ns) return StreamSetLength(ns.BaseFullPath, ns.StreamName, length);
         return ((LocalFileHandle)handle).SetLength(length);
     }
 
     protected override NtStatus Rename(IFileHandle handle, string newPath, bool replaceIfExists)
     {
         if (_readOnly) return NtStatus.AccessDenied;
+        if (handle is NamedStreamHandle) return NtStatus.NotSupported; // renaming a stream is not modeled
         var h = (LocalFileHandle)handle;
         if (!TryResolve(newPath, out string dest)) return NtStatus.ObjectPathNotFound;
         try
@@ -278,11 +293,13 @@ public sealed class LocalFileStore : SyncFileStore
     protected override NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
     {
         if (_readOnly && delete) return NtStatus.AccessDenied;
+        if (handle is NamedStreamHandle ns) { ns.DeleteOnClose = delete; return NtStatus.Success; }
         ((LocalFileHandle)handle).DeleteOnClose = delete;
         return NtStatus.Success;
     }
 
-    protected override NtStatus Flush(IFileHandle handle) => ((LocalFileHandle)handle).FlushStream();
+    protected override NtStatus Flush(IFileHandle handle)
+        => handle is NamedStreamHandle ? NtStatus.Success : ((LocalFileHandle)handle).FlushStream();
 
     /// <summary>
     /// Returns the stored security descriptor for the handle, or a permissive default (owner Local
@@ -292,8 +309,9 @@ public sealed class LocalFileStore : SyncFileStore
     public override ValueTask<FileStoreResult<SecurityDescriptor>> GetSecurityAsync(
         IFileHandle handle, CancellationToken cancellationToken = default)
     {
-        var h = (LocalFileHandle)handle;
-        SecurityDescriptor sd = _securityStore.TryGet(h.FullPath) ?? DefaultDescriptor();
+        // A named stream shares the base file's security descriptor.
+        string key = handle is NamedStreamHandle ns ? ns.BaseFullPath : ((LocalFileHandle)handle).FullPath;
+        SecurityDescriptor sd = _securityStore.TryGet(key) ?? DefaultDescriptor();
         return new(FileStoreResult<SecurityDescriptor>.Ok(sd));
     }
 
@@ -301,10 +319,203 @@ public sealed class LocalFileStore : SyncFileStore
         IFileHandle handle, SecurityDescriptor descriptor, CancellationToken cancellationToken = default)
     {
         if (_readOnly) return new(NtStatus.AccessDenied);
-        var h = (LocalFileHandle)handle;
-        _securityStore.Set(h.FullPath, descriptor);
+        string key = handle is NamedStreamHandle ns ? ns.BaseFullPath : ((LocalFileHandle)handle).FullPath;
+        _securityStore.Set(key, descriptor);
         return new(NtStatus.Success);
     }
+
+    // ---------------------------------------------------------------------
+    //  [Phase 9 / M9.1] Alternate data streams
+    // ---------------------------------------------------------------------
+
+    /// <inheritdoc/>
+    public ValueTask<FileStoreResult<FileCreateResult>> OpenNamedStreamAsync(
+        string basePath, string streamName, FileAccessIntent access, CreateDispositionIntent disposition,
+        CancellationToken cancellationToken = default)
+    {
+        if (!TryResolve(basePath, out string fullBase))
+            return Fail(NtStatus.ObjectNameNotFound);
+
+        bool wantsWrite = access.HasFlag(FileAccessIntent.Write) || disposition is
+            CreateDispositionIntent.Create or CreateDispositionIntent.Overwrite or
+            CreateDispositionIntent.OverwriteIf or CreateDispositionIntent.Supersede;
+        if (_readOnly && wantsWrite)
+            return Fail(NtStatus.AccessDenied);
+
+        // A data stream requires an existing base file (directory streams are not modeled here).
+        if (!File.Exists(fullBase))
+            return Fail(NtStatus.ObjectNameNotFound);
+
+        string key = StreamKey(fullBase, streamName);
+        CreateOutcome outcome;
+        lock (_adsLock)
+        {
+            bool exists = _streams.ContainsKey(key);
+            switch (disposition)
+            {
+                case CreateDispositionIntent.Open:
+                    if (!exists) return Fail(NtStatus.ObjectNameNotFound);
+                    outcome = CreateOutcome.Opened;
+                    break;
+                case CreateDispositionIntent.Create:
+                    if (exists) return Fail(NtStatus.ObjectNameCollision);
+                    _streams[key] = new StreamData { Name = streamName };
+                    outcome = CreateOutcome.Created;
+                    break;
+                case CreateDispositionIntent.Overwrite:
+                    if (!exists) return Fail(NtStatus.ObjectNameNotFound);
+                    _streams[key] = new StreamData { Name = streamName };
+                    outcome = CreateOutcome.Overwritten;
+                    break;
+                case CreateDispositionIntent.OpenIf:
+                    if (!exists) { _streams[key] = new StreamData { Name = streamName }; outcome = CreateOutcome.Created; }
+                    else outcome = CreateOutcome.Opened;
+                    break;
+                case CreateDispositionIntent.OverwriteIf:
+                    outcome = exists ? CreateOutcome.Overwritten : CreateOutcome.Created;
+                    _streams[key] = new StreamData { Name = streamName };
+                    break;
+                default: // Supersede
+                    outcome = exists ? CreateOutcome.Superseded : CreateOutcome.Created;
+                    _streams[key] = new StreamData { Name = streamName };
+                    break;
+            }
+        }
+
+        var handle = new NamedStreamHandle(this, fullBase, streamName);
+        return new(FileStoreResult<FileCreateResult>.Ok(new FileCreateResult(handle, outcome)));
+
+        static ValueTask<FileStoreResult<FileCreateResult>> Fail(NtStatus s)
+            => new(FileStoreResult<FileCreateResult>.Fail(s));
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<FileStoreResult<IReadOnlyList<StreamInfo>>> QueryStreamsAsync(
+        IFileHandle handle, CancellationToken cancellationToken = default)
+    {
+        string fullBase = handle is NamedStreamHandle ns ? ns.BaseFullPath : ((LocalFileHandle)handle).FullPath;
+        var list = new List<StreamInfo>();
+
+        // The default unnamed $DATA stream exists for a regular file (a directory has no data stream).
+        if (File.Exists(fullBase))
+        {
+            long size = new FileInfo(fullBase).Length;
+            list.Add(new StreamInfo(string.Empty, size, AlignUp(size, 4096)));
+        }
+
+        string prefix = fullBase + "\u0000";
+        lock (_adsLock)
+        {
+            foreach (KeyValuePair<string, StreamData> kv in _streams)
+                if (kv.Key.StartsWith(prefix, StringComparison.Ordinal))
+                    list.Add(new StreamInfo(kv.Value.Name, kv.Value.Content.Length, AlignUp(kv.Value.Content.Length, 4096)));
+        }
+        return new(FileStoreResult<IReadOnlyList<StreamInfo>>.Ok(list));
+    }
+
+    private static string StreamKey(string fullBase, string streamName)
+        => fullBase + "\u0000" + streamName.ToUpperInvariant();
+
+    internal FileStoreResult<int> StreamRead(string fullBase, string streamName, long offset, Span<byte> buffer)
+    {
+        lock (_adsLock)
+        {
+            if (!_streams.TryGetValue(StreamKey(fullBase, streamName), out StreamData? s))
+                return FileStoreResult<int>.Fail(NtStatus.FileClosed);
+            if (offset < 0 || offset >= s.Content.Length) return FileStoreResult<int>.Ok(0);
+            int n = (int)Math.Min(buffer.Length, s.Content.Length - offset);
+            s.Content.AsSpan((int)offset, n).CopyTo(buffer);
+            return FileStoreResult<int>.Ok(n);
+        }
+    }
+
+    internal FileStoreResult<int> StreamWrite(string fullBase, string streamName, long offset, ReadOnlySpan<byte> data)
+    {
+        if (_readOnly) return FileStoreResult<int>.Fail(NtStatus.AccessDenied);
+        if (offset < 0) return FileStoreResult<int>.Fail(NtStatus.InvalidParameter);
+        lock (_adsLock)
+        {
+            if (!_streams.TryGetValue(StreamKey(fullBase, streamName), out StreamData? s))
+                return FileStoreResult<int>.Fail(NtStatus.FileClosed);
+            long end = offset + data.Length;
+            if (end > s.Content.Length)
+            {
+                var grown = new byte[end];
+                s.Content.CopyTo(grown, 0);
+                s.Content = grown;
+            }
+            data.CopyTo(s.Content.AsSpan((int)offset));
+            return FileStoreResult<int>.Ok(data.Length);
+        }
+    }
+
+    internal NtStatus StreamSetLength(string fullBase, string streamName, long length)
+    {
+        if (_readOnly) return NtStatus.AccessDenied;
+        if (length < 0) return NtStatus.InvalidParameter;
+        lock (_adsLock)
+        {
+            if (!_streams.TryGetValue(StreamKey(fullBase, streamName), out StreamData? s))
+                return NtStatus.FileClosed;
+            var resized = new byte[length];
+            Array.Copy(s.Content, resized, Math.Min(s.Content.Length, length));
+            s.Content = resized;
+            return NtStatus.Success;
+        }
+    }
+
+    internal long StreamLength(string fullBase, string streamName)
+    {
+        lock (_adsLock)
+            return _streams.TryGetValue(StreamKey(fullBase, streamName), out StreamData? s) ? s.Content.Length : 0;
+    }
+
+    internal void StreamRemove(string fullBase, string streamName)
+    {
+        lock (_adsLock) _streams.Remove(StreamKey(fullBase, streamName));
+    }
+
+    // ---------------------------------------------------------------------
+    //  [Phase 9 / M9.2] Extended attributes
+    // ---------------------------------------------------------------------
+
+    /// <inheritdoc/>
+    public ValueTask<FileStoreResult<IReadOnlyList<ExtendedAttribute>>> GetExtendedAttributesAsync(
+        IFileHandle handle, CancellationToken cancellationToken = default)
+    {
+        string key = EaKey(handle);
+        lock (_adsLock)
+        {
+            if (_eas.TryGetValue(key, out List<ExtendedAttribute>? list))
+                return new(FileStoreResult<IReadOnlyList<ExtendedAttribute>>.Ok(list.ToArray()));
+        }
+        return new(FileStoreResult<IReadOnlyList<ExtendedAttribute>>.Ok(Array.Empty<ExtendedAttribute>()));
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<NtStatus> SetExtendedAttributesAsync(
+        IFileHandle handle, IReadOnlyList<ExtendedAttribute> entries, CancellationToken cancellationToken = default)
+    {
+        if (_readOnly) return new(NtStatus.AccessDenied);
+        string key = EaKey(handle);
+        lock (_adsLock)
+        {
+            if (!_eas.TryGetValue(key, out List<ExtendedAttribute>? list))
+                _eas[key] = list = new List<ExtendedAttribute>();
+
+            foreach (ExtendedAttribute e in entries)
+            {
+                list.RemoveAll(x => string.Equals(x.Name, e.Name, StringComparison.OrdinalIgnoreCase));
+                if (e.Value is { Length: > 0 })   // a zero-length value deletes the attribute (§2.4.15)
+                    list.Add(e);
+            }
+            if (list.Count == 0) _eas.Remove(key);
+        }
+        return new(NtStatus.Success);
+    }
+
+    private static string EaKey(IFileHandle handle)
+        => handle is NamedStreamHandle ns ? ns.BaseFullPath : ((LocalFileHandle)handle).FullPath;
 
     /// <summary>The implicit ACL for a file that has none set: everyone gets full control (0x1F01FF).</summary>
     private static SecurityDescriptor DefaultDescriptor()
@@ -437,6 +648,61 @@ public sealed class LocalFileStore : SyncFileStore
     }
 
     private static long AlignUp(long value, long alignment) => (value + alignment - 1) / alignment * alignment;
+}
+
+/// <summary>
+/// [Phase 9 / M9.1] Backend handle for a named alternate data stream of a local file. Content lives in
+/// the owning <see cref="LocalFileStore"/>'s in-process stream table; all I/O routes back through the
+/// store. <see cref="PhysicalPath"/> is the base file so directory-lease / security keying is unchanged.
+/// </summary>
+internal sealed class NamedStreamHandle : IFileHandle
+{
+    private readonly LocalFileStore _store;
+
+    public NamedStreamHandle(LocalFileStore store, string baseFullPath, string streamName)
+    {
+        _store = store;
+        BaseFullPath = baseFullPath;
+        StreamName = streamName;
+    }
+
+    public string BaseFullPath { get; }
+    public string StreamName { get; }
+    public bool DeleteOnClose { get; set; }
+    public string Path => System.IO.Path.GetFileName(BaseFullPath) + ":" + StreamName;
+    public bool IsDirectory => false;
+    public string? PhysicalPath => BaseFullPath;
+
+    public FileEntryInfo GetInfo()
+    {
+        long size = _store.StreamLength(BaseFullPath, StreamName);
+        var fi = new FileInfo(BaseFullPath);
+        long ct = Safe(fi, static f => f.CreationTimeUtc);
+        long at = Safe(fi, static f => f.LastAccessTimeUtc);
+        long wt = Safe(fi, static f => f.LastWriteTimeUtc);
+        return new FileEntryInfo
+        {
+            Name = System.IO.Path.GetFileName(BaseFullPath) + ":" + StreamName + ":$DATA",
+            Attributes = SmbFileAttributes.Normal,
+            EndOfFile = size,
+            AllocationSize = (size + 4095) / 4096 * 4096,
+            CreationTime = ct,
+            LastAccessTime = at,
+            LastWriteTime = wt,
+            ChangeTime = wt,
+            IndexNumber = PathId.Of(BaseFullPath + ":" + StreamName),
+        };
+    }
+
+    private static long Safe(FileInfo fi, Func<FileInfo, DateTime> pick)
+    {
+        try { return fi.Exists ? pick(fi).ToFileTimeUtc() : 0; } catch { return 0; }
+    }
+
+    public void Dispose()
+    {
+        if (DeleteOnClose) _store.StreamRemove(BaseFullPath, StreamName);
+    }
 }
 
 /// <summary>
