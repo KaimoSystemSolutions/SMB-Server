@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Net;
 using System.Net.Sockets;
 using Smb.Crypto;
 using Smb.Protocol.Constants;
@@ -6,6 +7,7 @@ using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Transport;
 using Smb.Server;
+using Smb.Server.Diagnostics;
 using Smb.Server.State;
 
 namespace Smb.Host;
@@ -45,10 +47,31 @@ internal sealed class SmbConnectionHandler
         _ioGate = maxOps > 1 ? new SemaphoreSlim(maxOps, maxOps) : null;
     }
 
-    public async Task RunAsync(TcpClient client, CancellationToken ct)
+    public async Task RunAsync(TcpClient client, CancellationToken hardCt, CancellationToken drainToken = default)
     {
-        var connection = new SmbConnection();
+        long nowTicks = _server.Options.TimeProvider.GetUtcNow().Ticks;
+        var connection = new SmbConnection
+        {
+            ClientAddress = (client.Client.RemoteEndPoint as IPEndPoint)?.ToString(),
+            CreatedTicks = nowTicks,
+            LastActivityTicks = nowTicks,
+        };
+
+        // [M8.2] Per-connection hard cancellation so the timeout sweeper (or a forced shutdown) can drop
+        // this connection alone (the read loop is otherwise blocked in ReadAsync). Sends/ops use this token.
+        using var connCts = CancellationTokenSource.CreateLinkedTokenSource(hardCt);
+        CancellationToken connCt = connCts.Token;
+        connection.RequestClose = () => { try { connCts.Cancel(); } catch (ObjectDisposedException) { } };
+
+        // [M8.4] Frame reads additionally observe the graceful-drain token: on shutdown the pending read
+        // is cancelled so the loop stops taking new frames, but in-flight work still completes and its
+        // response is sent over connCt (which is not cancelled during a graceful drain).
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(connCt, drainToken);
+        CancellationToken readCt = readCts.Token;
+
         _server.Connections[connection.ConnectionId] = connection;
+        _server.Options.Metrics.OnConnectionAccepted();
+        AuditConnection(SmbAuditEventType.ConnectionAccepted, connection);
 
         try
         {
@@ -58,18 +81,18 @@ internal sealed class SmbConnectionHandler
             // Provide an out-of-band send channel: asynchronously completed responses (e.g. a
             // blocking LOCK that was granted/cancelled) go through the same serialized
             // writer. Encryption/framing happen centrally in SendFramedAsync.
-            connection.SendRawAsync = (raw, forceEncrypt) => SendFramedAsync(stream, connection, raw, forceEncrypt, ct);
+            connection.SendRawAsync = (raw, forceEncrypt) => SendFramedAsync(stream, connection, raw, forceEncrypt, connCt);
 
-            while (!ct.IsCancellationRequested)
+            while (!readCt.IsCancellationRequested)
             {
                 // 1. Read NBSS prefix (4 bytes, 24-bit big-endian length).
-                if (!await TryReadExactAsync(stream, prefix, ct)) break;
+                if (!await TryReadExactAsync(stream, prefix, readCt)) break;
                 int length = NbssFrame.ReadLength(prefix);
                 if (length <= 0 || length > NbssFrame.MaxPayloadLength) break;
 
                 // 2. Read payload.
                 var payload = new byte[length];
-                if (!await TryReadExactAsync(stream, payload, ct)) break;
+                if (!await TryReadExactAsync(stream, payload, readCt)) break;
 
                 // 3. Decrypt (if transform frame). null = discard (unknown session, auth tag error).
                 (ReadOnlyMemory<byte> Message, bool Encrypted)? decoded = DecryptFrame(connection, payload);
@@ -82,11 +105,11 @@ internal sealed class SmbConnectionHandler
                 if (_ioGate is not null
                     && _dispatcher.TryBeginConcurrentFrame(connection, message, transportEncrypted, out Smb2Dispatcher.PreparedFrame prepared))
                 {
-                    await _ioGate.WaitAsync(ct).ConfigureAwait(false); // cap: waits until a slot is free
+                    await _ioGate.WaitAsync(connCt).ConfigureAwait(false); // cap: waits until a slot is free
                     lock (_inflight)
                     {
                         _inflight.RemoveAll(t => t.IsCompleted);
-                        _inflight.Add(RunConcurrentFrameAsync(stream, connection, prepared, ct));
+                        _inflight.Add(RunConcurrentFrameAsync(stream, connection, prepared, connCt));
                     }
                     continue;
                 }
@@ -99,7 +122,7 @@ internal sealed class SmbConnectionHandler
                 // 6. Encrypt (if needed), NBSS-frame, write back in serialized fashion.
                 //    Empty response = nothing to send (e.g. CANCEL).
                 if (response.Length != 0)
-                    await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct);
+                    await SendFramedAsync(stream, connection, response, forceEncrypt: false, connCt);
 
                 // [M5.3] A failed FSCTL_VALIDATE_NEGOTIATE_INFO (downgrade attack) requires the
                 // transport connection to be torn down (§3.3.5.15.12).
@@ -117,16 +140,34 @@ internal sealed class SmbConnectionHandler
         finally
         {
             connection.SendRawAsync = null;
+            connection.RequestClose = null; // the linked CTS is about to be disposed
             await DrainInflightAsync().ConfigureAwait(false); // drain running I/Os (before writeLock dispose!)
             // OnConnectionClosed releases opens (handles/locks/oplocks/share-modes, O5) and cancels pending
             // async ops — but keeps a session (and its pending LOCK/CHANGE_NOTIFY) alive when another
             // multichannel channel survives, rerouting their final response there (M6.3 failover).
             _dispatcher.OnConnectionClosed(connection);
             _server.Connections.TryRemove(connection.ConnectionId, out _);
+            _server.Options.Metrics.OnConnectionClosed();
+            AuditConnection(SmbAuditEventType.ConnectionClosed, connection);
             _writeLock.Dispose();
             _ioGate?.Dispose();
             client.Dispose();
         }
+    }
+
+    /// <summary>[M8.1] Emits a connection-lifecycle audit event (accept/close) if the logger is enabled.</summary>
+    private void AuditConnection(SmbAuditEventType type, SmbConnection connection)
+    {
+        ISmbAuditLogger logger = _server.Options.AuditLogger;
+        if (!logger.IsEnabled(SmbLogLevel.Information))
+            return;
+        logger.Log(new SmbAuditEvent
+        {
+            EventType = type,
+            Level = SmbLogLevel.Information,
+            Timestamp = _server.Options.TimeProvider.GetUtcNow(),
+            ClientAddress = connection.ClientAddress,
+        });
     }
 
     /// <summary>
@@ -293,6 +334,10 @@ internal sealed class SmbConnectionHandler
         catch (EndOfStreamException)
         {
             return false;
+        }
+        catch (OperationCanceledException)
+        {
+            return false; // [M8.4] graceful drain / connection close — stop reading, let the finally drain
         }
     }
 }

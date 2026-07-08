@@ -75,7 +75,7 @@ ISpnegoNegotiator  ──>  IGssMechanism (NTLM today, Kerberos later)
 
 ## Verification
 
-The suite (349 tests) covers, among others:
+The suite (372 tests) covers, among others:
 
 - **Official crypto vectors:** AES-CMAC (RFC 4493 §4), MD4 (RFC 1320 A.5), NTOWFv2 (MS-NLMP §4.2 example).
 - Wire roundtrips: header (sync/async), NBSS (big-endian length prefix), negotiate contexts
@@ -119,7 +119,8 @@ The suite (349 tests) covers, among others:
 | **Phase 5 Server-side copy & FSCTLs** ✅ (FSCTL_SRV_COPYCHUNK + resume keys + `CopyRangeAsync` offload; SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES / GET·SET·DELETE_REPARSE_POINT via opt-in seams; Secure Negotiate) | ✅ |
 | **Phase 6 Multichannel** ✅ (session binding + per-channel signing, FSCTL_QUERY_NETWORK_INTERFACE_INFO via `INetworkInterfaceProvider`, channel failover) | ✅ |
 | **Phase 7 DFS referrals** ✅ (FSCTL_DFS_GET_REFERRALS / _EX via pluggable `IDfsNamespace` + `StandaloneDfsNamespace`; DFS TREE_CONNECT/NEGOTIATE flags; link resolution → `STATUS_PATH_NOT_COVERED`) | ✅ |
-| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅; QUIC, RDMA, structured ops/logging | 🟡 |
+| **Phase 8 Operational readiness** ✅ (structured audit logging `ISmbAuditLogger`; idle/auth timeouts; connection admission control `ConnectionLimiter`; graceful draining shutdown; health/perf metrics `SmbServerMetrics`) | ✅ |
+| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅; QUIC, RDMA, ADS/EA | 🟡 |
 
 ## License note
 

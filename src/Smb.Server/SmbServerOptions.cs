@@ -3,6 +3,7 @@ using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Server.Authorization;
 using Smb.Server.Dfs;
+using Smb.Server.Diagnostics;
 using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Locking;
@@ -190,6 +191,66 @@ public sealed class SmbServerOptions
     /// <see cref="Smb.FileSystem.Share.IsDfs"/> so its TREE_CONNECT response carries the DFS flags.
     /// </summary>
     public IDfsNamespace? DfsNamespace { get; set; }
+
+    /// <summary>
+    /// Structured audit logging for security-relevant events (Phase 8 / M8.1): authentication,
+    /// share access, file open/close/delete, permission change, session/connection lifecycle. Default
+    /// <see cref="NullSmbAuditLogger"/> (off). Set a <see cref="DelegatingSmbAuditLogger"/> or a custom
+    /// <see cref="ISmbAuditLogger"/> to forward events to a log framework or SIEM.
+    /// </summary>
+    public ISmbAuditLogger AuditLogger { get; set; } = NullSmbAuditLogger.Instance;
+
+    /// <summary>
+    /// Health &amp; performance counters (Phase 8 / M8.5): active connections/sessions/handles, bytes
+    /// read/written (total and per share), auth attempts, lock contention and request-latency
+    /// percentiles. Always collected (cheap Interlocked counters); read <see cref="SmbServerMetrics.Snapshot"/>
+    /// for a health endpoint or subclass it to fan out to OpenTelemetry.
+    /// </summary>
+    public SmbServerMetrics Metrics { get; set; } = new();
+
+    /// <summary>
+    /// Idle-session timeout (Phase 8 / M8.2): a valid session with no request for this long is torn down
+    /// (its opens/locks/oplocks/share-modes released). Default 15 min; <see cref="TimeSpan.Zero"/> disables it.
+    /// </summary>
+    public TimeSpan SessionIdleTimeout { get; set; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// Idle-connection timeout (Phase 8 / M8.2): a TCP connection with no SMB frame for this long is
+    /// closed. Default 5 min; <see cref="TimeSpan.Zero"/> disables it.
+    /// </summary>
+    public TimeSpan ConnectionIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Authentication timeout (Phase 8 / M8.2): a connection that has not established a valid session
+    /// within this window of being accepted is dropped (slow-loris / half-open auth protection). Default
+    /// 30 s; <see cref="TimeSpan.Zero"/> disables it.
+    /// </summary>
+    public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How often the host runs the idle/auth-timeout sweep (Phase 8 / M8.2). Default 30 s;
+    /// <see cref="TimeSpan.Zero"/> disables the background sweeper entirely.
+    /// </summary>
+    public TimeSpan TimeoutSweepInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Maximum concurrent TCP connections the host accepts (Phase 8 / M8.3). Excess connections are
+    /// closed immediately without allocating state. Default 1024; ≤ 0 disables the global cap.
+    /// </summary>
+    public int MaxConnections { get; set; } = 1024;
+
+    /// <summary>
+    /// Maximum concurrent TCP connections per client IP (Phase 8 / M8.3). Protects against a single
+    /// client exhausting the connection budget. Default 64; ≤ 0 disables the per-client cap.
+    /// </summary>
+    public int MaxConnectionsPerClient { get; set; } = 64;
+
+    /// <summary>
+    /// Grace period a graceful <c>StopAsync</c> allows in-flight operations to finish before connections
+    /// are force-closed (Phase 8 / M8.4). Default 30 s. During drain no new frames are read; caching
+    /// holders are sent an oplock/lease break first.
+    /// </summary>
+    public TimeSpan ShutdownDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>Validates the configuration and throws on misconfiguration.</summary>
     public void Validate()

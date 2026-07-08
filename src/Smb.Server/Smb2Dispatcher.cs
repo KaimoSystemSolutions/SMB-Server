@@ -6,6 +6,7 @@ using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Wire;
 using Smb.Server.Authorization;
+using Smb.Server.Diagnostics;
 using Smb.Server.State;
 
 namespace Smb.Server;
@@ -37,6 +38,43 @@ public sealed partial class Smb2Dispatcher
     }
 
     /// <summary>
+    /// [M8.1] Emits a structured audit event if the configured logger is interested in this level.
+    /// Guarded by <see cref="ISmbAuditLogger.IsEnabled"/> so the default (off) path allocates nothing.
+    /// </summary>
+    private void Audit(SmbAuditEventType type, SmbLogLevel level, SmbConnection? connection,
+        string? user = null, string? share = null, string? path = null,
+        NtStatus status = NtStatus.Success, string? message = null)
+    {
+        ISmbAuditLogger logger = _server.Options.AuditLogger;
+        if (!logger.IsEnabled(level))
+            return;
+        logger.Log(new SmbAuditEvent
+        {
+            EventType = type,
+            Level = level,
+            Timestamp = _server.Options.TimeProvider.GetUtcNow(),
+            User = user,
+            ClientAddress = connection?.ClientAddress,
+            Share = share,
+            Path = path,
+            Status = status,
+            Message = message,
+        });
+    }
+
+    /// <summary>Renders an identity for the audit log (UPN if present, else <c>DOMAIN\user</c>).</summary>
+    private static string DescribeIdentity(SecurityIdentity? identity)
+    {
+        if (identity is null || identity.IsAnonymous)
+            return "(anonymous)";
+        if (!string.IsNullOrEmpty(identity.UserPrincipalName))
+            return identity.UserPrincipalName!;
+        return string.IsNullOrEmpty(identity.DomainName)
+            ? identity.UserName
+            : $"{identity.DomainName}\\{identity.UserName}";
+    }
+
+    /// <summary>
     /// Synchronous convenience wrapper around <see cref="ProcessMessageAsync"/> — for tests and
     /// hosts without an async path. With purely synchronous backends (<see cref="SyncFileStore"/>)
     /// the ValueTask chain completes synchronously anyway.
@@ -51,6 +89,11 @@ public sealed partial class Smb2Dispatcher
     /// </summary>
     public async ValueTask<byte[]> ProcessMessageAsync(SmbConnection connection, ReadOnlyMemory<byte> message, bool transportEncrypted = false)
     {
+        // [M8.2] Mark connection activity for the idle-connection timeout sweep.
+        connection.LastActivityTicks = _server.Options.TimeProvider.GetUtcNow().Ticks;
+        // [M8.5] Time this request for the latency histogram.
+        long requestStart = System.Diagnostics.Stopwatch.GetTimestamp();
+
         // SMB1 Multi-Protocol-Negotiate (§6.1): legacy clients (e.g. impacket) first send an
         // SMB1 SMB_COM_NEGOTIATE (ProtocolId FF 53 4D 42). Respond with an SMB2 NEGOTIATE response
         // with DialectRevision 0x02FF (wildcard); the real SMB2 NEGOTIATE follows after.
@@ -107,6 +150,8 @@ public sealed partial class Smb2Dispatcher
             offset += segmentLength;
         }
 
+        _server.Options.Metrics.OnRequestCompleted(
+            System.Diagnostics.Stopwatch.GetElapsedTime(requestStart).TotalMilliseconds);
         return AssembleResponse(connection, segments);
     }
 
@@ -427,6 +472,8 @@ public sealed partial class Smb2Dispatcher
 
         if (!auth.IsSuccess)
         {
+            _server.Options.Metrics.OnAuthenticationFailed();
+            Audit(SmbAuditEventType.AuthenticationFailed, SmbLogLevel.Warning, connection, status: auth.Status);
             CleanupFailedSession(connection, session);
             return BuildError(header, auth.Status);
         }
@@ -455,6 +502,10 @@ public sealed partial class Smb2Dispatcher
         }
 
         session.State = SessionState.Valid;
+        session.LastActivityTicks = _server.Options.TimeProvider.GetUtcNow().Ticks; // [M8.2] start the idle clock
+        _server.Options.Metrics.OnAuthenticationSucceeded();
+        Audit(SmbAuditEventType.AuthenticationSucceeded, SmbLogLevel.Information, connection,
+            user: DescribeIdentity(session.Identity));
 
         // Register the primary channel (Context §8.1 Session.ChannelList). Its signing key is the
         // session signing key; further connections bind additional channels with their own keys.
@@ -686,7 +737,11 @@ public sealed partial class Smb2Dispatcher
         };
         ShareAccessResult decision = _server.Options.ShareAccessPolicy.AuthorizeConnect(accessContext);
         if (!decision.Allowed)
+        {
+            Audit(SmbAuditEventType.ShareAccessDenied, SmbLogLevel.Warning, connection,
+                user: DescribeIdentity(session.Identity), share: request.ShareName, status: decision.DenyStatus);
             return BuildError(header, decision.DenyStatus);
+        }
 
         // Share encryption requirement (SMB2_SHAREFLAG_ENCRYPT_DATA, §3.3.5.7): if the share
         // requires encryption but the connection cannot provide it (dialect < 3.0 or no cipher
@@ -705,6 +760,9 @@ public sealed partial class Smb2Dispatcher
             EncryptData = encryptTree,
         };
         session.TreeConnects[treeId] = tree;
+        _server.Options.Metrics.OnTreeConnected();
+        Audit(SmbAuditEventType.ShareAccessGranted, SmbLogLevel.Information, connection,
+            user: DescribeIdentity(session.Identity), share: share.Name);
 
         var shareFlags = ShareFlags.ManualCaching;
         if (tree.EncryptData) shareFlags |= ShareFlags.EncryptData;
@@ -741,7 +799,8 @@ public sealed partial class Smb2Dispatcher
         if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        session.TreeConnects.TryRemove(header.TreeId, out _);
+        if (session.TreeConnects.TryRemove(header.TreeId, out _))
+            _server.Options.Metrics.OnTreeDisconnected();
 
         Smb2Header respHeader = header.CreateResponse(NtStatus.Success);
         respHeader.CreditRequestResponse = CreditManager.ComputeCreditGrant(header.CreditRequestResponse, _server.Options.MaxCreditsPerResponse);
@@ -760,6 +819,9 @@ public sealed partial class Smb2Dispatcher
         if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
+        Audit(SmbAuditEventType.SessionLogoff, SmbLogLevel.Information, connection,
+            user: DescribeIdentity(session.Identity));
+        _server.Options.Metrics.OnSessionClosed();
         CloseSessionOpens(session); // release handles/locks/oplocks/share-modes of this session (O5)
         connection.Sessions.TryRemove(session.SessionId, out _);
         _server.SessionGlobalList.TryRemove(session.SessionId, out _);
@@ -799,7 +861,10 @@ public sealed partial class Smb2Dispatcher
     private bool TryGetValidSession(SmbConnection connection, ulong sessionId, out SmbSession session)
     {
         if (connection.Sessions.TryGetValue(sessionId, out session!) && session.State == SessionState.Valid)
+        {
+            session.LastActivityTicks = _server.Options.TimeProvider.GetUtcNow().Ticks; // [M8.2] idle-session tracking
             return true;
+        }
         session = null!;
         return false;
     }

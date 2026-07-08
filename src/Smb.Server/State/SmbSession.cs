@@ -25,6 +25,10 @@ public sealed class SmbSession
 
     public SessionState State { get; set; } = SessionState.InProgress;
 
+    /// <summary>Timestamp (UTC ticks from the server's TimeProvider) of the last request handled on this
+    /// session across any of its channels. Drives the idle-session timeout (Phase 8 / M8.2).</summary>
+    public long LastActivityTicks { get; set; }
+
     /// <summary>Stateful SPNEGO context for the running auth flow.</summary>
     public ISpnegoServerContext? AuthContext { get; set; }
 

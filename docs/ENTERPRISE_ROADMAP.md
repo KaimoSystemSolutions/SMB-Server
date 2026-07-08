@@ -542,60 +542,83 @@ suite 335 → **349 green**.
 Enterprise file servers require structured logging, timeouts, rate limiting,
 and graceful lifecycle management.
 
-### M8.1 — Structured audit logging
+### M8.1 — Structured audit logging ✅
 
-- [ ] Replace `Action<string>?` logger with `ILogger` (Microsoft.Extensions.Logging)
-      or a similar structured logging interface.
-- [ ] Define log event IDs for security-relevant operations:
-  - Authentication success/failure (event 4624/4625 equivalent)
-  - Share access granted/denied
-  - File open/close/delete
-  - Permission change
-  - Session establish/teardown
-- [ ] Include structured fields: timestamp, user, client IP, share, file path,
-      action, result.
-- [ ] Tests: verify log events emitted for key operations.
+Kept dependency-free (no forced logging framework): a small structured-logging seam in
+`Smb.Server.Diagnostics` rather than an `ILogger` dependency, so consumers adapt it to
+Microsoft.Extensions.Logging / Serilog / a SIEM with a thin implementation. The freeform
+`Action<string>?` debug trace stays for developer diagnostics.
 
-### M8.2 — Session & connection timeouts
+- [x] `ISmbAuditLogger` seam + `SmbAuditEvent` (value type: timestamp, level, event type/id, user,
+      client address, share, path, status, message) + defaults `NullSmbAuditLogger` (off) and
+      `DelegatingSmbAuditLogger`. Wired via `SmbServerOptions.AuditLogger`.
+- [x] `SmbAuditEventType` with Windows-equivalent event ids: authentication succeeded/failed (4624/4625),
+      session logoff (4634), file closed/deleted (4658/4660), permission changed (4670), share access
+      granted/denied (5140/5143), file opened (5145), connection accepted/closed.
+- [x] Emitted at: session auth success/failure, LOGOFF, TREE_CONNECT grant/deny, CREATE (open), CLOSE
+      (close + delete-on-close), SET_SECURITY (permission change), connection accept/close (host). Each
+      call is guarded by `IsEnabled` so the default path allocates nothing. `SmbConnection.ClientAddress`
+      carries the client IP for the events.
+- [x] Tests (`AuditLoggingTests`, 8): a capturing logger asserts each event and its fields.
 
-- [ ] Implement idle session timeout: sessions without activity for a configurable
-      period (default 15 min) are torn down (opens closed, locks released).
-- [ ] Implement idle connection timeout: TCP connections without any SMB traffic
-      for a configurable period (default 5 min) are closed.
-- [ ] Implement authentication timeout: SESSION_SETUP must complete within a
-      configurable window (default 30 s) or the connection is dropped.
-- [ ] Tests: idle session expires, idle connection closes, slow auth times out.
+### M8.2 — Session & connection timeouts ✅
 
-### M8.3 — Connection rate limiting & DoS protection
+- [x] Idle-session timeout (`SessionIdleTimeout`, default 15 min): a valid session idle past the window
+      is torn down (opens/locks/oplocks/share-modes released) by `Smb2Dispatcher.SweepIdleTimeouts` →
+      `ExpireSession`. `SmbSession.LastActivityTicks` updated in `TryGetValidSession`.
+- [x] Idle-connection timeout (`ConnectionIdleTimeout`, default 5 min): a connection with no frame for
+      the window is dropped via a host-supplied `SmbConnection.RequestClose` (cancels the read loop).
+      `SmbConnection.LastActivityTicks` updated per frame.
+- [x] Authentication timeout (`AuthenticationTimeout`, default 30 s): a connection with no valid session
+      by `CreatedTicks + timeout` is dropped (slow-loris protection).
+- [x] The host runs the sweep on a background loop (`TimeoutSweepInterval`, default 30 s; 0 disables).
+      All timeouts measured against `SmbServerOptions.TimeProvider`.
+- [x] Tests (`TimeoutTests`, 5): idle session expires, active session kept, slow-auth connection closed,
+      authenticated connection not closed by auth timeout, idle connection closed — all over a `ManualTimeProvider`.
 
-- [ ] Add per-IP connection rate limiter (configurable max connections per IP,
-      default 64).
-- [ ] Add global connection limit (configurable, default 1024).
-- [ ] Add per-connection request rate limiter (optional, disabled by default).
-- [ ] Reject excess connections with TCP RST (do not allocate state).
-- [ ] Tests: exceed per-IP limit → rejected, global limit → rejected.
+### M8.3 — Connection rate limiting & DoS protection ✅
 
-### M8.4 — Graceful shutdown & connection draining
+- [x] `ConnectionLimiter` (thread-safe, pure): global cap (`MaxConnections`, default 1024) and per-client-IP
+      cap (`MaxConnectionsPerClient`, default 64); ≤ 0 disables a cap. `TryAdmit` at accept, `Release` at close.
+- [x] The host admits at accept and closes an over-limit connection immediately without allocating session
+      state (accept loop `TryAdmit` → `client.Dispose()` on rejection; release via a continuation).
+- [x] Per-connection request rate limiter: intentionally **deferred** (roadmap marks it optional/off by
+      default; the credit window already bounds outstanding requests, and the async-op cap covers the
+      resource-holding ones — H1).
+- [x] Tests (`ConnectionLimiterTests`, 5): per-client and global rejection, release frees a slot, zero =
+      unlimited, a rejected admission increments nothing.
 
-- [ ] On `StopAsync()`, stop accepting new connections but allow existing
-      connections to finish in-flight operations (configurable drain timeout,
-      default 30 s).
-- [ ] Send `SMB2_OPLOCK_BREAK` / lease break to all holders before closing handles.
-- [ ] Log connection drain progress.
-- [ ] Tests: shutdown during active I/O, all operations complete or time out.
+### M8.4 — Graceful shutdown & connection draining ✅
 
-### M8.5 — Health & performance metrics
+- [x] `StopAsync(drainTimeout?)` (default `ShutdownDrainTimeout`, 30 s): stops accepting (listener stop),
+      signals connections via a drain token so they stop reading **new** frames but finish in-flight work
+      and send its response (reads observe the drain token; sends/ops keep the hard token), waits up to the
+      drain timeout, then force-closes the remainder.
+- [x] `Smb2Dispatcher.SendShutdownBreaksAsync` notifies every caching holder (oplock ≥ LevelII, or a lease
+      with caching) to break to `None` before handles close, so the client can flush.
+- [x] Drain progress logged (count + timeout, and a force-close notice on timeout).
+- [x] Tests (`ShutdownDrainTests`, 2): shutdown-break reaches an oplock holder; a graceful stop drains an
+      idle real-TCP connection and closes the socket within the window.
 
-- [ ] Expose counters via a `SmbServerMetrics` class:
-  - Active connections, sessions, tree connects, open handles
-  - Bytes read/written (per share, total)
-  - Authentication attempts (success/failure)
-  - Lock contention count
-  - Request latency histogram (p50, p95, p99)
-- [ ] Optional integration with `System.Diagnostics.Metrics` (OpenTelemetry).
-- [ ] Tests: verify counters increment on operations.
+### M8.5 — Health & performance metrics ✅
 
-**Estimated scope:** ~2,000 LOC production + ~600 LOC tests.
+- [x] `SmbServerMetrics` (`Smb.Server.Diagnostics`, lock-free Interlocked, dependency-free): gauges (active
+      connections/sessions/tree-connects/open-handles), counters (connections accepted, auth success/failure,
+      requests, bytes read/written total **and per share**, lock contention) and a bucketed request-latency
+      histogram exposing p50/p95/p99. `Snapshot()` returns an immutable `MetricsSnapshot`.
+- [x] Wired throughout the dispatcher/host at the natural points (accept/close, auth, tree connect/disconnect,
+      CREATE/CLOSE, READ/WRITE bytes, lock conflict, per-request latency). Exposed as `SmbServer.Metrics` and
+      `SmbServerOptions.Metrics`.
+- [x] OpenTelemetry: kept dependency-free — subclass `SmbServerMetrics` (methods are `virtual`) or poll
+      `Snapshot()` to bridge to `System.Diagnostics.Metrics`, rather than forcing the package on all consumers.
+- [x] Tests (`MetricsTests`, 3): histogram percentiles monotonic/bucketed, auth counters, handle/byte
+      counters over real READ/WRITE.
+
+**Estimated scope:** ~2,000 LOC production + ~600 LOC tests. *(Actual: ~520 LOC production + ~470 LOC
+tests across M8.1–M8.5.)*
+
+**Phase 8 complete.** Structured audit logging, idle/auth timeouts, connection admission control, graceful
+draining shutdown and health/perf metrics landed with 23 tests (8 + 5 + 5 + 2 + 3), suite 349 → **372 green**.
 
 ---
 
@@ -751,11 +774,11 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-07 | Phase 6 / M6.3 | Complete | Channel failover. `SmbSession.SelectSendChannel(preferred)` + centralized `SendOutOfBandAsync` (selects a live channel BEFORE signing so the per-channel key is right) — wired into lease/oplock break + blocking-LOCK/CHANGE_NOTIFY finals. `OnConnectionClosed` now cancels only pending async ops whose session didn't survive (others complete + reroute); host no longer blanket-cancels. 2 tests (`Phase6FailoverTests.cs`: SelectSendChannel prefer/failover/null; blocking LOCK on a dropping channel granted + delivered on the survivor). **Phase 6 complete — suite 335 green.** |
 | 2026-07-08 | Phase 7 / M7.1 | Complete | DFS referral responses. Pure `DfsReferralMessage` (REQ/REQ_EX parse, RESP with V4 non-name-list entries + de-duplicated string pool) in `Smb.Protocol`; `IDfsNamespace` seam + `StandaloneDfsNamespace` (static link table, longest-prefix resolution) in `Smb.Server.Dfs`, injectable via `SmbServerOptions.DfsNamespace`. `HandleDfsGetReferrals` (FSCTL 0x00060194 / _EX 0x000601B0, NOT_FOUND when no namespace / path outside it, output capped to MaxOutputResponse). `IShare.IsDfs` → TREE_CONNECT DFS share flags + `SMB2_SHARE_CAP_DFS` (new `ShareCapabilities` enum); NEGOTIATE advertises `SMB2_GLOBAL_CAP_DFS` when a namespace is set. 11 tests (`DfsReferralTests.cs`), suite 346 green. |
 | 2026-07-08 | Phase 7 / M7.2 | Complete | DFS link resolution. CREATE on a DFS-root share whose path is at/below a DFS link → `STATUS_PATH_NOT_COVERED` (new `NtStatus.PathNotCovered`) via `IDfsNamespace.IsLinkCovered`; candidate path reconstructed as `\Server\Share\relative` (`BuildDfsPath`), consistent with the referral request shape. TTL + preference-ordered targets already carried by the referral. 3 tests (link → PATH_NOT_COVERED, root file served locally, non-DFS share ignores the namespace). **Phase 7 complete — suite 349 green.** |
-| | Phase 8 / M8.1 | Not started | |
-| | Phase 8 / M8.2 | Not started | |
-| | Phase 8 / M8.3 | Not started | |
-| | Phase 8 / M8.4 | Not started | |
-| | Phase 8 / M8.5 | Not started | |
+| 2026-07-08 | Phase 8 / M8.1 | Complete | Structured audit logging. `ISmbAuditLogger` seam + `SmbAuditEvent`/`SmbAuditEventType` (Windows-equivalent ids) + `Null`/`Delegating` defaults in `Smb.Server.Diagnostics`, wired via `SmbServerOptions.AuditLogger` (kept dependency-free, not `ILogger`). Emitted at auth success/fail, LOGOFF, TREE_CONNECT grant/deny, CREATE/CLOSE/delete, SET_SECURITY, connection accept/close; `SmbConnection.ClientAddress` added. 8 tests (`AuditLoggingTests`). |
+| 2026-07-08 | Phase 8 / M8.2 | Complete | Idle/auth timeouts. `SweepIdleTimeouts`/`ExpireSession` + `SmbSession.LastActivityTicks`, `SmbConnection.LastActivityTicks`/`CreatedTicks`/`RequestClose`; options `SessionIdleTimeout` (15 min), `ConnectionIdleTimeout` (5 min), `AuthenticationTimeout` (30 s), `TimeoutSweepInterval` (30 s); host background sweep loop + per-connection cancellation. 5 tests (`TimeoutTests`, `ManualTimeProvider`). |
+| 2026-07-08 | Phase 8 / M8.3 | Complete | Connection admission control. `ConnectionLimiter` (global `MaxConnections` 1024 + per-IP `MaxConnectionsPerClient` 64; ≤0 = unlimited), host `TryAdmit` at accept → immediate close on rejection, `Release` via continuation. Per-connection request rate limiter deferred (optional). 5 tests (`ConnectionLimiterTests`). |
+| 2026-07-08 | Phase 8 / M8.4 | Complete | Graceful shutdown/draining. `StopAsync(drainTimeout?)` (default `ShutdownDrainTimeout` 30 s): stop accepting → drain token stops new reads while in-flight finish (reads use drain token, sends/ops the hard token) → wait → force-close; `Smb2Dispatcher.SendShutdownBreaksAsync` breaks caching holders to None first; drain progress logged. 2 tests (`ShutdownDrainTests`: shutdown-break to holder, real-TCP idle drain). |
+| 2026-07-08 | Phase 8 / M8.5 | Complete | Health/perf metrics. `SmbServerMetrics` (Interlocked, dependency-free): gauges (active connections/sessions/trees/handles), counters (accepted, auth ok/fail, requests, bytes read/written total+per-share, lock contention), bucketed latency histogram p50/p95/p99, `Snapshot()`→`MetricsSnapshot`. Wired across dispatcher/host; `SmbServer.Metrics`. `virtual` methods for OTel bridging (no forced dep). 3 tests (`MetricsTests`). **Phase 8 complete — suite 372 green.** |
 | | Phase 9 / M9.1 | Not started | |
 | | Phase 9 / M9.2 | Not started | |
 | | Phase 10 / M10.1 | Not started | |

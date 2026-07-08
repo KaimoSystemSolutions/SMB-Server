@@ -7,6 +7,7 @@ using Smb.Protocol.Messages.Fscc;
 using Smb.Protocol.Security;
 using Smb.Protocol.Wire;
 using Smb.Server.Dfs;
+using Smb.Server.Diagnostics;
 using Smb.Server.Durable;
 using Smb.Server.Leases;
 using Smb.Server.Oplocks;
@@ -247,6 +248,10 @@ public sealed partial class Smb2Dispatcher
         // cached on the parent so the holder re-enumerates (directory leasing, M1.3).
         if (outcome == CreateOutcome.Created)
             BreakParentDirectoryLease(handle.PhysicalPath);
+
+        _server.Options.Metrics.OnHandleOpened();
+        Audit(SmbAuditEventType.FileOpened, SmbLogLevel.Information, connection,
+            user: DescribeIdentity(session.Identity), share: tree.Share.Name, path: request.Name);
 
         byte[]? responseContexts = responseCtxList.Count > 0 ? CreateContextList.Serialize(responseCtxList) : null;
         FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
@@ -805,6 +810,13 @@ public sealed partial class Smb2Dispatcher
         if (removedPhysicalPath is not null)
             BreakParentDirectoryLease(removedPhysicalPath);
 
+        _server.Options.Metrics.OnHandleClosed();
+        if (open.DeleteOnClose)
+            Audit(SmbAuditEventType.FileDeleted, SmbLogLevel.Information, connection,
+                user: DescribeIdentity(session.Identity), share: open.TreeConnect.Share.Name, path: open.PathName);
+        Audit(SmbAuditEventType.FileClosed, SmbLogLevel.Information, connection,
+            user: DescribeIdentity(session.Identity), share: open.TreeConnect.Share.Name, path: open.PathName);
+
         byte[] body = info is null
             ? CloseMessage.BuildResponseBody()
             : CloseMessage.BuildResponseBody(true,
@@ -838,7 +850,10 @@ public sealed partial class Smb2Dispatcher
 
         uint length = Math.Min(req.Length, connection.MaxReadSize);
         if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, length, forWrite: false))
+        {
+            _server.Options.Metrics.OnLockContention();
             return BuildError(header, NtStatus.FileLockConflict);
+        }
         var buffer = new byte[length];
         FileStoreResult<int> result = await store.ReadAsync(open.LocalOpen, (long)req.Offset, buffer).ConfigureAwait(false);
         if (!result.IsSuccess)
@@ -846,6 +861,7 @@ public sealed partial class Smb2Dispatcher
         if (result.Value == 0 && length > 0)
             return BuildError(header, NtStatus.EndOfFile);
 
+        _server.Options.Metrics.OnBytesRead(open.TreeConnect.Share.Name, result.Value);
         return MaybeSigned(session, RespHeader(header, session),
             ReadMessage.BuildResponseBody(buffer.AsSpan(0, result.Value)));
     }
@@ -876,12 +892,16 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.AccessDenied);
 
         if (!_server.Options.LockManager.IsRangeAccessible(open, req.Offset, (ulong)req.Data.Length, forWrite: true))
+        {
+            _server.Options.Metrics.OnLockContention();
             return BuildError(header, NtStatus.FileLockConflict);
+        }
 
         FileStoreResult<int> result = await store.WriteAsync(open.LocalOpen, (long)req.Offset, req.Data).ConfigureAwait(false);
         if (!result.IsSuccess)
             return BuildError(header, result.Status);
 
+        _server.Options.Metrics.OnBytesWritten(open.TreeConnect.Share.Name, result.Value);
         return MaybeSigned(session, RespHeader(header, session),
             WriteMessage.BuildResponseBody((uint)result.Value));
     }
@@ -983,7 +1003,7 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.FileClosed);
 
         if (req.InfoType == InfoType.Security)
-            return await HandleSetSecurityAsync(session, header, store, open, req).ConfigureAwait(false);
+            return await HandleSetSecurityAsync(connection, session, header, store, open, req).ConfigureAwait(false);
 
         if (req.InfoType != InfoType.File)
             return BuildError(header, NtStatus.NotSupported);
@@ -1076,7 +1096,7 @@ public sealed partial class Smb2Dispatcher
     /// AdditionalInformation) from the supplied descriptor into the stored one and persists it.
     /// </summary>
     private async ValueTask<ResponseSegment> HandleSetSecurityAsync(
-        SmbSession session, Smb2Header header, IFileStore store, SmbOpen open, SetInfoMessage.Request req)
+        SmbConnection connection, SmbSession session, Smb2Header header, IFileStore store, SmbOpen open, SetInfoMessage.Request req)
     {
         SecurityDescriptor incoming;
         try { incoming = SecurityDescriptor.Parse(req.Buffer); }
@@ -1093,6 +1113,8 @@ public sealed partial class Smb2Dispatcher
         if (status != NtStatus.Success)
             return BuildError(header, status);
 
+        Audit(SmbAuditEventType.PermissionChanged, SmbLogLevel.Information, connection,
+            user: DescribeIdentity(session.Identity), share: open.TreeConnect.Share.Name, path: open.PathName);
         return MaybeSigned(session, RespHeader(header, session), SetInfoMessage.BuildResponseBody());
     }
 
@@ -1379,6 +1401,58 @@ public sealed partial class Smb2Dispatcher
     {
         foreach (DurableHandle dh in _server.Options.DurableHandleStore.TakeExpired(_server.Options.TimeProvider.GetUtcNow()))
             ReleaseDurable(dh);
+    }
+
+    /// <summary>
+    /// [M8.2] Sweeps idle/half-open state (host-driven, measured against
+    /// <see cref="SmbServerOptions.TimeProvider"/>): expires valid sessions idle past
+    /// <see cref="SmbServerOptions.SessionIdleTimeout"/>, and asks the host to close connections that
+    /// have exceeded <see cref="SmbServerOptions.AuthenticationTimeout"/> without a valid session or
+    /// <see cref="SmbServerOptions.ConnectionIdleTimeout"/> without any traffic. Each timeout is skipped
+    /// when its option is <see cref="TimeSpan.Zero"/>.
+    /// </summary>
+    public void SweepIdleTimeouts()
+    {
+        SmbServerOptions opts = _server.Options;
+        long now = opts.TimeProvider.GetUtcNow().Ticks;
+
+        if (opts.SessionIdleTimeout > TimeSpan.Zero)
+        {
+            long sessionMax = opts.SessionIdleTimeout.Ticks;
+            foreach (SmbSession session in _server.SessionGlobalList.Values)
+            {
+                if (session.State == SessionState.Valid && now - session.LastActivityTicks > sessionMax)
+                    ExpireSession(session);
+            }
+        }
+
+        long authMax = opts.AuthenticationTimeout.Ticks;
+        long idleMax = opts.ConnectionIdleTimeout.Ticks;
+        foreach (SmbConnection connection in _server.Connections.Values)
+        {
+            bool hasValidSession = connection.Sessions.Values.Any(s => s.State == SessionState.Valid);
+            bool authExpired = !hasValidSession && opts.AuthenticationTimeout > TimeSpan.Zero
+                && now - connection.CreatedTicks > authMax;
+            bool idleExpired = opts.ConnectionIdleTimeout > TimeSpan.Zero
+                && now - connection.LastActivityTicks > idleMax;
+            if (authExpired || idleExpired)
+                connection.RequestClose?.Invoke();
+        }
+    }
+
+    /// <summary>[M8.2] Tears a session down out-of-band on idle timeout: releases its opens and removes it
+    /// from the global list and every connection it was bound to (multichannel-safe).</summary>
+    private void ExpireSession(SmbSession session)
+    {
+        Audit(SmbAuditEventType.SessionLogoff, SmbLogLevel.Information, null,
+            user: DescribeIdentity(session.Identity), message: "idle timeout");
+        _server.Options.Metrics.OnSessionClosed();
+        CloseSessionOpens(session);
+        _server.SessionGlobalList.TryRemove(session.SessionId, out _);
+        foreach (SmbConnection connection in _server.Connections.Values)
+            connection.Sessions.TryRemove(session.SessionId, out _);
+        session.Channels.Clear();
+        session.State = SessionState.Expired;
     }
 
     /// <summary>Fully releases a durable open's server-side state (backend handle, locks, oplock/lease, share mode).</summary>

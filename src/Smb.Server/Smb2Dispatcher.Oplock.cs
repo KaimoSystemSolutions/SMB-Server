@@ -1,6 +1,7 @@
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Wire;
+using Smb.Server.Leases;
 using Smb.Server.Oplocks;
 using Smb.Server.State;
 
@@ -36,6 +37,38 @@ public sealed partial class Smb2Dispatcher
             brk.Holder.OplockLevel = brk.NewLevel;   // diagnostic mirror; the manager's state is authoritative.
             _ = SendOplockBreakAsync(brk);
         }
+    }
+
+    /// <summary>
+    /// [M8.4] On graceful shutdown, notifies every caching holder to break to <c>None</c> before their
+    /// handles are closed, so a client can flush cached writes (§3.3.7.1). Best-effort: sent out-of-band
+    /// on a still-live channel; the drain window then gives the client time to react.
+    /// </summary>
+    public async Task SendShutdownBreaksAsync()
+    {
+        var tasks = new List<Task>();
+        foreach (SmbSession session in _server.SessionGlobalList.Values)
+        {
+            if (session.State != SessionState.Valid)
+                continue;
+            foreach (SmbOpen open in session.Opens.Values)
+            {
+                switch (open.OplockLevel)
+                {
+                    case OplockLevel.Exclusive:
+                    case OplockLevel.Batch:
+                    case OplockLevel.LevelII:
+                        tasks.Add(SendOplockBreakAsync(new OplockBreak(open, OplockLevel.None)));
+                        break;
+                    case OplockLevel.Lease when open.LeaseState != LeaseState.None:
+                        tasks.Add(SendLeaseBreakAsync(new LeaseBreak(
+                            open.LeaseKey, open.LeaseState, LeaseState.None, (ushort)(open.LeaseEpoch + 1), open)));
+                        break;
+                }
+            }
+        }
+        if (tasks.Count > 0)
+            await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     /// <summary>Sends the OPLOCK_BREAK notification to a holder out-of-band (§2.2.23.1).</summary>

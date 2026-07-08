@@ -23,9 +23,13 @@ public sealed class SmbServer : IAsyncDisposable
     private readonly SmbServerState _state;
     private readonly IPEndPoint _endpoint;
     private readonly Action<string>? _log;
+    private readonly ConnectionLimiter _limiter;
     private TcpListener? _listener;
-    private CancellationTokenSource? _cts;
+    private CancellationTokenSource? _hardCts;
+    private CancellationTokenSource? _drainCts;
     private Task? _acceptLoop;
+    private Task? _sweepLoop;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
     internal SmbServer(SmbServerOptions options, IPEndPoint endpoint, Action<string>? log)
     {
@@ -34,6 +38,7 @@ public sealed class SmbServer : IAsyncDisposable
         _state = new SmbServerState(options);
         _endpoint = endpoint;
         _log = log;
+        _limiter = new ConnectionLimiter(options.MaxConnections, options.MaxConnectionsPerClient);
     }
 
     /// <summary>The local endpoint on which the server is listening (after <see cref="StartAsync"/> with the actual port).</summary>
@@ -41,6 +46,9 @@ public sealed class SmbServer : IAsyncDisposable
 
     /// <summary>Server state (shares, sessions) — for tests/diagnostics.</summary>
     public SmbServerState State => _state;
+
+    /// <summary>[M8.5] Live health &amp; performance counters. Read <c>Metrics.Snapshot()</c> for a health endpoint.</summary>
+    public Smb.Server.Diagnostics.SmbServerMetrics Metrics => _state.Options.Metrics;
 
     /// <summary>Currently published shares (snapshot); reflects runtime add/remove.</summary>
     public IReadOnlyCollection<IShare> Shares => _state.Shares.All;
@@ -63,53 +71,130 @@ public sealed class SmbServer : IAsyncDisposable
     {
         if (_listener is not null) throw new InvalidOperationException("Server is already running.");
 
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _hardCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _drainCts = new CancellationTokenSource();
         _listener = new TcpListener(_endpoint);
         _listener.Start();
         _log?.Invoke($"SMB server listening on {_listener.LocalEndpoint}.");
-        _acceptLoop = AcceptLoopAsync(_cts.Token);
+        _acceptLoop = AcceptLoopAsync(_hardCts.Token);
+        _sweepLoop = SweepLoopAsync(_hardCts.Token);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// [M8.2] Background timeout sweep: periodically expires idle sessions and drops idle / slow-auth
+    /// connections (via the dispatcher's <see cref="Smb2Dispatcher.SweepIdleTimeouts"/>) and scavenges
+    /// expired durable handles. Disabled when <see cref="SmbServerOptions.TimeoutSweepInterval"/> is zero.
+    /// </summary>
+    private async Task SweepLoopAsync(CancellationToken ct)
+    {
+        SmbServerOptions options = _state.Options;
+        if (options.TimeoutSweepInterval <= TimeSpan.Zero)
+            return;
+
+        var dispatcher = new Smb2Dispatcher(_state, _log);
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(options.TimeoutSweepInterval, options.TimeProvider, ct).ConfigureAwait(false);
+                try
+                {
+                    dispatcher.SweepIdleTimeouts();
+                    dispatcher.ScavengeDurableHandles();
+                }
+                catch (Exception ex)
+                {
+                    _log?.Invoke($"[sweep] error: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+        catch (OperationCanceledException) { /* stop */ }
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
-        var clientTasks = new List<Task>();
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 TcpClient client = await _listener!.AcceptTcpClientAsync(ct);
                 client.NoDelay = true;
+
+                // [M8.3] Admission control: reject (immediately close, no state) once the global or
+                // per-client connection cap is reached.
+                string clientIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "unknown";
+                if (!_limiter.TryAdmit(clientIp))
+                {
+                    _log?.Invoke($"Connection from {clientIp} rejected (connection limit reached).");
+                    try { client.Dispose(); } catch { /* ignore */ }
+                    continue;
+                }
+
                 var handler = new SmbConnectionHandler(_state, _log);
-                clientTasks.Add(handler.RunAsync(client, ct));
-                clientTasks.RemoveAll(t => t.IsCompleted);
+                Task run = handler.RunAsync(client, _hardCts!.Token, _drainCts!.Token);
+                _connectionTasks.TryAdd(run, 0);
+                _ = run.ContinueWith(t =>
+                {
+                    _connectionTasks.TryRemove(t, out _);
+                    _limiter.Release(clientIp);
+                }, TaskScheduler.Default);
             }
         }
         catch (OperationCanceledException) { /* Stop */ }
         catch (ObjectDisposedException) { /* Listener stopped */ }
-        finally
-        {
-            await Task.WhenAll(clientTasks.Where(t => !t.IsFaulted));
-        }
     }
 
-    /// <summary>Stops the listener and terminates the accept loop.</summary>
-    public async Task StopAsync()
+    /// <summary>
+    /// [M8.4] Graceful shutdown with connection draining. Stops accepting new connections, sends
+    /// oplock/lease breaks to caching holders, then lets in-flight operations finish for up to
+    /// <paramref name="drainTimeout"/> (default <see cref="SmbServerOptions.ShutdownDrainTimeout"/>)
+    /// before force-closing the remainder.
+    /// </summary>
+    public async Task StopAsync(TimeSpan? drainTimeout = null)
     {
-        if (_cts is null) return;
-        await _cts.CancelAsync();
+        if (_hardCts is null) return;
+        TimeSpan drain = drainTimeout ?? _state.Options.ShutdownDrainTimeout;
+
+        // 1. Stop accepting (the accept loop exits when the listener is stopped).
         _listener?.Stop();
-        if (_acceptLoop is not null)
+
+        // 2. Notify caching holders so they can flush before their handles close (best-effort).
+        try { await new Smb2Dispatcher(_state, _log).SendShutdownBreaksAsync(); } catch { /* best-effort */ }
+
+        // 3. Signal connections to stop reading new frames and drain in-flight work.
+        if (_drainCts is not null) await _drainCts.CancelAsync();
+
+        // 4. Wait for connections to finish, up to the drain timeout; then force-close.
+        Task[] pending = _connectionTasks.Keys.ToArray();
+        if (pending.Length > 0)
         {
-            try { await _acceptLoop; } catch { /* ignore */ }
+            _log?.Invoke($"Draining {pending.Length} connection(s), timeout {drain.TotalSeconds:0}s.");
+            Task all = Task.WhenAll(pending);
+            if (await Task.WhenAny(all, Task.Delay(drain)).ConfigureAwait(false) != all)
+            {
+                _log?.Invoke("Drain timeout reached — forcing remaining connections closed.");
+                await _hardCts.CancelAsync();
+            }
+            try { await all; } catch { /* connection faults are logged per-connection */ }
         }
+        else
+        {
+            await _hardCts.CancelAsync();
+        }
+
+        // 5. Wind down the background loops.
+        if (_acceptLoop is not null) { try { await _acceptLoop; } catch { /* ignore */ } }
+        if (!_hardCts.IsCancellationRequested) await _hardCts.CancelAsync(); // stop the sweep loop
+        if (_sweepLoop is not null) { try { await _sweepLoop; } catch { /* ignore */ } }
         _listener = null;
     }
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
-        _cts?.Dispose();
+        _hardCts?.Dispose();
+        _drainCts?.Dispose();
     }
 
     private static void EnsureIpcShare(ShareCollection shares)

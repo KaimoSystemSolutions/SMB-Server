@@ -29,6 +29,24 @@ public sealed class SmbConnection
 
     public Guid ConnectionId { get; } = Guid.NewGuid();
 
+    /// <summary>Remote client endpoint (<c>ip:port</c>), set by the host at accept. Used for audit
+    /// logging and per-IP rate limiting (Phase 8). Null when hosted outside the TCP listener (tests).</summary>
+    public string? ClientAddress { get; set; }
+
+    /// <summary>Timestamp (UTC ticks from the server's TimeProvider) of the last frame received on this
+    /// connection. Drives the idle-connection timeout (Phase 8 / M8.2).</summary>
+    public long LastActivityTicks { get; set; }
+
+    /// <summary>Timestamp (UTC ticks) at which this connection was accepted. Drives the authentication
+    /// timeout — a connection with no valid session by <c>CreatedTicks + AuthenticationTimeout</c> is
+    /// dropped (Phase 8 / M8.2).</summary>
+    public long CreatedTicks { get; set; }
+
+    /// <summary>Host-supplied callback that tears the transport connection down out-of-band (cancels the
+    /// read loop). Set by the host; invoked by the timeout sweeper. Null when hosted outside the TCP
+    /// listener (tests) — the sweep then only marks state.</summary>
+    public Action? RequestClose { get; set; }
+
     /// <summary>Negotiated dialect (None until NEGOTIATE completes).</summary>
     public SmbDialect Dialect { get; set; } = SmbDialect.None;
 
