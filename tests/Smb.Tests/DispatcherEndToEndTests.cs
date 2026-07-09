@@ -107,6 +107,68 @@ public class DispatcherEndToEndTests
     }
 
     [Fact]
+    public void Smb1MultiProtocolNegotiate_Smb2002WithoutWildcard_CompletesInSingleRound()
+    {
+        var (dispatcher, _, conn) = NewServer();
+
+        // pysmb-style SMB1 SMB_COM_NEGOTIATE: offers NT LM 0.12 + the concrete SMB 2.002 dialect,
+        // but NOT the "SMB 2.???" wildcard. Per MS-SMB2 §3.3.5.3.1 this completes in a single round —
+        // the server must answer with dialect 0x0202 AND finalise the connection state.
+        byte[] smb1 = BuildSmb1Negotiate("NT LM 0.12", "SMB 2.002");
+
+        byte[] negResp = dispatcher.ProcessMessage(conn, smb1);
+        Smb2Header negHeader = Smb2Header.Read(negResp);
+        Assert.Equal(SmbCommand.Negotiate, negHeader.Command);
+        Assert.Equal(NtStatus.Success, negHeader.Status);
+        Assert.Equal((ushort)SmbDialect.Smb202,
+            System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(negResp.AsSpan(64 + 4, 2)));
+        Assert.True(conn.NegotiateDone);
+        Assert.Equal(SmbDialect.Smb202, conn.Dialect);
+
+        // The next message (SESSION_SETUP, MessageId 1) must now be accepted instead of being
+        // rejected with STATUS_INVALID_PARAMETER (the pre-fix behaviour that broke pysmb).
+        byte[] ssResp = dispatcher.ProcessMessage(conn,
+            TestHelpers.BuildSessionSetupRequest(1, 0, [0x01]));
+        Assert.NotEqual(NtStatus.InvalidParameter, Smb2Header.Read(ssResp).Status);
+    }
+
+    [Fact]
+    public void Smb1MultiProtocolNegotiate_WithWildcard_StaysTwoStage()
+    {
+        var (dispatcher, _, conn) = NewServer();
+
+        // A client offering both the concrete 2.002 AND the wildcard is prepared for the two-stage
+        // upgrade → answer with the wildcard and leave the connection un-negotiated.
+        byte[] smb1 = BuildSmb1Negotiate("NT LM 0.12", "SMB 2.002", "SMB 2.???");
+
+        byte[] resp = dispatcher.ProcessMessage(conn, smb1);
+        Assert.Equal((ushort)SmbDialect.Wildcard2FF,
+            System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(resp.AsSpan(64 + 4, 2)));
+        Assert.False(conn.NegotiateDone);
+    }
+
+    /// <summary>Builds a minimal SMB1 SMB_COM_NEGOTIATE offering the given dialect strings.</summary>
+    private static byte[] BuildSmb1Negotiate(params string[] dialects)
+    {
+        var body = new List<byte>();
+        foreach (string d in dialects)
+        {
+            body.Add(0x02); // BufferFormat marker
+            body.AddRange(System.Text.Encoding.ASCII.GetBytes(d));
+            body.Add(0x00); // null terminator
+        }
+
+        var msg = new byte[32 + 1 + 2 + body.Count];
+        msg[0] = 0xFF; msg[1] = 0x53; msg[2] = 0x4D; msg[3] = 0x42; // \xFFSMB
+        msg[4] = 0x72;                                              // SMB_COM_NEGOTIATE
+        msg[32] = 0x00;                                             // WordCount
+        msg[33] = (byte)(body.Count & 0xFF);                       // ByteCount (LE)
+        msg[34] = (byte)((body.Count >> 8) & 0xFF);
+        body.CopyTo(msg, 35);
+        return msg;
+    }
+
+    [Fact]
     public void TreeConnect_UnknownShare_ReturnsBadNetworkName()
     {
         var (dispatcher, _, conn) = NewServer();

@@ -94,11 +94,11 @@ public sealed partial class Smb2Dispatcher
         // [M8.5] Time this request for the latency histogram.
         long requestStart = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        // SMB1 Multi-Protocol-Negotiate (§6.1): legacy clients (e.g. impacket) first send an
-        // SMB1 SMB_COM_NEGOTIATE (ProtocolId FF 53 4D 42). Respond with an SMB2 NEGOTIATE response
-        // with DialectRevision 0x02FF (wildcard); the real SMB2 NEGOTIATE follows after.
+        // SMB1 Multi-Protocol-Negotiate (§6.1): legacy clients first send an SMB1 SMB_COM_NEGOTIATE
+        // (ProtocolId FF 53 4D 42). Depending on which SMB2 dialects they offer, this either upgrades
+        // to SMB2 in two stages (wildcard, then a real SMB2 NEGOTIATE) or completes in a single round.
         if (SmbProtocolIds.IsSmb1(message.Span) && message.Length > 4 && message.Span[4] == 0x72 /* SMB_COM_NEGOTIATE */)
-            return BuildSmb1WildcardNegotiateResponse();
+            return BuildSmb1NegotiateResponse(connection, message.Span);
 
 
         var segments = new List<ResponseSegment>();
@@ -317,7 +317,106 @@ public sealed partial class Smb2Dispatcher
         return Convert.ToHexString(data[..n]) + (data.Length > n ? "…" : "");
     }
 
-    // --- SMB1 → SMB2 Upgrade (Context §6.1) ---
+    // --- SMB1 → SMB2 Upgrade (Context §6.1 / MS-SMB2 §3.3.5.3.1) ---
+
+    /// <summary>
+    /// Builds the response to an SMB1 SMB_COM_NEGOTIATE. Which of two paths is taken is decided by the
+    /// SMB2 dialect strings the client offered:
+    /// <list type="bullet">
+    /// <item>The client offers the wildcard <c>SMB 2.???</c> (Windows, impacket, …), or offers no
+    /// concrete SMB2 dialect we can settle on: answer with the wildcard dialect 0x02FF and await a real
+    /// SMB2 NEGOTIATE. Connection state is left untouched — the classic two-stage upgrade.</item>
+    /// <item>The client offers a concrete SMB2 dialect (<c>SMB 2.002</c>) but NOT the wildcard (e.g.
+    /// pysmb): the negotiation completes in a SINGLE round. Answer with DialectRevision 0x0202 as the
+    /// final NEGOTIATE response and initialise the connection state, so the client's next message
+    /// (SESSION_SETUP) is accepted instead of being rejected with STATUS_INVALID_PARAMETER.</item>
+    /// </list>
+    /// </summary>
+    private byte[] BuildSmb1NegotiateResponse(SmbConnection connection, ReadOnlySpan<byte> smb1Message)
+    {
+        (bool offersWildcard, bool offers2002) = ParseSmb1NegotiateDialects(smb1Message);
+
+        // Single-round completion only when the client committed to a concrete SMB 2.0.2 (no wildcard)
+        // AND 2.0.2 lies within the configured dialect range. Otherwise keep the two-stage wildcard
+        // behaviour (the wildcard-capable client will follow up with a real SMB2 NEGOTIATE).
+        bool canSingleRound = offers2002 && !offersWildcard
+            && SmbDialect.Smb202 >= _server.Options.MinDialect
+            && SmbDialect.Smb202 <= _server.Options.MaxDialect;
+
+        return canSingleRound
+            ? BuildSmb1Smb202FinalNegotiateResponse(connection)
+            : BuildSmb1WildcardNegotiateResponse();
+    }
+
+    /// <summary>
+    /// Scans the body of an SMB1 SMB_COM_NEGOTIATE for the SMB2 dialect strings the client offered and
+    /// reports whether the wildcard <c>SMB 2.???</c> and/or the concrete <c>SMB 2.002</c> were present.
+    /// Layout (MS-CIFS §2.2.4.5.1): 32-byte SMB1 header, WordCount(1, =0), ByteCount(2), then a list of
+    /// <c>0x02 &lt;ASCII dialect name&gt; 0x00</c> entries.
+    /// </summary>
+    private static (bool wildcard, bool smb2002) ParseSmb1NegotiateDialects(ReadOnlySpan<byte> smb1)
+    {
+        const int headerSize = 32;
+        if (smb1.Length < headerSize + 3) return (false, false); // header + WordCount + ByteCount
+
+        int byteCount = smb1[headerSize + 1] | (smb1[headerSize + 2] << 8);
+        int start = headerSize + 3;
+        int end = Math.Min(smb1.Length, start + byteCount);
+
+        bool wildcard = false, smb2002 = false;
+        int i = start;
+        while (i < end)
+        {
+            if (smb1[i] != 0x02) { i++; continue; } // each entry begins with the buffer-format byte 0x02
+            int nameStart = i + 1;
+            int nameEnd = nameStart;
+            while (nameEnd < end && smb1[nameEnd] != 0x00) nameEnd++;
+            ReadOnlySpan<byte> name = smb1[nameStart..nameEnd];
+            if (name.SequenceEqual("SMB 2.???"u8)) wildcard = true;
+            else if (name.SequenceEqual("SMB 2.002"u8)) smb2002 = true;
+            i = nameEnd + 1;
+        }
+        return (wildcard, smb2002);
+    }
+
+    /// <summary>
+    /// Completes an SMB1 → SMB2 negotiation in a single round with dialect SMB 2.0.2 (§3.3.5.3.1).
+    /// The lone SMB 2.0.2 offer is run through the SAME <see cref="NegotiateProcessor"/> the real SMB2
+    /// path uses (so security mode, signing, buffer sizes and server capabilities are derived
+    /// identically), then the connection state is finalised exactly as <see cref="HandleNegotiate"/>
+    /// does. 2.0.2 has no preauth-integrity hash (a 3.1.1 feature), so none is seeded here.
+    /// </summary>
+    private byte[] BuildSmb1Smb202FinalNegotiateResponse(SmbConnection connection)
+    {
+        var request = new NegotiateRequest
+        {
+            SecurityMode = SmbSecurityMode.SigningEnabled,
+            Capabilities = Smb2Capabilities.None,
+            ClientGuid = new byte[16],
+            Dialects = [SmbDialect.Smb202],
+            NegotiateContexts = [],
+        };
+
+        byte[] securityBuffer = _server.Options.SpnegoNegotiator!.CreateInitialServerToken();
+        NegotiateResponse response = NegotiateProcessor.BuildResponse(connection, request, _server.Options, securityBuffer);
+
+        // Finalise the connection (mirrors HandleNegotiate). The SMB1 negotiate carried MessageId 0,
+        // so the next expected SMB2 MessageId is 1.
+        connection.NegotiateDone = true;
+        connection.SequenceWindowStart = 1;
+        connection.SequenceWindowSize = _server.Options.MaxCreditsPerResponse;
+
+        var header = new Smb2Header
+        {
+            Command = SmbCommand.Negotiate,
+            MessageId = 0,
+            Flags = Smb2HeaderFlags.ServerToRedir,
+            Status = NtStatus.Success,
+            CreditRequestResponse = 1,
+        };
+
+        return Concat(header.ToArray(), response.ToBody());
+    }
 
     /// <summary>
     /// Response to an SMB1 SMB_COM_NEGOTIATE: an SMB2 NEGOTIATE response with wildcard dialect
