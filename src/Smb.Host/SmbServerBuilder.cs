@@ -7,8 +7,14 @@ using Smb.FileSystem.Versioning;
 using Smb.Protocol.Enums;
 using Smb.Server;
 using Smb.Server.Authorization;
+using Smb.Server.Dfs;
+using Smb.Server.Diagnostics;
+using Smb.Server.Durable;
+using Smb.Server.Leases;
 using Smb.Server.Locking;
+using Smb.Server.Multichannel;
 using Smb.Server.Notification;
+using Smb.Server.Oplocks;
 using Smb.Server.Sharing;
 
 namespace Smb.Host;
@@ -72,6 +78,67 @@ public sealed class SmbServerBuilder
         return this;
     }
 
+    /// <summary>
+    /// Reject unencrypted requests against an encryption-required session/tree with
+    /// <c>STATUS_ACCESS_DENIED</c> (secure default: on, like Windows since Server 2022/24H2). Only relax
+    /// it if clients that cannot encrypt must still reach encryption-required shares.
+    /// </summary>
+    public SmbServerBuilder RejectUnencryptedAccess(bool reject = true)
+    {
+        _options.RejectUnencryptedAccess = reject;
+        return this;
+    }
+
+    /// <summary>Reject guest fallback logins (secure default: on, Context §8.4/§20).</summary>
+    public SmbServerBuilder RejectGuestAccess(bool reject = true)
+    {
+        _options.RejectGuestAccess = reject;
+        return this;
+    }
+
+    /// <summary>Allow anonymous (NULL-session) access (default off; Context §20).</summary>
+    public SmbServerBuilder AllowAnonymousAccess(bool allow = true)
+    {
+        _options.AllowAnonymousAccess = allow;
+        return this;
+    }
+
+    /// <summary>
+    /// Pins a stable 16-byte server GUID (NEGOTIATE / durable-handle identity). By default a random GUID
+    /// is generated per process; set a persisted value so clients recognize the same server across restarts.
+    /// </summary>
+    public SmbServerBuilder WithServerGuid(Guid guid)
+    {
+        _options.ServerGuid = guid.ToByteArray();
+        return this;
+    }
+
+    /// <summary>Overrides the AES cipher preference (descending) advertised for SMB3 encryption.</summary>
+    public SmbServerBuilder WithCipherPreference(params SmbCipherId[] ciphers)
+    {
+        _options.CipherPreference = ciphers;
+        return this;
+    }
+
+    /// <summary>Overrides the signing-algorithm preference (descending) advertised for SMB3 signing.</summary>
+    public SmbServerBuilder WithSigningPreference(params SmbSigningAlgorithmId[] algorithms)
+    {
+        _options.SigningPreference = algorithms;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the maximum negotiated READ / WRITE / TRANSACT payload sizes (bytes). Larger values raise
+    /// throughput at the cost of per-request buffers; defaults are 8&#160;MiB each.
+    /// </summary>
+    public SmbServerBuilder WithMaxIoSizes(uint maxReadSize, uint maxWriteSize, uint maxTransactSize)
+    {
+        _options.MaxReadSize = maxReadSize;
+        _options.MaxWriteSize = maxWriteSize;
+        _options.MaxTransactSize = maxTransactSize;
+        return this;
+    }
+
     /// <summary>Sets the auth provider (SPNEGO/GSS) — e.g. NTLM/Kerberos (Context §9).</summary>
     public SmbServerBuilder UseAuthentication(ISpnegoNegotiator negotiator)
     {
@@ -92,6 +159,33 @@ public sealed class SmbServerBuilder
     public SmbServerBuilder AddShare(IShare share)
     {
         _options.Shares.Add(share);
+        return this;
+    }
+
+    /// <summary>
+    /// Adds a disk share backed by a <see cref="LocalFileStore"/> over <paramref name="directory"/> —
+    /// the common case, without hand-building a <see cref="Share"/>. <paramref name="remark"/> is the
+    /// share description shown to clients (net view / Explorer), <paramref name="encrypt"/> forces
+    /// per-share SMB3 encryption, and <paramref name="continuousAvailability"/> grants persistent handles
+    /// (SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY).
+    /// </summary>
+    public SmbServerBuilder AddDiskShare(
+        string name,
+        string directory,
+        bool readOnly = false,
+        string remark = "",
+        bool encrypt = false,
+        bool continuousAvailability = false)
+    {
+        _options.Shares.Add(new Share
+        {
+            Name = name,
+            Type = ShareType.Disk,
+            FileStore = new LocalFileStore(directory, readOnly),
+            Remark = remark,
+            EncryptData = encrypt,
+            ContinuousAvailability = continuousAvailability,
+        });
         return this;
     }
 
@@ -172,6 +266,42 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
+    /// Sets oplock management (SMB2 oplocks, Context §15). Default is process-local
+    /// (<see cref="InMemoryOplockManager"/>); pass <see cref="NullOplockManager"/> to disable oplocks
+    /// (CREATE then always grants <c>None</c>), or a custom <see cref="IOplockManager"/> to delegate to a
+    /// cluster coordinator.
+    /// </summary>
+    public SmbServerBuilder UseOplockManager(IOplockManager manager)
+    {
+        _options.OplockManager = manager;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets lease management (SMB 2.1+ leases, Context §15). Default is process-local
+    /// (<see cref="InMemoryLeaseManager"/>); pass <see cref="NullLeaseManager"/> to disable leasing
+    /// (clients fall back to classic oplocks), or a custom <see cref="ILeaseManager"/>.
+    /// </summary>
+    public SmbServerBuilder UseLeaseManager(ILeaseManager manager)
+    {
+        _options.LeaseManager = manager;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the durable/persistent-handle store (Phase 4) and optionally the post-drop retention window.
+    /// Default is <see cref="InMemoryDurableHandleStore"/> (survives transport drops but not a process
+    /// restart); supply a serializable store to also survive restarts for persistent (CA) handles.
+    /// </summary>
+    public SmbServerBuilder UseDurableHandleStore(IDurableHandleStore store, TimeSpan? timeout = null)
+    {
+        _options.DurableHandleStore = store;
+        if (timeout is { } t)
+            _options.DurableHandleTimeout = t;
+        return this;
+    }
+
+    /// <summary>
     /// [M10.1] Wraps the transport in TLS (SMB over TLS): every connection completes a TLS handshake
     /// before any SMB2 bytes are exchanged, using <paramref name="serverCertificate"/> (which must
     /// carry a private key). Layer this beneath SMB3 signing/encryption on a dedicated port (e.g.
@@ -226,6 +356,107 @@ public sealed class SmbServerBuilder
     public SmbServerBuilder UseQuotaProvider(Smb.Server.Quota.IQuotaProvider provider)
     {
         _options.QuotaProvider = provider;
+        return this;
+    }
+
+    /// <summary>
+    /// Publishes a DFS namespace served via FSCTL_DFS_GET_REFERRALS (Phase 7). Advertises
+    /// <c>SMB2_GLOBAL_CAP_DFS</c> at NEGOTIATE so clients issue referral requests; mark the DFS-root share
+    /// <see cref="Share.IsDfs"/> so its TREE_CONNECT response carries the DFS flags. Default is no namespace
+    /// (referrals answered with <c>STATUS_NOT_FOUND</c>).
+    /// </summary>
+    public SmbServerBuilder UseDfsNamespace(IDfsNamespace dfsNamespace)
+    {
+        _options.DfsNamespace = dfsNamespace;
+        return this;
+    }
+
+    /// <summary>
+    /// Toggles multichannel (Phase 6): whether <c>SMB2_GLOBAL_CAP_MULTICHANNEL</c> is advertised and
+    /// FSCTL_QUERY_NETWORK_INTERFACE_INFO served so clients open additional channels. On by default.
+    /// </summary>
+    public SmbServerBuilder EnableMultichannel(bool enable = true)
+    {
+        _options.EnableMultichannel = enable;
+        return this;
+    }
+
+    /// <summary>
+    /// Overrides the interfaces reported by FSCTL_QUERY_NETWORK_INTERFACE_INFO (multichannel). Default
+    /// <see cref="SystemNetworkInterfaceProvider"/> (operational, non-loopback NICs); supply a custom
+    /// provider to control exactly which interfaces and capabilities are advertised.
+    /// </summary>
+    public SmbServerBuilder UseNetworkInterfaceProvider(INetworkInterfaceProvider provider)
+    {
+        _options.NetworkInterfaceProvider = provider;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the structured audit-log sink for security-relevant events (Phase 8 / M8.1: auth, share
+    /// access, file open/close/delete, permission change, session/connection lifecycle). Default is off
+    /// (<see cref="NullSmbAuditLogger"/>).
+    /// </summary>
+    public SmbServerBuilder UseAuditLogger(ISmbAuditLogger logger)
+    {
+        _options.AuditLogger = logger;
+        return this;
+    }
+
+    /// <summary>
+    /// Forwards audit events at or above <paramref name="minLevel"/> to <paramref name="sink"/> — the
+    /// simplest way to wire auditing to a console/logger/SIEM.
+    /// </summary>
+    public SmbServerBuilder UseAuditLogger(Action<SmbAuditEvent> sink, SmbLogLevel minLevel = SmbLogLevel.Information)
+    {
+        _options.AuditLogger = new DelegatingSmbAuditLogger(sink, minLevel);
+        return this;
+    }
+
+    /// <summary>
+    /// Supplies the health/performance counters instance (Phase 8 / M8.5) so the caller can read
+    /// <see cref="SmbServerMetrics.Snapshot"/> for a health endpoint or bridge it to OpenTelemetry.
+    /// A default instance is used when not set.
+    /// </summary>
+    public SmbServerBuilder UseMetrics(SmbServerMetrics metrics)
+    {
+        _options.Metrics = metrics;
+        return this;
+    }
+
+    /// <summary>
+    /// Caps concurrent TCP connections (Phase 8 / M8.3): <paramref name="max"/> total and
+    /// <paramref name="perClient"/> per source IP. Excess connections are closed without allocating state;
+    /// pass <c>0</c> to disable a cap. Defaults are 1024 / 64.
+    /// </summary>
+    public SmbServerBuilder WithConnectionLimits(int max, int perClient)
+    {
+        _options.MaxConnections = max;
+        _options.MaxConnectionsPerClient = perClient;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the idle/auth timeouts (Phase 8 / M8.2): a session idle for <paramref name="session"/> or a
+    /// connection idle for <paramref name="connection"/> is torn down, and a connection that has not
+    /// authenticated within <paramref name="authentication"/> of being accepted is dropped.
+    /// <see cref="TimeSpan.Zero"/> disables the respective timeout. Defaults 15&#160;min / 5&#160;min / 30&#160;s.
+    /// </summary>
+    public SmbServerBuilder WithIdleTimeouts(TimeSpan session, TimeSpan connection, TimeSpan authentication)
+    {
+        _options.SessionIdleTimeout = session;
+        _options.ConnectionIdleTimeout = connection;
+        _options.AuthenticationTimeout = authentication;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the time source for durable-handle deadlines/scavenging and idle timeouts. Default
+    /// <see cref="System.TimeProvider.System"/>; inject a fake for deterministic tests.
+    /// </summary>
+    public SmbServerBuilder WithTimeProvider(TimeProvider timeProvider)
+    {
+        _options.TimeProvider = timeProvider;
         return this;
     }
 
