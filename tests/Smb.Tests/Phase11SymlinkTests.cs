@@ -67,6 +67,22 @@ public class Phase11SymlinkTests : IDisposable
         Assert.Equal(SymlinkErrorResponse.IoReparseTagSymlink, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(8, 4)));
     }
 
+    [Fact]
+    public void ErrorContext_WrapsAndUnwrapsSymlinkData()
+    {
+        byte[] symlink = SymlinkErrorResponse.Build(@"\??\C:\t", @"C:\t", 4, relative: false);
+        byte[] body = ErrorResponse.BuildBodyWithContext(symlink);
+
+        // ErrorContextCount == 1, and the unwrapped payload equals the original SYMLINK_ERROR_RESPONSE.
+        Assert.Equal(1, body[2]);
+        Assert.Equal(symlink, ErrorResponse.ReadErrorData(body));
+
+        // The raw-ErrorData path (older dialects) round-trips through the same reader.
+        byte[] raw = ErrorResponse.BuildBody(symlink);
+        Assert.Equal(0, raw[2]);
+        Assert.Equal(symlink, ErrorResponse.ReadErrorData(raw));
+    }
+
     // --- CREATE over the dispatcher ---
 
     [Fact]
@@ -79,7 +95,10 @@ public class Phase11SymlinkTests : IDisposable
         byte[] resp = Create(d, conn, sid, tid, "link.txt", (uint)CreateOptions.NonDirectoryFile);
         Assert.Equal(NtStatus.StoppedOnSymlink, Smb2Header.Read(resp).Status);
 
-        SymlinkErrorResponse.Parsed p = SymlinkErrorResponse.Parse(ErrorData(resp));
+        // On 3.1.1 the SYMLINK_ERROR_RESPONSE is wrapped in an SMB2_ERROR_CONTEXT (§2.2.2.1);
+        // ReadErrorData unwraps it. The body should carry ErrorContextCount = 1.
+        Assert.Equal(1, resp[Smb2Header.Size + 2]);
+        SymlinkErrorResponse.Parsed p = SymlinkErrorResponse.Parse(ErrorResponse.ReadErrorData(resp.AsSpan(Smb2Header.Size)));
         Assert.Equal(@"\??\C:\elsewhere", p.SubstituteName);
         Assert.Equal(@"C:\elsewhere", p.PrintName);
         Assert.False(p.IsRelative);
@@ -127,13 +146,6 @@ public class Phase11SymlinkTests : IDisposable
     private byte[] Create(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, string name, uint options)
         => d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
             NextMid(), sid, tid, name, ReadAccess, (uint)CreateDisposition.Open, options));
-
-    private static byte[] ErrorData(byte[] resp)
-    {
-        const int body = Smb2Header.Size;
-        int byteCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(resp.AsSpan(body + 4, 4));
-        return resp.AsSpan(body + 8, byteCount).ToArray();
-    }
 
     private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(IFileStore store)
     {

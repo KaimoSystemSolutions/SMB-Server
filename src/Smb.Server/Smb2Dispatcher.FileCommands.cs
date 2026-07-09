@@ -129,7 +129,7 @@ public sealed partial class Smb2Dispatcher
                 byte[] errorData = SymlinkErrorResponse.Build(
                     target.SubstituteName, target.PrintName ?? target.SubstituteName,
                     target.UnparsedPathLength, target.IsRelative);
-                return BuildError(header, NtStatus.StoppedOnSymlink, errorData);
+                return BuildError(connection, header, NtStatus.StoppedOnSymlink, errorData);
             }
         }
 

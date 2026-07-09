@@ -27,8 +27,10 @@ public sealed class SmbServer : IAsyncDisposable
     private readonly SmbTlsOptions? _tls;
     private readonly SmbQuicOptions? _quicOptions;
     private readonly IPEndPoint? _quicEndpoint;
+    private readonly WsDiscoveryOptions? _wsDiscoveryOptions;
     private TcpListener? _listener;
     private SmbQuicListener? _quicListener;
+    private WsDiscoveryListener? _wsDiscoveryListener;
     private CancellationTokenSource? _hardCts;
     private CancellationTokenSource? _drainCts;
     private Task? _acceptLoop;
@@ -36,11 +38,13 @@ public sealed class SmbServer : IAsyncDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
     internal SmbServer(SmbServerOptions options, IPEndPoint endpoint, Action<string>? log,
-        SmbTlsOptions? tls = null, SmbQuicOptions? quic = null, int quicPort = 443)
+        SmbTlsOptions? tls = null, SmbQuicOptions? quic = null, int quicPort = 443,
+        WsDiscoveryOptions? wsDiscovery = null)
     {
         options.Validate();
         tls?.Validate();
         quic?.Validate();
+        wsDiscovery?.Validate();
         EnsureIpcShare(options.Shares);
         _state = new SmbServerState(options);
         _endpoint = endpoint;
@@ -49,6 +53,7 @@ public sealed class SmbServer : IAsyncDisposable
         _quicOptions = quic;
         // [M10.2] QUIC runs on its own UDP endpoint (same bind address as TCP, conventionally port 443).
         _quicEndpoint = quic is not null ? new IPEndPoint(endpoint.Address, quicPort) : null;
+        _wsDiscoveryOptions = wsDiscovery;
         _limiter = new ConnectionLimiter(options.MaxConnections, options.MaxConnectionsPerClient);
     }
 
@@ -57,6 +62,9 @@ public sealed class SmbServer : IAsyncDisposable
 
     /// <summary>[M10.2] The local UDP endpoint of the SMB-over-QUIC listener, or <c>null</c> when QUIC is not configured.</summary>
     public IPEndPoint? QuicEndpoint => _quicListener?.LocalEndPoint ?? _quicEndpoint;
+
+    /// <summary>[M11.3] The local UDP endpoint of the WS-Discovery responder, or <c>null</c> when it is not enabled.</summary>
+    public IPEndPoint? WsDiscoveryEndpoint => _wsDiscoveryListener?.LocalEndPoint;
 
     /// <summary>Server state (shares, sessions) — for tests/diagnostics.</summary>
     public SmbServerState State => _state;
@@ -99,6 +107,13 @@ public sealed class SmbServer : IAsyncDisposable
         {
             _quicListener = new SmbQuicListener(_state, _quicOptions, _quicEndpoint!, _log);
             await _quicListener.StartAsync(_hardCts.Token, _drainCts.Token).ConfigureAwait(false);
+        }
+
+        // [M11.3] Optional WS-Discovery responder (UDP 3702) so the server shows up in Explorer's Network view.
+        if (_wsDiscoveryOptions is not null)
+        {
+            _wsDiscoveryListener = new WsDiscoveryListener(_wsDiscoveryOptions, _log);
+            _wsDiscoveryListener.Start(_hardCts.Token);
         }
     }
 
@@ -207,6 +222,9 @@ public sealed class SmbServer : IAsyncDisposable
         // 4b. [M10.2] Stop the QUIC listener and drain its connections (they already observe the drain
         //     token from step 3 and the hard token from step 4).
         if (_quicListener is not null) { try { await _quicListener.StopAsync(); } catch { /* ignore */ } }
+
+        // 4c. [M11.3] Stop the WS-Discovery responder (sends Bye, closes the UDP socket).
+        if (_wsDiscoveryListener is not null) { try { await _wsDiscoveryListener.StopAsync(); } catch { /* ignore */ } }
 
         // 5. Wind down the background loops.
         if (_acceptLoop is not null) { try { await _acceptLoop; } catch { /* ignore */ } }

@@ -840,23 +840,60 @@ so the core stays dependency-free and a backend maps it onto its real symlink re
       whether to follow the link (re-target + retry, §3.3.5.9).
 - [x] `FILE_OPEN_REPARSE_POINT` (CreateOptions 0x00200000) bypasses the interception — the link itself
       is opened, matching Windows semantics.
-- [x] Tests (`tests/Smb.Tests/Phase11SymlinkTests.cs`, 6): absolute/relative wire round-trips, CREATE on a
-      symlink path → `STOPPED_ON_SYMLINK` + parsed error data, `OPEN_REPARSE_POINT` opens the link,
-      non-link path resolves normally, plain (non-resolver) backend never intercepts. Suite 418 → **424 green**.
+- [x] **SMB2_ERROR_CONTEXT wrapping (§2.2.2.1):** on the SMB 3.1.1 dialect the error data is wrapped in an
+      `SMB2_ERROR_CONTEXT` (ErrorDataLength + ErrorId `SMB2_ERROR_ID_DEFAULT` + ErrorContextData) with
+      `ErrorContextCount = 1`, the format the dialect mandates; earlier dialects get the raw ErrorData. The
+      dialect-aware `BuildError(connection, header, status, errorData)` helper + `ErrorResponse.BuildBodyWithContext`
+      pick the correct wire format for every negotiated dialect, and `ErrorResponse.ReadErrorData` unwraps
+      either form — no dialect-dependent ambiguity.
+- [x] Tests (`tests/Smb.Tests/Phase11SymlinkTests.cs`, 7): absolute/relative wire round-trips, error-context
+      wrap/unwrap round-trip, CREATE on a symlink path → `STOPPED_ON_SYMLINK` + `ErrorContextCount = 1` +
+      parsed error data, `OPEN_REPARSE_POINT` opens the link, non-link path resolves normally, plain
+      (non-resolver) backend never intercepts. Suite 418 → **425 green**.
 
 > **Modularity:** the SYMLINK_ERROR_RESPONSE wire type is pure in `Smb.Protocol`; the *detection* of a
 > symlink is the `ISymlinkResolver` seam a deployment implements over its file system (the reparse data
-> stays opaque, matching the M5.2 `IReparsePointStore` FSCTL path). `STATUS_STOPPED_ON_SYMLINK` on 3.1.1
-> is returned with `ErrorContextCount = 0` (raw ErrorData, spec-valid); wrapping it in an
-> `SMB2_ERROR_CONTEXT` is a later nuance if a client ever requires it.
+> stays opaque, matching the M5.2 `IReparsePointStore` FSCTL path). The error is delivered in the
+> dialect-correct framing (raw ErrorData pre-3.1.1, `SMB2_ERROR_CONTEXT` on 3.1.1), so no dialect sees an
+> undefined error-response format.
 
-### M11.3 — WS-Discovery (network browsing)
+### M11.3 — WS-Discovery (network browsing) ✅
 
-- [ ] Implement WSD responder for automatic server discovery in Windows Explorer.
-- [ ] Multicast UDP announcement and probe response.
-- [ ] Tests: probe → response contains server endpoint.
+Wire format is pure in `Smb.Protocol.Discovery` (SOAP-over-UDP, WS-Discovery 2005/04 — the profile Windows
+Explorer uses); the UDP multicast socket lives in the host layer (`Smb.Host`), so the core stays
+transport-agnostic and the discovery logic is fully unit-testable without sockets.
 
-**Estimated scope:** ~1,200 LOC production + ~500 LOC tests.
+- [x] WSD responder: a Probe is answered with a `ProbeMatches` reply carrying the server's
+      EndpointReference (`urn:uuid:…`), advertised Types, XAddrs and MetadataVersion. Pure
+      `WsDiscoveryMessage` (`TryParseProbe` / `BuildProbeMatches` / `BuildHello` / `BuildBye`, `TryGetAction`)
+      + stateful, socket-free `WsDiscoveryResponder` (`TryCreateProbeMatch` / `CreateHello` / `CreateBye`).
+      Type matching is namespace-resolved (Clark form): a type-less "probe-all" always matches, otherwise a
+      requested type must equal an advertised one (default `pub:Computer`).
+- [x] Multicast UDP: host-layer `WsDiscoveryListener` binds UDP 3702 (`SO_REUSEADDR`), joins the IPv4
+      multicast group 239.255.255.250, unicasts each `ProbeMatches` back to the prober, and announces
+      `Hello` on start / `Bye` on stop. A failed multicast join degrades to unicast-only (logged) instead of
+      failing the server. `WsDiscoveryOptions` (`EndpointId`, `Types`, `XAddrs`, `Port`, `BindAddress`,
+      `JoinMulticast`, `AnnouncePresence`) + fluent `SmbServerBuilder.UseWsDiscovery(configure?)`;
+      `SmbServer` runs it alongside TCP/QUIC (shared hard token), `SmbServer.WsDiscoveryEndpoint`.
+- [x] **Defined behavior for every datagram:** malformed / non-Probe / empty input never throws and yields no
+      reply (a no-op), and the AppSequence gives a stable per-instance `InstanceId` + monotonic
+      `MessageNumber` so message ordering is never ambiguous. XML parsing is hardened (`DtdProcessing.Prohibit`,
+      no external resolver).
+- [x] Tests (`tests/Smb.Tests/Phase11WsDiscoveryTests.cs`, 6): parse a Windows-style Probe (MessageID +
+      namespace-resolved Types), non-Probe/garbage → false, matching + probe-all reply with endpoint +
+      RelatesTo + XAddrs, unknown type / non-probe → null, MessageNumber increments while InstanceId stays
+      stable, and a host-level loopback UDP round-trip (unicast, ephemeral port) → `ProbeMatches` containing
+      the endpoint. Suite 425 → **431 green**.
+
+> **Modularity:** the SOAP/discovery wire format is pure in `Smb.Protocol.Discovery`; the socket is the
+> host-layer `WsDiscoveryListener`; the advertised identity is `WsDiscoveryOptions` a deployment supplies
+> (set a persisted `EndpointId` so restarts keep the same device identity). **Phase 11 complete.**
+
+**Estimated scope:** ~1,200 LOC production + ~500 LOC tests. *(Actual: ~430 LOC production + ~180 LOC tests
+across M11.2–M11.3 — the pure-wire + opt-in-seam + host-listener patterns were already established.)*
+
+**Phase 11 complete.** Quota (M11.1), reparse/symlink responses with dialect-correct error framing (M11.2)
+and WS-Discovery (M11.3) landed. **This completes the enterprise roadmap** (Phases 1–11).
 
 ---
 
@@ -943,5 +980,5 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Phase 10 / M10.2 | Complete | SMB over QUIC. Host-layer only (`Smb.Server`/`Smb.Protocol` stay transport-agnostic + cross-platform): `SmbQuicListener` + `SmbQuicOptions` over `System.Net.Quic` (native MsQuic, guarded by `QuicListener.IsSupported`; CA1416 suppressed behind that runtime check). QUIC reuses the direct-TCP SMB2 framing, so `SmbConnectionHandler` was refactored into a transport-agnostic `ServeAsync(stream,…)` core driven by both the TCP entry (`RunAsync(TcpClient)`, keeps TLS) and QUIC (each inbound bidirectional `QuicStream` = one SMB2 connection, `transportPreSecured`→`IsTransportSecured`). Mandatory TLS 1.3 with ALPN `"smb"`, required-server-cert, optional mutual TLS. Fluent `SmbServerBuilder.UseQuic(cert, port, configure?)`; `SmbServer` runs it as an additional UDP listener alongside TCP (shared drain/hard tokens), `SmbServer.QuicEndpoint`. 5 tests (`Phase10QuicTests.cs`, gated on IsSupported): handshake+NEGOTIATE, full READ flow over a stream, mTLS accept/reject, no-private-key→Build throws. **Suite 404 → 409 green. Phase 10 complete (M10.1 TLS + M10.2 QUIC + M10.3 LZ77 compression).** |
 | 2026-07-08 | Phase 10 / M10.3 | Complete (LZ77; LZNT1/Huffman follow-up) | SMB compression. Pure `Smb.Protocol.Compression`: `PlainLz77` (MS-XCA §2.4, 8 KiB window, capped-match spec-safe output), `CompressionTransformHeader`/`CompressionPayloadHeader` (unchained §2.2.42.1 + chained §2.2.42.2 decode incl. None/Pattern_V1), `SmbCompressor` orchestrator (`SupportedAlgorithms` = LZ77). `NegotiateProcessor` intersects client list ∩ server preference ∩ codecs, stores `SmbConnection.CompressionAlgorithm`, echoes context; gated on `EnableCompression` (off by default, 3.1.1 only, unchained). Host (`SmbConnectionHandler`) compresses responses ≥ `CompressionMinSize` (4096) when not encrypting and decodes inbound compression frames (`EncodeOutbound`/`DecodeInboundFrame`). Options `EnableCompression`/`CompressionPreference`/`CompressionMinSize` + fluent `SmbServerBuilder.UseCompression`. 21 tests (`Phase10CompressionTests.cs`), full suite 383 → **404 green**. LZNT1 + LZ77+Huffman codecs deferred (need spec-exact validation against a live client before being advertised). |
 | 2026-07-08 | Phase 11 / M11.1 | Complete | Disk quota. Pure `QuotaMessage` (SMB2_QUERY_QUOTA_INFO §2.2.37.1 parse + FILE_QUOTA_INFORMATION §2.4.33 list build/parse) in `Smb.Protocol`; `IQuotaProvider` seam (`Query`/`Set`/`TryReserve`/`Release`) + `NullQuotaProvider` (default) + `InMemoryQuotaProvider` (per-share per-owner-SID) in `Smb.Server.Quota`, injectable via `SmbServerOptions.QuotaProvider` / `SmbServerBuilder.UseQuotaProvider`. `HandleQueryQuota`/`HandleSetQuota` (InfoType.Quota in QUERY/SET_INFO; output capped→BUFFER_TOO_SMALL, empty→NO_MORE_ENTRIES). Write enforcement: reserve file-growth bytes against the owner's quota → over-limit `STATUS_DISK_FULL`, release on write failure; anonymous/NotSupported = no-op. `QueryInfoMessage` now captures the request InputBuffer; new `NtStatus.NoMoreEntries`. 9 tests (`Phase11QuotaTests.cs`), suite 409 → **418 green**. |
-| 2026-07-09 | Phase 11 / M11.2 | Complete | Reparse/symlink responses. Pure `SymlinkErrorResponse` (Build/Parse of SYMLINK_ERROR_RESPONSE §2.2.2.2.1: SymLinkErrorTag/IO_REPARSE_TAG_SYMLINK, substitute+print PathBuffer, UnparsedPathLength, SYMLINK_FLAG_RELATIVE) in `Smb.Protocol`; new `NtStatus.StoppedOnSymlink` (0x8000002D) + `ErrorResponse.BuildBody(errorData)` overload + `BuildError(…, errorData)`. Opt-in `ISymlinkResolver` seam (`ResolveSymlinkAsync`→`SymlinkTarget?`) in `Smb.FileSystem`, consulted in `HandleCreateAsync` before the backend open; `FILE_OPEN_REPARSE_POINT` bypasses so the link opens itself; non-resolver backends never intercept. 6 tests (`Phase11SymlinkTests.cs`), suite 418 → **424 green**. |
-| | Phase 11 / M11.3 | Not started | |
+| 2026-07-09 | Phase 11 / M11.2 | Complete | Reparse/symlink responses. Pure `SymlinkErrorResponse` (Build/Parse of SYMLINK_ERROR_RESPONSE §2.2.2.2.1: SymLinkErrorTag/IO_REPARSE_TAG_SYMLINK, substitute+print PathBuffer, UnparsedPathLength, SYMLINK_FLAG_RELATIVE) in `Smb.Protocol`; new `NtStatus.StoppedOnSymlink` (0x8000002D). **Dialect-correct error framing:** `ErrorResponse.BuildBody(errorData)` + `BuildBodyWithContext` (SMB2_ERROR_CONTEXT §2.2.2.1) + `ReadErrorData`; dialect-aware `BuildError(connection,…,errorData)` wraps in an error context on 3.1.1, raw pre-3.1.1. Opt-in `ISymlinkResolver` seam (`ResolveSymlinkAsync`→`SymlinkTarget?`) in `Smb.FileSystem`, consulted in `HandleCreateAsync` before the backend open; `FILE_OPEN_REPARSE_POINT` bypasses so the link opens itself; non-resolver backends never intercept. 7 tests (`Phase11SymlinkTests.cs`), suite 418 → **425 green**. |
+| 2026-07-09 | Phase 11 / M11.3 | Complete | WS-Discovery (network browsing). Pure `Smb.Protocol.Discovery` (SOAP-over-UDP, WS-Discovery 2005/04): `WsDiscoveryConstants`, `WsDiscoveryQName` (Clark-form type matching), `WsDiscoveryMessage` (TryParseProbe/BuildProbeMatches/Hello/Bye, hardened XML: DtdProhibit + no resolver), stateful socket-free `WsDiscoveryResponder` (TryCreateProbeMatch/Hello/Bye, stable InstanceId + monotonic MessageNumber). Host-layer `WsDiscoveryListener` (UDP 3702, multicast 239.255.255.250 join → unicast ProbeMatches, Hello/Bye; degrades to unicast on join failure) + `WsDiscoveryOptions` + `SmbServerBuilder.UseWsDiscovery`; `SmbServer.WsDiscoveryEndpoint`. Malformed/non-Probe = defined no-op (never throws). 6 tests (`Phase11WsDiscoveryTests.cs`, incl. host loopback UDP round-trip), suite 425 → **431 green**. **Phase 11 + the enterprise roadmap complete.** |

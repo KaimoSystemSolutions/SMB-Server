@@ -26,6 +26,7 @@ public sealed class SmbServerBuilder
     private SmbTlsOptions? _tls;
     private SmbQuicOptions? _quic;
     private int _quicPort = 443;
+    private WsDiscoveryOptions? _wsDiscovery;
 
     public static SmbServerBuilder Create() => new();
 
@@ -228,6 +229,21 @@ public sealed class SmbServerBuilder
         return this;
     }
 
+    /// <summary>
+    /// [M11.3] Enables the WS-Discovery responder so the server appears in Windows Explorer's Network view:
+    /// a UDP listener on port 3702 joins the multicast group, answers Probe messages with a ProbeMatches
+    /// reply, and announces Hello/Bye. Use <paramref name="configure"/> to set a stable
+    /// <see cref="WsDiscoveryOptions.EndpointId"/>, the advertised <see cref="WsDiscoveryOptions.XAddrs"/>
+    /// (host/IP), or device types.
+    /// </summary>
+    public SmbServerBuilder UseWsDiscovery(Action<WsDiscoveryOptions>? configure = null)
+    {
+        var wsd = new WsDiscoveryOptions();
+        configure?.Invoke(wsd);
+        _wsDiscovery = wsd;
+        return this;
+    }
+
     /// <summary>Configures options directly (for fine-grained settings).</summary>
     public SmbServerBuilder Configure(Action<SmbServerOptions> configure)
     {
@@ -242,5 +258,5 @@ public sealed class SmbServerBuilder
         return this;
     }
 
-    public SmbServer Build() => new(_options, _endpoint, _log, _tls, _quic, _quicPort);
+    public SmbServer Build() => new(_options, _endpoint, _log, _tls, _quic, _quicPort, _wsDiscovery);
 }

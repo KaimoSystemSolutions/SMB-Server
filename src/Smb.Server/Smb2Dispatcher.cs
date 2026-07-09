@@ -902,11 +902,19 @@ public sealed partial class Smb2Dispatcher
         return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
     }
 
-    /// <summary>Builds an ERROR response carrying variable ErrorData (e.g. a SYMLINK_ERROR_RESPONSE, §2.2.2.2.1).</summary>
-    private static ResponseSegment BuildError(Smb2Header request, NtStatus status, ReadOnlySpan<byte> errorData)
+    /// <summary>
+    /// Builds an ERROR response carrying variable ErrorData (e.g. a SYMLINK_ERROR_RESPONSE, §2.2.2.2.1).
+    /// On the SMB 3.1.1 dialect the data is wrapped in an SMB2_ERROR_CONTEXT (§2.2.2.1) as the spec
+    /// mandates; earlier dialects receive the raw ErrorData. Passing the connection keeps the wire format
+    /// well-defined for every negotiated dialect (no ambiguous state).
+    /// </summary>
+    private static ResponseSegment BuildError(SmbConnection connection, Smb2Header request, NtStatus status, ReadOnlySpan<byte> errorData)
     {
         Smb2Header h = request.CreateResponse(status);
-        return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody(errorData));
+        byte[] body = connection.Dialect == SmbDialect.Smb311
+            ? ErrorResponse.BuildBodyWithContext(errorData)
+            : ErrorResponse.BuildBody(errorData);
+        return ResponseSegment.Unsigned(h, body);
     }
 
     /// <summary>

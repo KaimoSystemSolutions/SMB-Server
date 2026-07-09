@@ -122,8 +122,8 @@ The suite (383 tests) covers, among others:
 | **Phase 8 Operational readiness** ✅ (structured audit logging `ISmbAuditLogger`; idle/auth timeouts; connection admission control `ConnectionLimiter`; graceful draining shutdown; health/perf metrics `SmbServerMetrics`) | ✅ |
 | **Phase 9 Alternate data streams & extended attributes** ✅ (named streams `file.txt:stream` + FileStreamInformation via opt-in `INamedStreamStore`; FileFullEaInformation via opt-in `IExtendedAttributeStore`) | ✅ |
 | **Phase 10 Transport hardening** ✅ (**M10.1 SMB over TLS** — `SslStream` wrapper via `SmbServerBuilder.UseTls(cert)`, mutual TLS; **M10.2 SMB over QUIC** — `SmbServerBuilder.UseQuic(cert)`, TLS 1.3 + ALPN "smb"; **M10.3 compression** — LZ77 via `UseCompression`, negotiate context) | ✅ |
-| **Phase 11 Quota & advanced FS** 🟡 (**M11.1 quota** ✅ — QUERY/SET_QUOTA_INFO via opt-in `IQuotaProvider`, write enforcement → `STATUS_DISK_FULL`; **M11.2 reparse/symlink** ✅ — `STATUS_STOPPED_ON_SYMLINK` + SYMLINK_ERROR_RESPONSE via opt-in `ISymlinkResolver`; WS-Discovery open) | 🟡 |
-| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅, ADS/EA ✅, TLS/QUIC/compression ✅, quota ✅, reparse/symlink ✅; WS-Discovery, RDMA | 🟡 |
+| **Phase 11 Quota & advanced FS** ✅ (**M11.1 quota** — QUERY/SET_QUOTA_INFO via opt-in `IQuotaProvider`, write enforcement → `STATUS_DISK_FULL`; **M11.2 reparse/symlink** — `STATUS_STOPPED_ON_SYMLINK` + SYMLINK_ERROR_RESPONSE via opt-in `ISymlinkResolver`, dialect-correct SMB2_ERROR_CONTEXT framing; **M11.3 WS-Discovery** — UDP responder via `SmbServerBuilder.UseWsDiscovery()` for Explorer network browsing) | ✅ |
+| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅, ADS/EA ✅, TLS/QUIC/compression ✅, quota ✅, reparse/symlink ✅, WS-Discovery ✅; RDMA | 🟡 |
 
 ## License note
 
