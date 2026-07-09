@@ -821,13 +821,34 @@ onto the real OS quota system.
       unsupported provider → `NOT_SUPPORTED`, QUERY returns a seeded entry, SET updates the provider, and a
       write exceeding the owner's quota → `STATUS_DISK_FULL` (the prior within-limit write succeeds).
 
-### M11.2 — Reparse point / symlink responses
+### M11.2 — Reparse point / symlink responses ✅
 
-- [ ] On symlink encounter during path resolution, return
-      `STATUS_STOPPED_ON_SYMLINK` with `SYMLINK_ERROR_RESPONSE` error data
-      (§2.2.2.2.1) instead of silently resolving.
-- [ ] Let the client decide whether to follow the symlink.
-- [ ] Tests: symlink in path → proper error response, absolute/relative targets.
+Wire structure is pure in `Smb.Protocol.Messages.SymlinkErrorResponse`; detection sits behind the opt-in
+`ISymlinkResolver` seam in `Smb.FileSystem` (checked with `is`, like `IReparsePointStore` / `ISparseFileStore`),
+so the core stays dependency-free and a backend maps it onto its real symlink resolution.
+
+- [x] On a symlink encountered during CREATE path resolution the server returns
+      `STATUS_STOPPED_ON_SYMLINK` (new `NtStatus.StoppedOnSymlink` = 0x8000002D) with a
+      `SYMLINK_ERROR_RESPONSE` (§2.2.2.2.1) as the ERROR-response ErrorData instead of silently resolving
+      it. Pure `SymlinkErrorResponse.Build`/`Parse` (SymLinkErrorTag 0x4C4D5953, IO_REPARSE_TAG_SYMLINK
+      0xA000000C, substitute + print name PathBuffer, `UnparsedPathLength`, `SYMLINK_FLAG_RELATIVE`);
+      new `ErrorResponse.BuildBody(errorData)` overload + a `BuildError(header, status, errorData)`
+      dispatcher helper carry the variable ErrorData.
+- [x] `ISymlinkResolver.ResolveSymlinkAsync(path)` → `SymlinkTarget?` (substitute/print name,
+      unparsed-path length, relative flag). `HandleCreateAsync` consults it before the backend open;
+      only backends that implement the seam participate (others resolve as before). The client decides
+      whether to follow the link (re-target + retry, §3.3.5.9).
+- [x] `FILE_OPEN_REPARSE_POINT` (CreateOptions 0x00200000) bypasses the interception — the link itself
+      is opened, matching Windows semantics.
+- [x] Tests (`tests/Smb.Tests/Phase11SymlinkTests.cs`, 6): absolute/relative wire round-trips, CREATE on a
+      symlink path → `STOPPED_ON_SYMLINK` + parsed error data, `OPEN_REPARSE_POINT` opens the link,
+      non-link path resolves normally, plain (non-resolver) backend never intercepts. Suite 418 → **424 green**.
+
+> **Modularity:** the SYMLINK_ERROR_RESPONSE wire type is pure in `Smb.Protocol`; the *detection* of a
+> symlink is the `ISymlinkResolver` seam a deployment implements over its file system (the reparse data
+> stays opaque, matching the M5.2 `IReparsePointStore` FSCTL path). `STATUS_STOPPED_ON_SYMLINK` on 3.1.1
+> is returned with `ErrorContextCount = 0` (raw ErrorData, spec-valid); wrapping it in an
+> `SMB2_ERROR_CONTEXT` is a later nuance if a client ever requires it.
 
 ### M11.3 — WS-Discovery (network browsing)
 
@@ -922,5 +943,5 @@ Phase 11 (Quota)      ──── independent
 | 2026-07-08 | Phase 10 / M10.2 | Complete | SMB over QUIC. Host-layer only (`Smb.Server`/`Smb.Protocol` stay transport-agnostic + cross-platform): `SmbQuicListener` + `SmbQuicOptions` over `System.Net.Quic` (native MsQuic, guarded by `QuicListener.IsSupported`; CA1416 suppressed behind that runtime check). QUIC reuses the direct-TCP SMB2 framing, so `SmbConnectionHandler` was refactored into a transport-agnostic `ServeAsync(stream,…)` core driven by both the TCP entry (`RunAsync(TcpClient)`, keeps TLS) and QUIC (each inbound bidirectional `QuicStream` = one SMB2 connection, `transportPreSecured`→`IsTransportSecured`). Mandatory TLS 1.3 with ALPN `"smb"`, required-server-cert, optional mutual TLS. Fluent `SmbServerBuilder.UseQuic(cert, port, configure?)`; `SmbServer` runs it as an additional UDP listener alongside TCP (shared drain/hard tokens), `SmbServer.QuicEndpoint`. 5 tests (`Phase10QuicTests.cs`, gated on IsSupported): handshake+NEGOTIATE, full READ flow over a stream, mTLS accept/reject, no-private-key→Build throws. **Suite 404 → 409 green. Phase 10 complete (M10.1 TLS + M10.2 QUIC + M10.3 LZ77 compression).** |
 | 2026-07-08 | Phase 10 / M10.3 | Complete (LZ77; LZNT1/Huffman follow-up) | SMB compression. Pure `Smb.Protocol.Compression`: `PlainLz77` (MS-XCA §2.4, 8 KiB window, capped-match spec-safe output), `CompressionTransformHeader`/`CompressionPayloadHeader` (unchained §2.2.42.1 + chained §2.2.42.2 decode incl. None/Pattern_V1), `SmbCompressor` orchestrator (`SupportedAlgorithms` = LZ77). `NegotiateProcessor` intersects client list ∩ server preference ∩ codecs, stores `SmbConnection.CompressionAlgorithm`, echoes context; gated on `EnableCompression` (off by default, 3.1.1 only, unchained). Host (`SmbConnectionHandler`) compresses responses ≥ `CompressionMinSize` (4096) when not encrypting and decodes inbound compression frames (`EncodeOutbound`/`DecodeInboundFrame`). Options `EnableCompression`/`CompressionPreference`/`CompressionMinSize` + fluent `SmbServerBuilder.UseCompression`. 21 tests (`Phase10CompressionTests.cs`), full suite 383 → **404 green**. LZNT1 + LZ77+Huffman codecs deferred (need spec-exact validation against a live client before being advertised). |
 | 2026-07-08 | Phase 11 / M11.1 | Complete | Disk quota. Pure `QuotaMessage` (SMB2_QUERY_QUOTA_INFO §2.2.37.1 parse + FILE_QUOTA_INFORMATION §2.4.33 list build/parse) in `Smb.Protocol`; `IQuotaProvider` seam (`Query`/`Set`/`TryReserve`/`Release`) + `NullQuotaProvider` (default) + `InMemoryQuotaProvider` (per-share per-owner-SID) in `Smb.Server.Quota`, injectable via `SmbServerOptions.QuotaProvider` / `SmbServerBuilder.UseQuotaProvider`. `HandleQueryQuota`/`HandleSetQuota` (InfoType.Quota in QUERY/SET_INFO; output capped→BUFFER_TOO_SMALL, empty→NO_MORE_ENTRIES). Write enforcement: reserve file-growth bytes against the owner's quota → over-limit `STATUS_DISK_FULL`, release on write failure; anonymous/NotSupported = no-op. `QueryInfoMessage` now captures the request InputBuffer; new `NtStatus.NoMoreEntries`. 9 tests (`Phase11QuotaTests.cs`), suite 409 → **418 green**. |
-| | Phase 11 / M11.2 | Not started | |
+| 2026-07-09 | Phase 11 / M11.2 | Complete | Reparse/symlink responses. Pure `SymlinkErrorResponse` (Build/Parse of SYMLINK_ERROR_RESPONSE §2.2.2.2.1: SymLinkErrorTag/IO_REPARSE_TAG_SYMLINK, substitute+print PathBuffer, UnparsedPathLength, SYMLINK_FLAG_RELATIVE) in `Smb.Protocol`; new `NtStatus.StoppedOnSymlink` (0x8000002D) + `ErrorResponse.BuildBody(errorData)` overload + `BuildError(…, errorData)`. Opt-in `ISymlinkResolver` seam (`ResolveSymlinkAsync`→`SymlinkTarget?`) in `Smb.FileSystem`, consulted in `HandleCreateAsync` before the backend open; `FILE_OPEN_REPARSE_POINT` bypasses so the link opens itself; non-resolver backends never intercept. 6 tests (`Phase11SymlinkTests.cs`), suite 418 → **424 green**. |
 | | Phase 11 / M11.3 | Not started | |

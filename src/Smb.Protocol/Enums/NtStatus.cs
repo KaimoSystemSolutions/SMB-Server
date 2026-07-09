@@ -14,6 +14,13 @@ public enum NtStatus : uint
     NoMoreFiles = 0x80000006,
     NoMoreEntries = 0x8000001A,
 
+    /// <summary>
+    /// A symbolic link was encountered during path resolution; the ERROR response carries a
+    /// SYMLINK_ERROR_RESPONSE so the client can re-target and retry (MS-SMB2 §2.2.2.2.1, §3.3.5.9).
+    /// Warning severity (bits 30–31 == 2).
+    /// </summary>
+    StoppedOnSymlink = 0x8000002D,
+
     MoreProcessingRequired = 0xC0000016,
     InvalidParameter = 0xC000000D,
     InvalidInfoClass = 0xC0000003,

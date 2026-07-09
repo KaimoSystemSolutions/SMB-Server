@@ -902,6 +902,13 @@ public sealed partial class Smb2Dispatcher
         return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
     }
 
+    /// <summary>Builds an ERROR response carrying variable ErrorData (e.g. a SYMLINK_ERROR_RESPONSE, §2.2.2.2.1).</summary>
+    private static ResponseSegment BuildError(Smb2Header request, NtStatus status, ReadOnlySpan<byte> errorData)
+    {
+        Smb2Header h = request.CreateResponse(status);
+        return ResponseSegment.Unsigned(h, ErrorResponse.BuildBody(errorData));
+    }
+
     /// <summary>
     /// Sends a completed out-of-band response (lease/oplock break, blocking-LOCK/CHANGE_NOTIFY final)
     /// on a surviving channel of the session (multichannel failover, M6.3): picks a live channel

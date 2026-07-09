@@ -116,6 +116,23 @@ public sealed partial class Smb2Dispatcher
         if (namedStream && store is not INamedStreamStore)
             return BuildError(header, NtStatus.NotSupported);
 
+        // [M11.2] Symlink / reparse-point resolution: if a component of the path is a symbolic link the
+        // server does not silently follow it — it answers STATUS_STOPPED_ON_SYMLINK with a
+        // SYMLINK_ERROR_RESPONSE (§2.2.2.2.1) so the client re-targets and retries (§3.3.5.9). A CREATE
+        // asking for FILE_OPEN_REPARSE_POINT opens the link itself and is served normally. Only backends
+        // that implement ISymlinkResolver participate; others resolve as before.
+        if (!request.Options.HasFlag(CreateOptions.OpenReparsePoint) && store is ISymlinkResolver symlinkResolver)
+        {
+            SymlinkTarget? link = await symlinkResolver.ResolveSymlinkAsync(effectiveName).ConfigureAwait(false);
+            if (link is { } target)
+            {
+                byte[] errorData = SymlinkErrorResponse.Build(
+                    target.SubstituteName, target.PrintName ?? target.SubstituteName,
+                    target.UnparsedPathLength, target.IsRelative);
+                return BuildError(header, NtStatus.StoppedOnSymlink, errorData);
+            }
+        }
+
         // Allocate the open up front so the share-mode reservation can be keyed to it.
         ulong volatileId = connection.AllocateFileId();
         var open = new SmbOpen

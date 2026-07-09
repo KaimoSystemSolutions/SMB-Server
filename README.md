@@ -121,8 +121,9 @@ The suite (383 tests) covers, among others:
 | **Phase 7 DFS referrals** ✅ (FSCTL_DFS_GET_REFERRALS / _EX via pluggable `IDfsNamespace` + `StandaloneDfsNamespace`; DFS TREE_CONNECT/NEGOTIATE flags; link resolution → `STATUS_PATH_NOT_COVERED`) | ✅ |
 | **Phase 8 Operational readiness** ✅ (structured audit logging `ISmbAuditLogger`; idle/auth timeouts; connection admission control `ConnectionLimiter`; graceful draining shutdown; health/perf metrics `SmbServerMetrics`) | ✅ |
 | **Phase 9 Alternate data streams & extended attributes** ✅ (named streams `file.txt:stream` + FileStreamInformation via opt-in `INamedStreamStore`; FileFullEaInformation via opt-in `IExtendedAttributeStore`) | ✅ |
-| **Phase 10 Transport hardening** 🟡 (**M10.1 SMB over TLS** ✅ — `SslStream` transport wrapper via `SmbServerBuilder.UseTls(cert)`, mutual TLS, configurable protocols/handshake timeout; QUIC + compression open) | 🟡 |
-| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅, ADS/EA ✅, SMB-over-TLS ✅; QUIC, RDMA | 🟡 |
+| **Phase 10 Transport hardening** ✅ (**M10.1 SMB over TLS** — `SslStream` wrapper via `SmbServerBuilder.UseTls(cert)`, mutual TLS; **M10.2 SMB over QUIC** — `SmbServerBuilder.UseQuic(cert)`, TLS 1.3 + ALPN "smb"; **M10.3 compression** — LZ77 via `UseCompression`, negotiate context) | ✅ |
+| **Phase 11 Quota & advanced FS** 🟡 (**M11.1 quota** ✅ — QUERY/SET_QUOTA_INFO via opt-in `IQuotaProvider`, write enforcement → `STATUS_DISK_FULL`; **M11.2 reparse/symlink** ✅ — `STATUS_STOPPED_ON_SYMLINK` + SYMLINK_ERROR_RESPONSE via opt-in `ISymlinkResolver`; WS-Discovery open) | 🟡 |
+| M8 Kerberos ✅, LDAP backend ✅, durable/persistent handles ✅, multichannel ✅, DFS ✅, operational readiness ✅, ADS/EA ✅, TLS/QUIC/compression ✅, quota ✅, reparse/symlink ✅; WS-Discovery, RDMA | 🟡 |
 
 ## License note
 
