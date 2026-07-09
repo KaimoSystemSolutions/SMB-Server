@@ -160,6 +160,23 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # the fix regression tes
 - `combinedLen <= 4096 ? new byte[combinedLen] : new byte[combinedLen]` (identical branches) →
   simplified. Purely cosmetic. File: `PreauthIntegrityHash.cs`.
 
+### L2 — NTLM AUTHENTICATE field bounds not validated before slicing (fixed 2026-07-09, `[REVIEW-2026-07]`)
+- **Risk:** `NtlmAuthenticateMessage.Parse` sliced each payload field using the client-controlled
+  32-bit BufferOffset and 16-bit length **without** a containment check. An out-of-range pair threw
+  `ArgumentOutOfRangeException`, and a truncated message threw `SmbWireFormatException` out of
+  `SpanReader`; neither is a `FormatException`, so `NtlmServerMechanism.HandleAuthenticate` (which only
+  caught `FormatException`) let them escape. In the full server path the dispatcher's catch-all still
+  mapped them to `INVALID_PARAMETER` (no connection drop), but the mechanism relied on that outer net
+  instead of failing on its own defined path.
+- **Fix:** (1) `NtlmMessages.cs` — new `EnsureInBounds(dataLength, off, len)` (overflow-safe
+  `off > dataLength - len`) guards `Slice`/`Unicode`, throwing `FormatException` on an out-of-range
+  field. (2) `NtlmServerMechanism.HandleAuthenticate` now catches `FormatException` **and**
+  `SmbWireFormatException`, so a malformed/truncated token always fails cleanly with `LogonFailure`/
+  `INVALID_PARAMETER` and never propagates an exception out of the mechanism.
+- **Files:** `Smb.Auth/Ntlm/NtlmMessages.cs`, `Smb.Auth/Ntlm/NtlmServerMechanism.cs`.
+- **Re-verification:** `NtlmParsingRobustnessTests` (field offset beyond message → `FormatException`;
+  malformed/truncated AUTHENTICATE → mechanism fails cleanly without throwing).
+
 ### O1 — NTLM MIC not verified (fixed 2026-07-07, Phase 2 / M2.3)
 - **Risk:** Without MIC verification, a MITM could tamper with the NTLM NEGOTIATE flags (a downgrade)
   undetected — `NtlmCryptography.ComputeMic` existed but was never called server-side.
@@ -196,8 +213,10 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # the fix regression tes
 |----|-------|------|----------------|
 | **O6** | **Credit accounting** is a constant window size, not exact set-based extension (see H2) | Low precision vs. spec; non-critical for single-connection | Bitmap-exact sequence window + dynamic credit extension. |
 | **O7** | **No direct test** of AEAD nonce monotonicity (see M1) | Test gap | Make nonce counter checkable via a test-visible interface. |
+| **O8** | **SPNEGO `mechListMIC` not verified** (RFC 4178 §5, MS-SPNG §3.3.5.1) | With **multiple** registered mechanisms (e.g. Kerberos + NTLM fallback), an active MITM that strips the stronger mechanism from the client's `mechTypes` to force the weaker one is not cryptographically detected. Single-mechanism setups (register only Kerberos, or only NTLM) are unaffected. The per-mechanism NTLM MIC (O1) protects the NTLM messages, **not** the SPNEGO mechanism list. | Verify `mechListMIC` after the selected mechanism completes: re-encode the received `MechTypeList` and compare against the client's MIC computed via that mechanism's `GSS_getMIC`. For NTLM this requires implementing the NTLMSSP per-message signature (MS-NLMP §3.4.4: SIGNKEY/SEALKEY derivation §3.4.5.2, RC4-sealed checksum, SeqNum 0). **Deliberately not shipped blind:** Windows clients always send `mechListMIC`, so an even slightly incorrect verifier would break *all* real SPNEGO NTLM/Kerberos auth. Implement behind an opt-in option (like `RequireMessageIntegrity`) and enable only after validating against a real Windows capture. The parser already surfaces the field so the data is available. |
 
 > **O1, O3, O4 fixed 2026-07-07** (Phase 2 / M2.3) — see the *Fixed* section above.
+> **L2 fixed 2026-07-09** — see the *Fixed* section above.
 
 ---
 
@@ -211,3 +230,19 @@ dotnet test --filter FullyQualifiedName~AuditFixTests   # the fix regression tes
 - **Byte-range lock manager**: overflow-safe overlap (`UInt128`), atomic multi-locks,
   race-safe `NotifyOnce` for CHANGE_NOTIFY.
 - **Compound signing** per segment (including padding) correct.
+- **NTLM MIC default-lenient mode is sound** (re-reviewed 2026-07-09). Concern raised: with
+  `RequireMessageIntegrity=false` (default) a MITM could strip the client's MIC announcement so the
+  server skips MIC verification. Not exploitable: the announcement lives in the `MsvAvFlags` AV pair,
+  which is **inside the NTLMv2 `temp` blob covered by the NTProofStr**. Flipping the bit changes `temp`,
+  so the server's recomputed NTProofStr no longer matches the received one → `LogonFailure` before the
+  MIC path is even reached. The only residual is a genuinely pre-NTLMv2-timestamp client that never
+  sends a MIC, against which `NtlmServerOptions.RequireMessageIntegrity = true` provides full
+  NEGOTIATE-flag downgrade protection. **Recommendation:** set `RequireMessageIntegrity = true` for
+  high-security deployments (all modern clients — Windows 7+, Samba, macOS — always send a MIC).
+- **Unsigned ERROR responses** (`BuildError` → `ResponseSegment.Unsigned`) — reviewed, deferred.
+  MS-SMB2 §3.3.4.1.1 would sign error responses to a signed request on a signing-required session. Real
+  impact is minimal: a signing-required client rejects *any* unsigned response, so a spoofed unsigned
+  error cannot be accepted; where signing is not required there is no protection to add. A central
+  fix also has to interlock with the transform (encryption) layer — an encrypted response must **not**
+  carry an inner signature — so it was deliberately not changed to avoid a signing/encryption
+  regression for negligible security gain.

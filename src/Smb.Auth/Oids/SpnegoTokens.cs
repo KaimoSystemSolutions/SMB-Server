@@ -17,6 +17,14 @@ public sealed class SpnegoParseResult
     /// <summary>negState for NegTokenResp (0=accept-completed, 1=accept-incomplete, 2=reject, 3=request-mic).</summary>
     public int? NegState { get; init; }
 
+    /// <summary>
+    /// The SPNEGO <c>mechListMIC</c> ([3] of a NegTokenResp), if present. This is the client's
+    /// GSS_getMIC over the <c>MechTypeList</c> it sent; verifying it detects a mechanism-list downgrade
+    /// (RFC 4178 §5). Currently surfaced for diagnostics/future enforcement only — see
+    /// docs/SECURITY_AUDIT.md finding O8.
+    /// </summary>
+    public byte[]? MechListMic { get; init; }
+
     /// <summary>True if the token was a NegTokenResp (follow-up token); otherwise NegTokenInit.</summary>
     public bool IsResponseToken { get; init; }
 }
@@ -239,6 +247,7 @@ public static class SpnegoTokens
         int? negState = null;
         string? supportedMech = null;
         byte[]? responseToken = null;
+        byte[]? mechListMic = null;
 
         while (resp.HasData)
         {
@@ -260,6 +269,9 @@ public static class SpnegoTokens
                 case 2: // responseToken [2] OCTET STRING
                     responseToken = resp.ReadSequence(ContextTag2).ReadOctetString();
                     break;
+                case 3: // mechListMIC [3] OCTET STRING — surfaced for O8 (downgrade detection), not yet enforced
+                    mechListMic = resp.ReadSequence(ContextTag3).ReadOctetString();
+                    break;
                 default:
                     resp.ReadEncodedValue();
                     break;
@@ -271,6 +283,7 @@ public static class SpnegoTokens
             MechToken = responseToken,
             SupportedMech = supportedMech,
             NegState = negState,
+            MechListMic = mechListMic,
             IsResponseToken = true,
         };
     }

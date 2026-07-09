@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Smb.Crypto;
 using Smb.Protocol.Enums;
+using Smb.Protocol.Wire;
 
 namespace Smb.Auth.Ntlm;
 
@@ -18,6 +19,13 @@ public sealed class NtlmServerOptions
     /// that does not announce/provide one is rejected. When false (default, for compatibility with
     /// older clients), the MIC is verified only when the client announces it via <c>MsvAvFlags</c>.
     /// Either way, a present-but-invalid MIC is always rejected (downgrade protection, MS-NLMP §3.2.5.1.2).
+    /// <para>
+    /// The <c>MsvAvFlags</c> announcement itself cannot be stripped by a MITM: it lives in the NTLMv2
+    /// <c>temp</c> blob covered by the NTProofStr, so tampering breaks authentication before the MIC path.
+    /// The only case the default misses is a pre-timestamp client that never sends a MIC. <b>Recommended
+    /// for high-security deployments:</b> set this to <c>true</c> — all modern clients (Windows 7+, Samba,
+    /// macOS) always send a MIC. See docs/SECURITY_AUDIT.md (Reviewed &amp; OK).
+    /// </para>
     /// </summary>
     public bool RequireMessageIntegrity { get; set; }
 }
@@ -98,8 +106,15 @@ public sealed class NtlmServerMechanism : IGssMechanism
         _stage = Stage.Done;
 
         NtlmAuthenticateMessage auth;
+        // [REVIEW-2026-07] A malformed AUTHENTICATE (bad signature/type, truncated fixed fields, or a
+        // field offset/length pointing outside the message) must fail on the defined path, never throw
+        // out of the mechanism. FormatException covers signature/type/bounds; SmbWireFormatException
+        // covers a SpanReader underflow on a truncated message.
         try { auth = NtlmAuthenticateMessage.Parse(inToken); }
-        catch (FormatException) { return GssResult.Failed(NtStatus.InvalidParameter); }
+        catch (Exception ex) when (ex is FormatException or SmbWireFormatException)
+        {
+            return GssResult.Failed(NtStatus.InvalidParameter);
+        }
 
         if (auth.NtChallengeResponse.Length < 16)
             return GssResult.Failed(NtStatus.LogonFailure);

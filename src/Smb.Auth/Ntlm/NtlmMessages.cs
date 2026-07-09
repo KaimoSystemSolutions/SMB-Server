@@ -163,10 +163,33 @@ public sealed class NtlmAuthenticateMessage
     }
 
     private static byte[] Slice(ReadOnlySpan<byte> data, int off, int len)
-        => len == 0 ? [] : data.Slice(off, len).ToArray();
+    {
+        if (len == 0) return [];
+        EnsureInBounds(data.Length, off, len);
+        return data.Slice(off, len).ToArray();
+    }
 
     private static string Unicode(ReadOnlySpan<byte> data, int off, int len)
-        => len == 0 ? string.Empty : Encoding.Unicode.GetString(data.Slice(off, len));
+    {
+        if (len == 0) return string.Empty;
+        EnsureInBounds(data.Length, off, len);
+        return Encoding.Unicode.GetString(data.Slice(off, len));
+    }
+
+    /// <summary>
+    /// [REVIEW-2026-07] Validates that a payload field (len/off from the AUTHENTICATE header) lies fully
+    /// within the message before slicing. The offset is a client-controlled 32-bit value and the length a
+    /// 16-bit one; an out-of-range pair would make <see cref="ReadOnlySpan{T}.Slice(int,int)"/> throw an
+    /// <see cref="ArgumentOutOfRangeException"/> that escapes NTLM parsing. Throwing a
+    /// <see cref="FormatException"/> instead keeps it on the defined "malformed token → LogonFailure/
+    /// INVALID_PARAMETER" path (<see cref="NtlmServerMechanism.HandleAuthenticate"/>) rather than relying
+    /// on the dispatcher's catch-all. <c>off &gt; dataLength - len</c> is overflow-safe (len ≥ 0).
+    /// </summary>
+    private static void EnsureInBounds(int dataLength, int off, int len)
+    {
+        if (off < 0 || len < 0 || off > dataLength - len)
+            throw new FormatException("NTLM AUTHENTICATE field references data outside the message.");
+    }
 
     private static int Min(params int[] values)
     {
