@@ -1,5 +1,5 @@
-Hallo aus dem SMB-Share!
+Hello from the SMB-Share!
 
-Diese Datei liegt im Ordner examples/Smb.Sample.Server/shared/ und wird
-über die Smb-Server-Lib bereitgestellt. Wenn du diesen Text über einen
-SMB-Client liest, funktioniert Login + Share-Zugriff.
+This file is stored under examples/Smb.Sample.Server/shared/ and is
+provided by the Smb-Server-Lib. If you accessed this with a
+SMB-Client then the Login and Share-Access is working.
