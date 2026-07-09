@@ -177,22 +177,25 @@ public static class NegotiateProcessor
             List<SmbCompressionAlgorithm> agreed = PickCompression(options.CompressionPreference, clientComp.Algorithms);
             if (agreed.Count > 0)
             {
-                connection.CompressionAlgorithm = agreed[0];
+                // Advertise everything we can decode (so the peer may send any of them), but pick the
+                // outbound algorithm from the subset we can also produce. A decode-only algorithm
+                // (e.g. LZ77+Huffman) is still received; if nothing agreed is encodable we send plain.
+                connection.CompressionAlgorithm = agreed.FirstOrDefault(SmbCompressor.IsEncodable, SmbCompressionAlgorithm.None);
                 responseContexts.Add(new CompressionContext { Flags = 0, Algorithms = agreed });
             }
         }
     }
 
     /// <summary>
-    /// Intersects the server preference, the client's offered algorithms and the codecs this build
-    /// implements (<see cref="SmbCompressor.SupportedAlgorithms"/>), preserving server-preference order.
+    /// Intersects the server preference, the client's offered algorithms and the codecs this build can
+    /// decode (<see cref="SmbCompressor.DecodableAlgorithms"/>), preserving server-preference order.
     /// </summary>
     private static List<SmbCompressionAlgorithm> PickCompression(
         IReadOnlyList<SmbCompressionAlgorithm> serverPref, IReadOnlyList<SmbCompressionAlgorithm> clientList)
     {
         var agreed = new List<SmbCompressionAlgorithm>();
         foreach (SmbCompressionAlgorithm pref in serverPref)
-            if (SmbCompressor.IsSupported(pref) && clientList.Contains(pref) && !agreed.Contains(pref))
+            if (SmbCompressor.IsDecodable(pref) && clientList.Contains(pref) && !agreed.Contains(pref))
                 agreed.Add(pref);
         return agreed;
     }

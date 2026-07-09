@@ -3,6 +3,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using Smb.Auth;
 using Smb.FileSystem;
 using Smb.Host;
 using Smb.Protocol.Enums;
@@ -114,6 +115,52 @@ public class TlsTransportTests
         X509Certificate2? presented = await seenClientCert.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.NotNull(presented);
         Assert.Equal(clientCert.Thumbprint, presented!.Thumbprint);
+        await server.StopAsync();
+    }
+
+    [Fact]
+    public void DelegatingTlsClientIdentityMapper_InvokesDelegate()
+    {
+        using X509Certificate2 cert = CreateSelfSignedCert("CN=smb-tls-map-unit");
+        var identity = new SecurityIdentity { DomainName = "CERT", UserName = "unit" };
+        ITlsClientIdentityMapper mapper = new DelegatingTlsClientIdentityMapper(_ => identity);
+        Assert.Same(identity, mapper.Map(cert));
+    }
+
+    [Fact]
+    public async Task Server_WithClientIdentityMapper_MapsPresentedCertificate()
+    {
+        using X509Certificate2 serverCert = CreateSelfSignedCert("CN=smb-tls-map-srv");
+        using X509Certificate2 clientCert = CreateSelfSignedCert("CN=smb-tls-map-client");
+        // The mapper runs on the server after the handshake; capture the cert it received via a TCS.
+        var mappedFrom = new TaskCompletionSource<X509Certificate2>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using SmbServer server = BuildTlsServer(serverCert, tls =>
+        {
+            tls.RequireClientCertificate = true;
+            tls.ClientCertificateValidation = (_, cert, _, _) => cert is not null;
+            tls.ClientIdentityMapper = new DelegatingTlsClientIdentityMapper(cert =>
+            {
+                mappedFrom.TrySetResult(cert);
+                return new SecurityIdentity { DomainName = "CERT", UserName = cert.GetNameInfo(X509NameType.SimpleName, false) };
+            });
+        });
+        await server.StartAsync();
+        int port = server.Endpoint.Port;
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        await using var ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen: false,
+            userCertificateValidationCallback: (_, _, _, _) => true);
+        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = "localhost",
+            ClientCertificates = [clientCert],
+        });
+        await AssertNegotiateSucceedsAsync(ssl); // drive a round-trip so the server-side capture has run
+
+        X509Certificate2 seen = await mappedFrom.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(clientCert.Thumbprint, seen.Thumbprint); // mapper received the presented client cert
         await server.StopAsync();
     }
 

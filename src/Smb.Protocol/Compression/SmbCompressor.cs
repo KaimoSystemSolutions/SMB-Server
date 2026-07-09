@@ -12,34 +12,48 @@ namespace Smb.Protocol.Compression;
 /// or chained with <see cref="SmbCompressionAlgorithm.None"/>, <see cref="SmbCompressionAlgorithm.PatternV1"/>
 /// and a single compressing link.
 /// <para>
-/// Only algorithms in <see cref="SupportedAlgorithms"/> are actually produced/decoded; the negotiate
-/// layer must never advertise an algorithm outside this set (an advertised algorithm can arrive
-/// inbound and must decode correctly). <see cref="SmbCompressionAlgorithm.Lz77"/> is the interoperable
-/// default; LZNT1 and LZ77+Huffman are a documented follow-up (spec-exact codecs pending live
-/// Windows interop validation).
+/// Capability is split into two sets. <see cref="DecodableAlgorithms"/> are the algorithms this build
+/// can <b>decode</b> — the negotiate layer advertises only these, because an advertised algorithm can
+/// arrive inbound and must decode correctly. <see cref="EncodableAlgorithms"/> are the subset it can
+/// also <b>produce</b>; the outbound choice must stay within it. <see cref="SmbCompressionAlgorithm.Lz77"/>
+/// (interoperable default) and <see cref="SmbCompressionAlgorithm.Lznt1"/> are fully symmetric.
+/// <see cref="SmbCompressionAlgorithm.Lz77Huffman"/> is <b>decode-only</b> here: the server accepts
+/// LZ77+Huffman frames from a peer (e.g. Windows) but never emits them — a spec-conformant encoder
+/// (byte-exact interleaved length bytes + block flush, validated against a live Windows decoder) is a
+/// documented follow-up.
 /// </para>
 /// </summary>
 public static class SmbCompressor
 {
-    /// <summary>Algorithms this build can both produce and decode. Negotiation must stay within this set.</summary>
-    public static readonly IReadOnlyList<SmbCompressionAlgorithm> SupportedAlgorithms = [SmbCompressionAlgorithm.Lz77];
+    /// <summary>Algorithms this build can decode. Negotiation advertises only these (inbound must decode).</summary>
+    public static readonly IReadOnlyList<SmbCompressionAlgorithm> DecodableAlgorithms =
+        [SmbCompressionAlgorithm.Lz77, SmbCompressionAlgorithm.Lznt1, SmbCompressionAlgorithm.Lz77Huffman];
 
-    /// <summary>True when the given algorithm has a working codec in this build.</summary>
-    public static bool IsSupported(SmbCompressionAlgorithm algorithm)
+    /// <summary>Algorithms this build can produce. The negotiated outbound algorithm must be one of these.</summary>
+    public static readonly IReadOnlyList<SmbCompressionAlgorithm> EncodableAlgorithms =
+        [SmbCompressionAlgorithm.Lz77, SmbCompressionAlgorithm.Lznt1];
+
+    /// <summary>True when the given algorithm has a decoder in this build (may be advertised).</summary>
+    public static bool IsDecodable(SmbCompressionAlgorithm algorithm) => Contains(DecodableAlgorithms, algorithm);
+
+    /// <summary>True when the given algorithm has an encoder in this build (may be the outbound choice).</summary>
+    public static bool IsEncodable(SmbCompressionAlgorithm algorithm) => Contains(EncodableAlgorithms, algorithm);
+
+    private static bool Contains(IReadOnlyList<SmbCompressionAlgorithm> set, SmbCompressionAlgorithm algorithm)
     {
-        for (int i = 0; i < SupportedAlgorithms.Count; i++)
-            if (SupportedAlgorithms[i] == algorithm) return true;
+        for (int i = 0; i < set.Count; i++)
+            if (set[i] == algorithm) return true;
         return false;
     }
 
     /// <summary>
     /// Compresses a complete SMB2 message into an unchained compression transform frame, or returns
     /// <c>null</c> when compression is not worthwhile: the message is below <paramref name="minSize"/>,
-    /// the algorithm has no codec, or the frame would not be smaller than the plaintext.
+    /// the algorithm has no encoder, or the frame would not be smaller than the plaintext.
     /// </summary>
     public static byte[]? TryCompressUnchained(SmbCompressionAlgorithm algorithm, ReadOnlySpan<byte> message, int minSize)
     {
-        if (message.Length < minSize || message.Length == 0 || !IsSupported(algorithm))
+        if (message.Length < minSize || message.Length == 0 || !IsEncodable(algorithm))
             return null;
 
         byte[] compressed = CompressPayload(algorithm, message);
@@ -158,12 +172,15 @@ public static class SmbCompressor
     private static byte[] CompressPayload(SmbCompressionAlgorithm algorithm, ReadOnlySpan<byte> data) => algorithm switch
     {
         SmbCompressionAlgorithm.Lz77 => PlainLz77.Compress(data),
+        SmbCompressionAlgorithm.Lznt1 => Lznt1.Compress(data),
         _ => throw new SmbWireFormatException($"No compressor for {algorithm}."),
     };
 
     private static byte[] DecompressPayload(SmbCompressionAlgorithm algorithm, ReadOnlySpan<byte> data, int originalSize) => algorithm switch
     {
         SmbCompressionAlgorithm.Lz77 => PlainLz77.Decompress(data, originalSize),
+        SmbCompressionAlgorithm.Lznt1 => Lznt1.Decompress(data, originalSize),
+        SmbCompressionAlgorithm.Lz77Huffman => Lz77Huffman.Decompress(data, originalSize),
         SmbCompressionAlgorithm.None => data.ToArray(),
         _ => throw new SmbWireFormatException($"No decompressor for {algorithm}."),
     };

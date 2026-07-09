@@ -39,6 +39,20 @@ public sealed class SmbConnection
     /// the SMB3 encryption policy.</summary>
     public bool IsTransportSecured { get; set; }
 
+    /// <summary>[M10.1] The validated client certificate presented during a mutual-TLS handshake, or
+    /// <c>null</c> when none was presented (or the transport is not TLS). Surfaced by the host so the
+    /// authorization/audit layer and a consumer's <c>IIdentityBackend</c> can use it. Only ever set
+    /// after the transport has accepted the certificate per its validation callback. This is an
+    /// independent copy owned by the host, which disposes it when the connection tears down — do not
+    /// dispose it or retain it past the connection's lifetime.</summary>
+    public System.Security.Cryptography.X509Certificates.X509Certificate2? ClientCertificate { get; set; }
+
+    /// <summary>[M10.1] Identity the transport mapped from <see cref="ClientCertificate"/> via an
+    /// <c>ITlsClientIdentityMapper</c>, or <c>null</c> when unmapped. This is a transport assertion made
+    /// available to the SMB layer (audit/authorization); it does not by itself authenticate an SMB
+    /// session — SPNEGO still runs — so no session key or signing decision is derived from it here.</summary>
+    public SecurityIdentity? TransportAssertedIdentity { get; set; }
+
     /// <summary>Timestamp (UTC ticks from the server's TimeProvider) of the last frame received on this
     /// connection. Drives the idle-connection timeout (Phase 8 / M8.2).</summary>
     public long LastActivityTicks { get; set; }

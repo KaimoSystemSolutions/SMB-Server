@@ -41,6 +41,15 @@ public sealed class SmbTlsOptions
     public RemoteCertificateValidationCallback? ClientCertificateValidation { get; set; }
 
     /// <summary>
+    /// [M10.1] Optional seam that maps a validated mutual-TLS client certificate to an SMB identity.
+    /// When set, the host runs it once per connection after the handshake and records the result on
+    /// <c>SmbConnection.TransportAssertedIdentity</c> (the certificate itself is always recorded on
+    /// <c>SmbConnection.ClientCertificate</c>). The mapped identity is surfaced to authorization/audit;
+    /// it does not replace SPNEGO. See <see cref="ITlsClientIdentityMapper"/>.
+    /// </summary>
+    public ITlsClientIdentityMapper? ClientIdentityMapper { get; set; }
+
+    /// <summary>
     /// TLS protocol versions offered to clients. Default TLS 1.2 + TLS 1.3 (older versions are
     /// deliberately excluded). Narrow this to <see cref="SslProtocols.Tls13"/> only for a hardened
     /// deployment.

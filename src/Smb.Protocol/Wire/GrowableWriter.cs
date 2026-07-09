@@ -78,6 +78,9 @@ public sealed class GrowableWriter
         if (rem != 0) WriteZeros(alignment - rem);
     }
 
+    /// <summary>Overwrites a single byte at an already-written position (offset patching).</summary>
+    public void PatchByte(int offset, byte value) => _buffer[offset] = value;
+
     /// <summary>Overwrites 2 bytes at an already-written position (offset patching).</summary>
     public void PatchUInt16(int offset, ushort value)
         => BinaryPrimitives.WriteUInt16LittleEndian(_buffer.AsSpan(offset, 2), value);

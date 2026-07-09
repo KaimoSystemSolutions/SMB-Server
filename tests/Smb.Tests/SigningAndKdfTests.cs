@@ -27,6 +27,64 @@ public class SigningAndKdfTests
         Assert.Equal(a, a2);
     }
 
+    // ---- Authoritative KATs against the .NET framework's CAVP-validated SP800-108 KDF ----
+    // System.Security.Cryptography.SP800108HmacCounterKdf implements the exact same construction
+    // (PRF(KI, [i]₄ ‖ Label ‖ 0x00 ‖ Context ‖ [L]₄), counter+L 32-bit big-endian). Matching it
+    // validates our KDF against an independent, certified oracle — no hand-transcribed test vectors.
+    // This closes Finding M3's "no known-answer vector" gap for the KDF math and the SMB label/context
+    // wiring; the remaining M3 item is a live Windows capture of the end-to-end handshake.
+
+    [Theory]
+    [InlineData(16)]
+    [InlineData(32)]
+    [InlineData(48)] // > 32 bytes → exercises the multi-iteration counter loop (i = 1, 2)
+    public void Kdf_MatchesFrameworkSp800108_KnownAnswer(int outputBytes)
+    {
+        byte[] kdk = Convert.FromHexString("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        byte[] label = "SMBSigningKey\0"u8.ToArray();
+        byte[] context = Convert.FromHexString("aabbccddeeff00112233445566778899");
+
+        byte[] mine = Sp800108CounterKdf.DeriveKey(kdk, label, context, outputBytes);
+        byte[] oracle = SP800108HmacCounterKdf.DeriveBytes(kdk, HashAlgorithmName.SHA256, label, context, outputBytes);
+
+        Assert.Equal(oracle, mine);
+    }
+
+    [Fact]
+    public void Smb3KeyDerivation_311_MatchesFrameworkOracle_ForEachKey()
+    {
+        byte[] sessionKey = RandomNumberGenerator.GetBytes(16);
+        byte[] preauth = RandomNumberGenerator.GetBytes(64);
+
+        Smb3SessionKeys keys = Smb3KeyDerivation.Derive(
+            SmbDialect.Smb311, SmbCipherId.Aes128Gcm, sessionKey, sessionKey, preauth);
+
+        // Exact SMB 3.1.1 labels (MS-SMB2 §3.1.4.2), each carrying its terminating NUL as impacket/Windows do.
+        Assert.Equal(Oracle(sessionKey, "SMBSigningKey\0", preauth, 16), keys.SigningKey);
+        Assert.Equal(Oracle(sessionKey, "SMBAppKey\0", preauth, 16), keys.ApplicationKey);
+        Assert.Equal(Oracle(sessionKey, "SMBS2CCipherKey\0", preauth, 16), keys.EncryptionKey); // server encrypts (S2C)
+        Assert.Equal(Oracle(sessionKey, "SMBC2SCipherKey\0", preauth, 16), keys.DecryptionKey); // server decrypts (C2S)
+    }
+
+    [Fact]
+    public void Smb3KeyDerivation_311Aes256_CipherKeys_MatchFrameworkOracle_At32Bytes()
+    {
+        byte[] sessionKey = RandomNumberGenerator.GetBytes(16);
+        byte[] preauth = RandomNumberGenerator.GetBytes(64);
+
+        Smb3SessionKeys keys = Smb3KeyDerivation.Derive(
+            SmbDialect.Smb311, SmbCipherId.Aes256Gcm, sessionKey, RandomNumberGenerator.GetBytes(32), preauth);
+
+        // KDK is the 16-byte session key; only the output length L becomes 256 bits (Finding M3).
+        Assert.Equal(Oracle(sessionKey, "SMBS2CCipherKey\0", preauth, 32), keys.EncryptionKey);
+        Assert.Equal(Oracle(sessionKey, "SMBC2SCipherKey\0", preauth, 32), keys.DecryptionKey);
+        Assert.Equal(Oracle(sessionKey, "SMBSigningKey\0", preauth, 16), keys.SigningKey); // signing stays 16 bytes
+    }
+
+    private static byte[] Oracle(byte[] kdk, string label, byte[] context, int bytes)
+        => SP800108HmacCounterKdf.DeriveBytes(
+            kdk, HashAlgorithmName.SHA256, System.Text.Encoding.ASCII.GetBytes(label), context, bytes);
+
     [Fact]
     public void Smb3KeyDerivation_311Aes128_ProducesDistinct16ByteKeys()
     {

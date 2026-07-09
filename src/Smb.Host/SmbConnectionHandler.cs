@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using Smb.Crypto;
 using Smb.Protocol.Compression;
 using Smb.Protocol.Constants;
@@ -196,7 +197,8 @@ internal sealed class SmbConnectionHandler
             _dispatcher.OnConnectionClosed(connection);
             _server.Connections.TryRemove(connection.ConnectionId, out _);
             _server.Options.Metrics.OnConnectionClosed();
-            AuditConnection(SmbAuditEventType.ConnectionClosed, connection);
+            AuditConnection(SmbAuditEventType.ConnectionClosed, connection); // reads TransportAssertedIdentity
+            connection.ClientCertificate?.Dispose(); // [M10.1] release the owned mutual-TLS certificate
             _writeLock.Dispose();
             _ioGate?.Dispose();
             if (stream is not null) { try { await stream.DisposeAsync().ConfigureAwait(false); } catch { /* ignore */ } }
@@ -220,6 +222,7 @@ internal sealed class SmbConnectionHandler
             handshakeCts.CancelAfter(_tls.HandshakeTimeout);
             await ssl.AuthenticateAsServerAsync(authOptions, handshakeCts.Token).ConfigureAwait(false);
             connection.IsTransportSecured = true;
+            CaptureClientCertificate(ssl, connection);
             return ssl;
         }
         catch (Exception ex)
@@ -227,6 +230,34 @@ internal sealed class SmbConnectionHandler
             _log?.Invoke($"[conn {connection.ConnectionId:N}] TLS handshake failed: {ex.GetType().Name}: {ex.Message}");
             await ssl.DisposeAsync().ConfigureAwait(false);
             return null;
+        }
+    }
+
+    /// <summary>
+    /// [M10.1] Records the validated mutual-TLS client certificate on the connection and, when a
+    /// <see cref="ITlsClientIdentityMapper"/> is configured, the identity it maps to. Best-effort: a
+    /// throwing mapper is logged and treated as "no identity" so it never fails the connection.
+    /// </summary>
+    private void CaptureClientCertificate(SslStream ssl, SmbConnection connection)
+    {
+        if (ssl.RemoteCertificate is not { } remote) return;
+
+        // Own an INDEPENDENT certificate: SslStream disposes its own RemoteCertificate when the stream
+        // closes, so aliasing it (a plain `as X509Certificate2` cast) would leave a dangling instance on
+        // the connection. Load a fresh public certificate from the DER bytes (subject/thumbprint are all
+        // the identity/audit layer needs — the client keeps the private key). Disposed in ServeAsync's
+        // finally when the connection tears down.
+        var certificate = X509CertificateLoader.LoadCertificate(remote.Export(X509ContentType.Cert));
+        connection.ClientCertificate = certificate;
+
+        if (_tls!.ClientIdentityMapper is not { } mapper) return;
+        try
+        {
+            connection.TransportAssertedIdentity = mapper.Map(certificate);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"[conn {connection.ConnectionId:N}] TLS client-identity mapper threw: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -242,6 +273,9 @@ internal sealed class SmbConnectionHandler
             Level = SmbLogLevel.Information,
             Timestamp = _server.Options.TimeProvider.GetUtcNow(),
             ClientAddress = connection.ClientAddress,
+            // [M10.1] Surface a mutual-TLS transport identity (mapped from the client cert) when present;
+            // null at ConnectionAccepted (fires before the handshake), set by ConnectionClosed.
+            User = connection.TransportAssertedIdentity?.ToString(),
         });
     }
 

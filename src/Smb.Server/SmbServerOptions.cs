@@ -75,16 +75,20 @@ public sealed class SmbServerOptions
     /// COMPRESSION_CAPABILITIES context is answered with the server's chosen algorithm, and the host
     /// then compresses large enough responses and decodes compressed requests. Off by default —
     /// compression is a throughput optimization and is opt-in until validated against the target
-    /// clients; the negotiated algorithm is always taken from <see cref="CompressionPreference"/>
-    /// intersected with the client list and the codecs this build implements
-    /// (<see cref="Smb.Protocol.Compression.SmbCompressor.SupportedAlgorithms"/>).
+    /// clients; the advertised algorithms are <see cref="CompressionPreference"/> intersected with the
+    /// client list and the codecs this build can decode
+    /// (<see cref="Smb.Protocol.Compression.SmbCompressor.DecodableAlgorithms"/>), and the outbound
+    /// algorithm is the first of those this build can also produce
+    /// (<see cref="Smb.Protocol.Compression.SmbCompressor.EncodableAlgorithms"/>).
     /// </summary>
     public bool EnableCompression { get; set; }
 
     /// <summary>
-    /// Compression algorithm preference (descending) when <see cref="EnableCompression"/> is on. Only
-    /// algorithms with a codec in this build take effect (currently
-    /// <see cref="SmbCompressionAlgorithm.Lz77"/>). Default: LZ77.
+    /// Compression algorithm preference (descending) when <see cref="EnableCompression"/> is on.
+    /// Producing needs an encoder (<see cref="SmbCompressionAlgorithm.Lz77"/> /
+    /// <see cref="SmbCompressionAlgorithm.Lznt1"/>); <see cref="SmbCompressionAlgorithm.Lz77Huffman"/> is
+    /// decode-only — listing it lets the server <i>receive</i> LZ77+Huffman (e.g. from Windows) while it
+    /// keeps sending an encodable algorithm. Default: LZ77 (add others to opt in).
     /// </summary>
     public IReadOnlyList<SmbCompressionAlgorithm> CompressionPreference { get; set; } =
     [
