@@ -122,10 +122,19 @@ public sealed partial class Smb2Dispatcher
                 break;
             }
 
-            // Determine compound boundaries.
-            int segmentLength = header.NextCommand != 0
-                ? (int)header.NextCommand
-                : message.Length - offset;
+            // Determine compound boundaries. NextCommand is client-controlled: a value with the high
+            // bit set casts to a negative int, and any value larger than the bytes actually remaining
+            // (or smaller than a header) would make the Slice below throw — which escapes this method
+            // and drops the whole connection instead of answering with a clean error. Validate it and
+            // return STATUS_INVALID_PARAMETER for the offending element (§3.3.5.2 / Context §7).
+            int remaining = message.Length - offset;
+            int segmentLength = header.NextCommand != 0 ? (int)header.NextCommand : remaining;
+            if (segmentLength < Smb2Header.Size || segmentLength > remaining)
+            {
+                _log?.Invoke($"[parse] invalid NextCommand={header.NextCommand} (remaining {remaining}) → INVALID_PARAMETER");
+                segments.Add(BuildError(header, NtStatus.InvalidParameter));
+                break;
+            }
             ReadOnlyMemory<byte> segment = message.Slice(offset, segmentLength);
 
             // Related operation inherits SessionId/TreeId from the predecessor (Context §7).

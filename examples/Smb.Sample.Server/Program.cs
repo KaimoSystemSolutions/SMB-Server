@@ -103,6 +103,17 @@ try
         Console.WriteLine("---");
         Console.WriteLine(content?.TrimEnd());
         Console.WriteLine("---");
+
+        // Write path: create a file, write to it, read it back, verify, then delete it again.
+        const string probe = "selftest-write.txt";
+        const string payload = "written by the self-test";
+        bool wrote = await client.WriteFileAsync(probe, payload);
+        string? readBack = await client.ReadFileAsync(probe);
+        bool verified = wrote && readBack == payload;
+        Console.WriteLine($"Write → read-back roundtrip ({probe}): {(verified ? "OK" : "FAILED")}");
+
+        bool deleted = await client.DeleteFileAsync(probe);
+        Console.WriteLine($"Delete ({probe}): {(deleted ? "OK" : "FAILED")}");
     }
 }
 catch (Exception ex)

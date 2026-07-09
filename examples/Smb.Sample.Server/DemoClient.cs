@@ -74,10 +74,34 @@ internal sealed class DemoClient : IDisposable
         return Encoding.UTF8.GetString(resp.AsSpan(80, dataLen));
     }
 
-    private async Task<(ulong persistent, ulong vol, NtStatus status)> OpenAsync(
-        string name, CreateDisposition disposition, CreateOptions options)
+    public async Task<bool> WriteFileAsync(string name, string content)
     {
-        byte[] resp = await RoundtripAsync(BuildCreate(name, disposition, options));
+        // Create-or-overwrite with read+write access, write the payload at offset 0, then close.
+        const uint readWrite = 0x00000001 | 0x00000002; // FILE_READ_DATA | FILE_WRITE_DATA
+        (ulong p, ulong v, NtStatus st) = await OpenAsync(
+            name, CreateDisposition.OverwriteIf, CreateOptions.NonDirectoryFile, readWrite);
+        if (st != NtStatus.Success) return false;
+
+        byte[] resp = await RoundtripAsync(BuildWrite(p, v, Encoding.UTF8.GetBytes(content)));
+        await RoundtripAsync(BuildClose(p, v));
+        return Smb2Header.Read(resp).Status == NtStatus.Success;
+    }
+
+    public async Task<bool> DeleteFileAsync(string name)
+    {
+        // Open with DELETE access + FILE_DELETE_ON_CLOSE — the entry is removed when the handle closes.
+        (ulong p, ulong v, NtStatus st) = await OpenAsync(
+            name, CreateDisposition.Open, CreateOptions.NonDirectoryFile | CreateOptions.DeleteOnClose, 0x00010000);
+        if (st != NtStatus.Success) return false;
+
+        byte[] resp = await RoundtripAsync(BuildClose(p, v));
+        return Smb2Header.Read(resp).Status == NtStatus.Success;
+    }
+
+    private async Task<(ulong persistent, ulong vol, NtStatus status)> OpenAsync(
+        string name, CreateDisposition disposition, CreateOptions options, uint desiredAccess = 0x00000001)
+    {
+        byte[] resp = await RoundtripAsync(BuildCreate(name, disposition, options, desiredAccess));
         var h = Smb2Header.Read(resp);
         if (h.Status != NtStatus.Success) return (0, 0, h.Status);
         ulong persistent = BinaryPrimitives.ReadUInt64LittleEndian(resp.AsSpan(Smb2Header.Size + 64, 8));
@@ -137,13 +161,13 @@ internal sealed class DemoClient : IDisposable
         return Concat(Header(SmbCommand.TreeConnect), b.ToArray());
     }
 
-    private byte[] BuildCreate(string name, CreateDisposition disposition, CreateOptions options)
+    private byte[] BuildCreate(string name, CreateDisposition disposition, CreateOptions options, uint desiredAccess)
     {
         byte[] n = Encoding.Unicode.GetBytes(name);
         var b = new GrowableWriter(64 + n.Length);
         b.WriteUInt16(57); b.WriteByte(0); b.WriteByte(0); b.WriteUInt32(2);
         b.WriteUInt64(0); b.WriteUInt64(0);
-        b.WriteUInt32(0x00000001);        // DesiredAccess = FILE_READ_DATA
+        b.WriteUInt32(desiredAccess);     // DesiredAccess
         b.WriteUInt32(0); b.WriteUInt32(0x07);
         b.WriteUInt32((uint)disposition); b.WriteUInt32((uint)options);
         int offPos = b.Position; b.WriteUInt16(0); b.WriteUInt16((ushort)n.Length);
@@ -172,6 +196,22 @@ internal sealed class DemoClient : IDisposable
         b.WriteUInt64(p); b.WriteUInt64(v); b.WriteUInt32(0); b.WriteUInt32(0); b.WriteUInt32(0);
         b.WriteUInt16(0); b.WriteUInt16(0); b.WriteByte(0);
         return Concat(Header(SmbCommand.Read), b.ToArray());
+    }
+
+    private byte[] BuildWrite(ulong p, ulong v, byte[] data)
+    {
+        var b = new GrowableWriter(50 + data.Length);
+        b.WriteUInt16(49);                       // StructureSize
+        int offPos = b.Position; b.WriteUInt16(0); // DataOffset (patched below)
+        b.WriteUInt32((uint)data.Length);        // Length
+        b.WriteUInt64(0);                        // Offset
+        b.WriteUInt64(p); b.WriteUInt64(v);      // FileId
+        b.WriteUInt32(0); b.WriteUInt32(0);      // Channel + RemainingBytes
+        b.WriteUInt16(0); b.WriteUInt16(0);      // WriteChannelInfoOffset/Length
+        b.WriteUInt32(0);                        // Flags
+        int start = b.Position; b.WriteBytes(data);
+        b.PatchUInt16(offPos, (ushort)(Smb2Header.Size + start));
+        return Concat(Header(SmbCommand.Write), b.ToArray());
     }
 
     private byte[] BuildClose(ulong p, ulong v)

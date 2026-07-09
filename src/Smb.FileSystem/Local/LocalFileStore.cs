@@ -156,7 +156,11 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
 
         try
         {
-            var stream = new FileStream(full, mode, fileAccess, share);
+            // bufferSize 1 disables FileStream's user-space read/write buffering. The async ReadAsync/
+            // WriteAsync overrides open a fresh OS handle per request (overlapped I/O), so a buffered
+            // read here could return stale bytes, and a buffered write could stay invisible to those
+            // fresh handles until flush/close. Unbuffered keeps this persistent handle coherent with them.
+            var stream = new FileStream(full, mode, fileAccess, share, bufferSize: 1);
             createAction = disposition switch
             {
                 CreateDispositionIntent.Create => CreateOutcome.Created,
