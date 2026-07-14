@@ -210,7 +210,7 @@ public sealed partial class Smb2Dispatcher
             {
                 SmbCommand.Negotiate => HandleNegotiate(connection, header, segment.Span),
                 SmbCommand.SessionSetup => HandleSessionSetup(connection, header, segment.Span),
-                SmbCommand.TreeConnect => HandleTreeConnect(connection, header, segment.Span, frameEncrypted),
+                SmbCommand.TreeConnect => await HandleTreeConnectAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
                 SmbCommand.TreeDisconnect => HandleTreeDisconnect(connection, header, segment.Span, frameEncrypted),
                 SmbCommand.Logoff => HandleLogoff(connection, header, segment.Span, frameEncrypted),
                 SmbCommand.Echo => HandleEcho(connection, header, segment.Span, frameEncrypted),
@@ -837,29 +837,35 @@ public sealed partial class Smb2Dispatcher
 
     // --- TREE_CONNECT (Context §12) ---
 
-    private ResponseSegment HandleTreeConnect(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment, bool frameEncrypted)
+    private async ValueTask<ResponseSegment> HandleTreeConnectAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
-        if (!VerifyInboundSignature(connection, session, header, segment, frameEncrypted))
+        if (!VerifyInboundSignature(connection, session, header, segment.Span, frameEncrypted))
             return BuildError(header, NtStatus.AccessDenied);
 
-        TreeConnectRequest request = TreeConnectRequest.Parse(segment, Smb2Header.Size);
-        if (!_server.Shares.TryGet(request.ShareName, out IShare share))
+        // Parse everything off the span BEFORE the await below (a ReadOnlySpan cannot cross an await point).
+        TreeConnectRequest request = TreeConnectRequest.Parse(segment.Span, Smb2Header.Size);
+        string shareName = request.ShareName;
+        if (!_server.Shares.TryGet(shareName, out IShare share))
             return BuildError(header, NtStatus.BadNetworkName);
 
         // Authorization hook (Context §12): check access and determine the granted access mask.
+        // [W6.2] Awaited so an I/O-bound policy (DB/LDAP) does not block a thread pool thread sync-over-async.
+        // The default IShareAccessPolicy.AuthorizeConnectAsync delegates to the sync method, so a synchronous
+        // policy behaves exactly as before. NOTE: this does not yet unfreeze unrelated I/O behind a slow policy
+        // — TREE_CONNECT still runs on the read-loop barrier until W6.3 moves it off.
         var accessContext = new ShareAccessContext
         {
             Identity = session.Identity ?? AnonymousIdentity,
             Share = share,
             Connection = connection,
         };
-        ShareAccessResult decision = _server.Options.ShareAccessPolicy.AuthorizeConnect(accessContext);
+        ShareAccessResult decision = await _server.Options.ShareAccessPolicy.AuthorizeConnectAsync(accessContext).ConfigureAwait(false);
         if (!decision.Allowed)
         {
             Audit(SmbAuditEventType.ShareAccessDenied, SmbLogLevel.Warning, connection,
-                user: DescribeIdentity(session.Identity), share: request.ShareName, status: decision.DenyStatus);
+                user: DescribeIdentity(session.Identity), share: shareName, status: decision.DenyStatus);
             return BuildError(header, decision.DenyStatus);
         }
 

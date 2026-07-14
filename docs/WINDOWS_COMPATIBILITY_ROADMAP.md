@@ -226,11 +226,19 @@ anderen Trees einzufrieren.
 - **Dateien:** `src/Smb.Server/Authorization/ShareAccess.cs`.
 - **Tests:** eine async-only-Policy wird korrekt aufgerufen; eine sync-Policy delegiert per Default identisch.
 
-### W6.2 — Dispatcher konsumiert den async-Seam
-- `HandleTreeConnect` → async; `AuthorizeConnectAsync` awaiten. Share-Enumeration (`IsVisible` in
-  srvsvc/`GetVisibleShares`) analog auf `IsVisibleAsync`. Damit kein sync-over-async-Thread-Block mehr.
+### W6.2 — Dispatcher konsumiert den async-Seam ✅ DONE (TREE_CONNECT; Enumeration zurückgestellt)
+- `HandleTreeConnect` → `HandleTreeConnectAsync` (`async ValueTask<ResponseSegment>`, Param `ReadOnlyMemory`
+  statt `ReadOnlySpan`, Span-Parsing vor dem `await`); Dispatch-Switch awaitet es. `AuthorizeConnectAsync` wird
+  awaited → kein sync-over-async-Thread-Block mehr. Default-Policy delegiert auf sync → Verhalten unverändert.
   (Verbindungs-Freeze noch **nicht** behoben — das ist W6.3.)
-- **Dateien:** `src/Smb.Server/Smb2Dispatcher.cs` (HandleTreeConnect + Dispatch-Signatur), Enumerationspfad.
+- **Zurückgestellt (bewusst):** Share-Enumeration (`IShareAccessPolicy.IsVisible` via
+  `SmbServerState.GetVisibleShares`, aufgerufen aus dem **synchronen** srvsvc-RPC-Pfad
+  `Smb2Dispatcher.FileCommands.cs:372`) bleibt vorerst synchron — das ist ein separater, invasiverer Umbau
+  durch den RPC/NDR-Stack und ein deutlich selteneren Pfad (Netzwerk-Browse) als TREE_CONNECT. Eigener
+  Milestone bei Bedarf (W6.2b).
+- **Dateien:** `src/Smb.Server/Smb2Dispatcher.cs` (HandleTreeConnectAsync + Dispatch-Arm).
+- **Tests:** `AsyncSeam_IsUsedAtTreeConnect_AsyncDenyRejects` (WindowsFreezeReproTests) — Policy erlaubt sync,
+  verweigert async → TREE_CONNECT wird `ACCESS_DENIED` ⇒ beweist, dass der async-Seam entscheidet.
 
 ### W6.3 — TREE_CONNECT aus dem Read-Loop-Barrier lösen (der eigentliche Freeze-Fix)
 - TREE_CONNECT als concurrent-eligible klassifizieren (läuft **frei** wie CREATE: keine nachfolgende Op
@@ -313,4 +321,15 @@ anderen Trees einzufrieren.
   Noch nicht verdrahtet (das ist W6.2). Nächste Aktion: **W6.2** — `HandleTreeConnect` async machen und
   `AuthorizeConnectAsync` awaiten (+ Enumeration `IsVisibleAsync`), sodass I/O-Auth nicht mehr sync-over-async
   einen Thread blockiert; danach **W6.3** (der Freeze-Fix).
+- **2026-07-14** — **W6.2 DONE (TREE_CONNECT-Auth-Pfad).** `HandleTreeConnect` → `HandleTreeConnectAsync`
+  (async, `ReadOnlyMemory` statt `ReadOnlySpan`, gesamtes Span-Parsing vor dem `await`; `TreeConnectRequest`
+  ist eine `class`, überlebt das await problemlos); Dispatch-Switch-Arm awaitet. `AuthorizeConnectAsync` wird
+  jetzt awaited — I/O-gebundene Auth blockiert keinen Thread mehr sync-over-async. Default-Policy delegiert auf
+  sync ⇒ **verhaltensneutral** (551 Bestandstests unverändert grün). Verhaltensnachweis:
+  `AsyncSeam_IsUsedAtTreeConnect_AsyncDenyRejects` (sync grant / async deny → `ACCESS_DENIED`). **Suite
+  551 → 552 grün.** **Enumeration (`IsVisible`) bewusst zurückgestellt** (synchroner srvsvc-RPC-Pfad,
+  separater Umbau, selteneres Browsing-Szenario — W6.2b bei Bedarf). Verbindungs-Freeze weiterhin offen →
+  Nächste Aktion **W6.3**: TREE_CONNECT als concurrent-eligible klassifizieren („runs free" wie CREATE), damit
+  eine langsame (async) Policy unabhängige I/O nicht mehr einfriert — der eigentliche Fix; dazu die Umkehrung
+  des W2.2-Grenzfalltests.
 - _(hier Fortschritt anhängen, Items in den Phasen abhaken)_

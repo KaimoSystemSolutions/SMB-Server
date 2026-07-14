@@ -172,6 +172,34 @@ public class WindowsFreezeReproTests
         }
     }
 
+    /// <summary>
+    /// docs/WINDOWS_COMPATIBILITY_ROADMAP.md W6.2 — proves the dispatcher now consults the <b>async</b>
+    /// authorization seam at TREE_CONNECT. The policy grants synchronously but denies asynchronously, so the
+    /// connection is rejected only if <see cref="IShareAccessPolicy.AuthorizeConnectAsync"/> is the path taken
+    /// (a regression to the sync <c>AuthorizeConnect</c> would wrongly grant).
+    /// </summary>
+    [Fact]
+    public async Task AsyncSeam_IsUsedAtTreeConnect_AsyncDenyRejects()
+    {
+        var policy = new AsyncDenyPolicy();
+        await using SmbServer server = await StartAuthServerAsync(policy, concurrentMetadata: false);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, server.Endpoint.Port);
+        await using NetworkStream stream = client.GetStream();
+
+        await SendAsync(stream, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        await ReceiveAsync(stream);
+        await SendAsync(stream, TestHelpers.BuildSessionSetupRequest(1, 0, [0x01]));
+        ulong sid = Smb2Header.Read(await ReceiveAsync(stream)).SessionId;
+
+        await SendAsync(stream, TestHelpers.BuildTreeConnectRequest(2, sid, @"\\s\Files"));
+        Smb2Header h = Smb2Header.Read(await ReceiveAsync(stream));
+        Assert.Equal(NtStatus.AccessDenied, h.Status); // async deny won → the async seam decided
+
+        await server.StopAsync();
+    }
+
     // ─── Host / handshake helpers ─────────────────────────────────────────
 
     private static async Task<SmbServer> StartAuthServerAsync(IShareAccessPolicy policy, bool concurrentMetadata)
@@ -279,6 +307,22 @@ public class WindowsFreezeReproTests
             if (string.Equals(context.ShareName, slowShare, StringComparison.OrdinalIgnoreCase))
                 _gate.Wait(TimeSpan.FromSeconds(30)); // synchronous block: the seam has no async variant
             return ShareAccessResult.Grant();
+        }
+    }
+
+    /// <summary>
+    /// Grants synchronously but denies asynchronously — a probe that only rejects if the caller takes the
+    /// async seam (<see cref="AuthorizeConnectAsync"/>). Used to prove W6.2 wiring.
+    /// </summary>
+    private sealed class AsyncDenyPolicy : IShareAccessPolicy
+    {
+        public bool IsVisible(ShareAccessContext context) => true;
+        public ShareAccessResult AuthorizeConnect(ShareAccessContext context) => ShareAccessResult.Grant();
+
+        public async ValueTask<ShareAccessResult> AuthorizeConnectAsync(ShareAccessContext context)
+        {
+            await Task.Yield();
+            return ShareAccessResult.Deny();
         }
     }
 
