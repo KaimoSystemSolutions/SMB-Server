@@ -44,26 +44,50 @@ wire-format or public-behavior change.
 - **Files:** new `docs` section (this file); no code yet.
 - **Tests:** none yet — this milestone is the spec the later tests assert against.
 
-### A1 — Per-key async lock manager
-- Introduce `Smb.Server/Concurrency/KeyedAsyncLock.cs` — an async, reentrancy-free, fairness-aware
-  lock keyed by an opaque token, with `ValueTask<Releaser> AcquireAsync(key, ct)`. Backed by a
-  `ConcurrentDictionary<key, SemaphoreSlim>` with refcounted eviction so idle keys don't leak.
-- Keys: `OpenScope(fileId)` for per-open ops; `PathScope(treeId, normalizedPath)` for
-  create/rename/delete-on-close that race on a name.
-- **Files:** `src/Smb.Server/Concurrency/KeyedAsyncLock.cs` (new).
-- **Tests:** `tests/Smb.Tests/KeyedAsyncLockTests.cs` — mutual exclusion per key, parallelism across
-  keys, no deadlock under contention, key eviction after last release, cancellation.
+### A1 — Per-key exclusive async lock (utility) ✅ DONE
+- `src/Smb.Server/Concurrency/KeyedAsyncLock.cs` — async, non-reentrant, refcount-evicting exclusive
+  lock keyed by an opaque token, `ValueTask<Releaser> AcquireAsync(key, ct)`.
+- **Note:** this exclusive primitive does **not** preserve arrival order (acquisition races off the
+  read loop) and has no shared mode, so it is **not** the dispatch-ordering primitive — it is retained
+  for **A3** (guarding per-path state-store mutations, where order is irrelevant). The dispatch path
+  uses **A2a** instead. Tests: `tests/Smb.Tests/KeyedAsyncLockTests.cs` (5, green).
 
-### A2 — Classify metadata ops as concurrency-eligible
-- Extend `TryBeginConcurrentFrame` (or add a sibling classifier) so single, non-compound
-  CREATE/CLOSE/SET_INFO/QUERY_INFO/QUERY_DIRECTORY/FLUSH become eligible for the concurrent path,
-  guarded by the appropriate keyed lock instead of the barrier.
-- Lifecycle commands (LOGOFF, TREE_DISCONNECT, SESSION_SETUP, NEGOTIATE) and compound requests
-  remain barrier ops.
-- **Files:** `src/Smb.Server/Smb2Dispatcher.Concurrency.cs`, `src/Smb.Host/SmbConnectionHandler.cs`.
-- **Tests:** `tests/Smb.Tests/ConcurrentMetadataDispatchTests.cs` — parallel CREATE/CLOSE on
-  distinct paths overlap; two ops on the same FileId serialize; a LOGOFF drains inflight metadata
-  ops before tearing down the session.
+### A2a — Ordered keyed reader/writer queue (dispatch-ordering primitive)
+Why an RW queue and not the A1 lock: the dispatch path has two hard requirements the A1 lock cannot
+meet. (1) **Arrival order per key** — `SET_INFO(delete-on-close)` then `CLOSE` on the same FileId must
+not reorder. Order must be fixed on the read loop (arrival order), not at off-loop acquisition. (2)
+**Shared vs exclusive** — READ/WRITE run in parallel today (even on the same handle); a concurrent
+CLOSE must serialize *after* inflight READ/WRITE of that Open while READs stay parallel among
+themselves. That is a reader/writer relation with FIFO fairness (no writer starvation).
+- Introduce `src/Smb.Server/Concurrency/KeyedReaderWriterQueue.cs` with a **two-phase** API:
+  - `Reservation Reserve(TKey key, LockMode mode)` — called **synchronously on the read loop** in
+    arrival order; fixes this frame's FIFO position for `key`.
+  - `ValueTask<Releaser> Reservation.AcquireAsync(ct)` — called **off-loop** by the executing task;
+    completes when granted per FIFO + RW rules (a run of leading `Shared` reservations is granted as a
+    batch; an `Exclusive` reservation is granted alone once it reaches the head).
+  - Per-key eviction when the queue drains; cancellation removes a not-yet-granted node and re-pumps.
+- **Files:** `src/Smb.Server/Concurrency/KeyedReaderWriterQueue.cs` (new).
+- **Tests:** `tests/Smb.Tests/KeyedReaderWriterQueueTests.cs` — leading shared batch runs in parallel;
+  exclusive waits for prior shared and runs alone; shared reserved after an exclusive waits for it
+  (FIFO, no reordering); writer not starved by a shared stream; cancellation of a queued node unblocks
+  the rest; eviction leaves no state.
+
+### A2b — Classify metadata ops as concurrency-eligible & wire the queue
+- Extend the read-loop classifier so single, non-compound CREATE/CLOSE/SET_INFO/QUERY_INFO/
+  QUERY_DIRECTORY/FLUSH (and the existing READ/WRITE) each `Reserve` a scope on the read loop:
+  - READ/WRITE/QUERY_INFO/QUERY_DIRECTORY → `Shared`, keyed `OpenScope(fileId)`.
+  - CLOSE/SET_INFO/FLUSH → `Exclusive`, keyed `OpenScope(fileId)`.
+  - CREATE → `Exclusive`, keyed `PathScope(treeId, normalizedName)` (parse the CREATE name on the read
+    loop to form the key).
+- The executing task `AcquireAsync`es its reservation before `DispatchOneAsync`. Lifecycle commands
+  (LOGOFF, TREE_DISCONNECT, SESSION_SETUP, NEGOTIATE, CANCEL) and compound/related requests stay
+  **barrier** ops (still drain all inflight first). Gate the whole metadata-concurrency behind an
+  option (default off until A3 lands + it is validated) so it can be rolled back.
+- **Files:** `src/Smb.Server/Smb2Dispatcher.Concurrency.cs`, `src/Smb.Host/SmbConnectionHandler.cs`,
+  `src/Smb.Server/SmbServerOptions.cs`.
+- **Tests:** `tests/Smb.Tests/ConcurrentMetadataDispatchTests.cs` — parallel CREATE/CLOSE on distinct
+  paths overlap; SET_INFO→CLOSE on the same FileId keep order; a LOGOFF drains inflight metadata ops
+  before tearing down the session; a CLOSE waits for an inflight WRITE on the same Open.
 
 ### A3 — Make state stores safe for concurrent metadata ops
 - Audit `SmbSession.Opens`, `SmbTreeConnect`, `DurableHandleStore`, `InMemoryShareModeManager`,
@@ -160,4 +184,20 @@ wire-format or public-behavior change.
   Next action: **A2** — classify single non-compound CREATE/CLOSE/SET_INFO/QUERY_*/FLUSH as
   concurrency-eligible and guard them with `KeyedAsyncLock` (OpenScope(fileId) / PathScope(treeId,path))
   instead of the barrier. First define the key type + which command maps to which scope.
+- **2026-07-14** — **Design refinement while starting A2.** The A1 exclusive `KeyedAsyncLock` is the
+  wrong primitive for the dispatch path: (a) its acquisition races off the read loop so it does NOT
+  preserve arrival order, and (b) it has no shared mode, so a concurrent CLOSE couldn't let same-Open
+  READs stay parallel. Split A2 into **A2a** (ordered RW primitive) + **A2b** (wiring). A1 is retained
+  for A3 state-store guarding (order-agnostic per-path mutations).
+  **A2a done:** `src/Smb.Server/Concurrency/KeyedReaderWriterQueue.cs` — two-phase (`Reserve` on the
+  read loop fixes FIFO position; `Reservation.AcquireAsync` off-loop grants per FIFO+RW rules), leading
+  shared batched, exclusive alone, strict FIFO (no writer starvation), cancellation removes a queued
+  node + re-pumps, per-key eviction. Tcs uses `RunContinuationsAsynchronously` (grant happens under the
+  gate). Tests `tests/Smb.Tests/KeyedReaderWriterQueueTests.cs` (7, green). Full suite **481/481 green**
+  (nothing wired yet — primitives only).
+  <!-- NOTE A2b is the invasive step and depends on A3: once CLOSE/SET_INFO leave the barrier the state
+       stores (SmbSession.Opens etc.) are mutated off the read loop and must be made concurrency-safe
+       FIRST, and the metadata-concurrency must ship behind a default-off option for rollback. -->
+  Next action: **A3** (make state stores concurrency-safe) — audit `SmbSession.Opens` &
+  managers — then **A2b** (read-loop classifier + `Reserve`/`AcquireAsync` wiring, option-gated).
 - _(append progress entries here as milestones complete; check items off in the phase sections)_
