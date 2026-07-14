@@ -56,6 +56,24 @@ public interface IShareAccessPolicy
 
     /// <summary>Decides the TREE_CONNECT connection and returns the granted access mask.</summary>
     ShareAccessResult AuthorizeConnect(ShareAccessContext context);
+
+    /// <summary>
+    /// [W6.1] Async visibility check for share enumeration. The default delegates to
+    /// <see cref="IsVisible"/>, so a synchronous policy needs no change. Override this (and
+    /// <see cref="AuthorizeConnectAsync"/>) for I/O-bound authorization (DB/LDAP): the server awaits it
+    /// instead of blocking a thread pool thread sync-over-async. See
+    /// docs/WINDOWS_COMPATIBILITY_ROADMAP.md Phase W6.
+    /// </summary>
+    ValueTask<bool> IsVisibleAsync(ShareAccessContext context) => new(IsVisible(context));
+
+    /// <summary>
+    /// [W6.1] Async connect authorization. The default delegates to <see cref="AuthorizeConnect"/>, so a
+    /// synchronous policy needs no change. Override for I/O-bound authorization so the dispatcher can await
+    /// it. Note (verified against the read loop): awaiting alone avoids the sync-over-async thread block but
+    /// does <b>not</b> by itself unfreeze unrelated I/O — TREE_CONNECT must also leave the read-loop barrier
+    /// (roadmap W6.3). See docs/WINDOWS_COMPATIBILITY_ROADMAP.md Phase W6.
+    /// </summary>
+    ValueTask<ShareAccessResult> AuthorizeConnectAsync(ShareAccessContext context) => new(AuthorizeConnect(context));
 }
 
 /// <summary>Default policy: all shares visible, full access for every valid session (previous behaviour).</summary>
