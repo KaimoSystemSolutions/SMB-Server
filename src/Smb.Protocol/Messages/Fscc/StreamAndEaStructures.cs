@@ -150,6 +150,14 @@ public static class FullEaInformation
 
             if (next == 0)
                 break;
+
+            // [D3] NextEntryOffset is attacker-controlled: it must advance strictly past this entry and stay
+            // within the buffer. Without this a huge value casts to a negative int (→ ArgumentOutOfRangeException
+            // on the next slice) and an overlapping value could re-read the same bytes — treat both as malformed.
+            int consumed = r.Position;
+            if (next < (uint)consumed || (long)offset + next > buffer.Length)
+                throw new SmbWireFormatException(
+                    $"FILE_FULL_EA_INFORMATION NextEntryOffset {next} out of range (entry consumed {consumed}, at {offset}/{buffer.Length}).");
             offset += (int)next;
         }
         return result;

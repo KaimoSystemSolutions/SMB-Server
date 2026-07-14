@@ -10,8 +10,10 @@
     <Project Path="src/Smb.Host/Smb.Host.csproj" />
     <Project Path="src/Smb.Protocol/Smb.Protocol.csproj" />
     <Project Path="src/Smb.Server/Smb.Server.csproj" />
+    <Project Path="src/Smb.Server.OpenTelemetry/Smb.Server.OpenTelemetry.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Smb.Tests/Smb.Tests.csproj" />
+    <Project Path="tests/Smb.Fuzz/Smb.Fuzz.csproj" />
   </Folder>
 </Solution>

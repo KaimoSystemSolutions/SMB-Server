@@ -1,6 +1,19 @@
 using System.Collections.Concurrent;
+using Smb.Protocol.Enums;
 
 namespace Smb.Server.Diagnostics;
+
+/// <summary>
+/// [D1] Per-command tracing scope (Phase D / D1). Returned by
+/// <see cref="SmbServerMetrics.BeginCommand"/> at the start of a dispatched SMB2 command and disposed
+/// when it completes. A diagnostics bridge (e.g. OpenTelemetry) wraps an <c>Activity</c> in it; the core
+/// server never creates one (the base hook returns <c>null</c>), so there is no tracing dependency in core.
+/// </summary>
+public interface ISmbCommandTrace : IDisposable
+{
+    /// <summary>Records the command's resulting NT status (called once, just before <see cref="IDisposable.Dispose"/>).</summary>
+    void SetStatus(NtStatus status);
+}
 
 /// <summary>
 /// Server health &amp; performance counters (Phase 8 / M8.5). Thread-safe, lock-free (Interlocked) and
@@ -58,6 +71,15 @@ public class SmbServerMetrics
         Interlocked.Increment(ref _requestCount);
         _latency.Record(milliseconds);
     }
+
+    /// <summary>
+    /// [D1] Begins a tracing scope for a single dispatched SMB2 command (Phase D / D1). Called before the
+    /// command is handled; the returned scope (if any) receives the resulting status via
+    /// <see cref="ISmbCommandTrace.SetStatus"/> and is disposed on completion. The base implementation
+    /// returns <c>null</c> (no tracing) so core stays free of any OpenTelemetry/Activity dependency — the
+    /// <c>Smb.Server.OpenTelemetry</c> bridge overrides it to emit an <c>Activity</c> span and per-op metric.
+    /// </summary>
+    public virtual ISmbCommandTrace? BeginCommand(SmbCommand command) => null;
 
     public virtual void OnBytesRead(string share, long count)
     {

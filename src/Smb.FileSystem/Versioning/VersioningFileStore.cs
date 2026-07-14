@@ -82,6 +82,14 @@ public sealed class VersioningFileStore : IFileStore, ISnapshotStore
             ? new(FileStoreResult<IReadOnlyList<FileEntryInfo>>.Fail(NtStatus.InvalidParameter))
             : _inner.QueryDirectoryAsync(handle, searchPattern, cancellationToken);
 
+    // [D2] Forward the bounded overload to the inner store so its early-stop enumeration is preserved
+    // through the versioning wrapper (otherwise the interface default would materialize the full list).
+    public ValueTask<FileStoreResult<BoundedDirectoryListing>> QueryDirectoryAsync(
+        IFileHandle handle, string searchPattern, int maxEntries, CancellationToken cancellationToken = default)
+        => handle is SnapshotFileHandle
+            ? new(FileStoreResult<BoundedDirectoryListing>.Fail(NtStatus.InvalidParameter))
+            : _inner.QueryDirectoryAsync(handle, searchPattern, maxEntries, cancellationToken);
+
     public ValueTask<NtStatus> SetEndOfFileAsync(
         IFileHandle handle, long length, CancellationToken cancellationToken = default)
         => handle is SnapshotFileHandle

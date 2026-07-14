@@ -27,7 +27,7 @@ public abstract class SyncFileStore : IFileStore
     /// <inheritdoc cref="IFileStore.WriteAsync"/>
     protected abstract FileStoreResult<int> Write(IFileHandle handle, long offset, ReadOnlySpan<byte> data);
 
-    /// <inheritdoc cref="IFileStore.QueryDirectoryAsync"/>
+    /// <inheritdoc cref="IFileStore.QueryDirectoryAsync(IFileHandle,string,CancellationToken)"/>
     protected abstract FileStoreResult<IReadOnlyList<FileEntryInfo>> QueryDirectory(IFileHandle handle, string searchPattern);
 
     /// <inheritdoc cref="IFileStore.SetEndOfFileAsync"/>
@@ -64,6 +64,33 @@ public abstract class SyncFileStore : IFileStore
     public virtual ValueTask<FileStoreResult<IReadOnlyList<FileEntryInfo>>> QueryDirectoryAsync(
         IFileHandle handle, string searchPattern, CancellationToken cancellationToken = default)
         => new(QueryDirectory(handle, searchPattern));
+
+    /// <summary>
+    /// Bounded synchronous directory enumeration (Phase D / D2). Default calls the abstract
+    /// <see cref="QueryDirectory(IFileHandle,string)"/> and truncates after the fact — a backend that can enumerate lazily
+    /// (e.g. <c>Directory.EnumerateFileSystemInfos</c>) should override this to stop early.
+    /// <paramref name="maxEntries"/> &lt;= 0 means unbounded.
+    /// </summary>
+    protected virtual FileStoreResult<BoundedDirectoryListing> QueryDirectory(IFileHandle handle, string searchPattern, int maxEntries)
+    {
+        FileStoreResult<IReadOnlyList<FileEntryInfo>> result = QueryDirectory(handle, searchPattern);
+        if (!result.IsSuccess)
+            return FileStoreResult<BoundedDirectoryListing>.Fail(result.Status);
+
+        IReadOnlyList<FileEntryInfo> all = result.Value!;
+        if (maxEntries > 0 && all.Count > maxEntries)
+        {
+            var capped = new List<FileEntryInfo>(maxEntries);
+            for (int i = 0; i < maxEntries; i++)
+                capped.Add(all[i]);
+            return FileStoreResult<BoundedDirectoryListing>.Ok(new BoundedDirectoryListing(capped, Truncated: true));
+        }
+        return FileStoreResult<BoundedDirectoryListing>.Ok(new BoundedDirectoryListing(all, Truncated: false));
+    }
+
+    public virtual ValueTask<FileStoreResult<BoundedDirectoryListing>> QueryDirectoryAsync(
+        IFileHandle handle, string searchPattern, int maxEntries, CancellationToken cancellationToken = default)
+        => new(QueryDirectory(handle, searchPattern, maxEntries));
 
     public virtual ValueTask<NtStatus> SetEndOfFileAsync(
         IFileHandle handle, long length, CancellationToken cancellationToken = default)

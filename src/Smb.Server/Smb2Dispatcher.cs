@@ -150,7 +150,19 @@ public sealed partial class Smb2Dispatcher
             }
 
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} tid={header.TreeId} len={segment.Length} charge={header.CreditCharge}");
-            ResponseSegment? response = await DispatchOneAsync(connection, header, segment, transportEncrypted).ConfigureAwait(false);
+            // [D1] Per-command tracing scope (no-op unless a diagnostics bridge is installed). Started before
+            // dispatch so a bridge's Activity is current across the await (nested backend spans attach to it).
+            ISmbCommandTrace? trace = _server.Options.Metrics.BeginCommand(header.Command);
+            ResponseSegment? response;
+            try
+            {
+                response = await DispatchOneAsync(connection, header, segment, transportEncrypted).ConfigureAwait(false);
+                trace?.SetStatus(response is { } tr ? tr.Header.Status : NtStatus.Success);
+            }
+            finally
+            {
+                trace?.Dispose();
+            }
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");
 
             if (response is { } seg) segments.Add(seg);

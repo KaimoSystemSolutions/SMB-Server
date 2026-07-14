@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- OpenTelemetry bridge for the SMB server (docs/ENTERPRISE_HARDENING_ROADMAP.md, D1).
+       Optional add-on: reference it only when you want OTel traces/metrics. It has NO dependency
+       on the OpenTelemetry SDK — it emits via the standard System.Diagnostics ActivitySource +
+       System.Diagnostics.Metrics.Meter APIs (part of the shared framework), which any OTel exporter
+       subscribes to by source/meter name ("Smb.Server"). -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Server.OpenTelemetry</RootNamespace>
+    <AssemblyName>Smb.Server.OpenTelemetry</AssemblyName>
+    <Description>OpenTelemetry bridge for the Smb.* SMB server library: exposes per-command traces (ActivitySource "Smb.Server") and server metrics (Meter "Smb.Server") via the standard System.Diagnostics APIs, with no OpenTelemetry SDK dependency.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Server\Smb.Server.csproj" />
+  </ItemGroup>
+</Project>

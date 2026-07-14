@@ -136,6 +136,27 @@ public sealed class SmbServerOptions
     /// </summary>
     public bool ConcurrentMetadataOps { get; set; }
 
+    /// <summary>
+    /// [D2] Maximum number of concurrently open handles a single session may hold
+    /// (docs/ENTERPRISE_HARDENING_ROADMAP.md, D2). A CREATE past this cap is rejected with
+    /// <c>STATUS_INSUFFICIENT_RESOURCES</c> before any backend side effect, so one client cannot exhaust
+    /// server memory with unbounded opens. Default 16384; ≤ 0 disables the cap. (Under
+    /// <see cref="ConcurrentMetadataOps"/> the cap is a soft bound — concurrent CREATEs on one session may
+    /// overshoot slightly since CREATE runs without a per-Open reservation.)
+    /// </summary>
+    public int MaxOpenHandlesPerSession { get; set; } = 16384;
+
+    /// <summary>
+    /// [D2] Maximum number of directory entries a single QUERY_DIRECTORY scan may materialize
+    /// (docs/ENTERPRISE_HARDENING_ROADMAP.md, D2). A directory with more entries than this is rejected with
+    /// <c>STATUS_INSUFFICIENT_RESOURCES</c> rather than being loaded into memory unbounded; the built-in
+    /// backend stops enumerating early (no full-directory allocation, see
+    /// <see cref="Smb.FileSystem.IFileStore.QueryDirectoryAsync(Smb.FileSystem.IFileHandle,string,int,System.Threading.CancellationToken)"/>).
+    /// The snapshot is taken once at the first call of a scan and paged across continuation calls, so this
+    /// bounds the per-open retained listing too. Default 1048576; ≤ 0 disables the cap.
+    /// </summary>
+    public int MaxDirectoryEnumerationEntries { get; set; } = 1_048_576;
+
     /// <summary>SPNEGO negotiator (auth). Required — e.g. NTLM-based or (test) <see cref="DevSpnegoNegotiator"/>.</summary>
     public ISpnegoNegotiator? SpnegoNegotiator { get; set; }
 

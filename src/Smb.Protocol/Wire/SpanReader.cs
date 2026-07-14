@@ -30,10 +30,16 @@ public ref struct SpanReader
     public readonly int Length => _buffer.Length;
 
     /// <summary>Sets the read position absolutely (e.g. to follow an offset field).</summary>
+    /// <exception cref="SmbWireFormatException">
+    /// If <paramref name="position"/> is outside the buffer. A wire offset field is attacker-controlled,
+    /// so an out-of-range value is a malformed frame — signalled with the same exception as a truncated
+    /// read so the dispatcher maps every wire-format fault to <c>STATUS_INVALID_PARAMETER</c> uniformly
+    /// (Phase D / D3 fuzz hardening).
+    /// </exception>
     public void Seek(int position)
     {
         if ((uint)position > (uint)_buffer.Length)
-            throw new ArgumentOutOfRangeException(nameof(position));
+            throw new SmbWireFormatException($"Seek past end of buffer: position {position}, length {_buffer.Length}.");
         _position = position;
     }
 
@@ -100,10 +106,15 @@ public ref struct SpanReader
     }
 
     /// <summary>Returns a slice at an absolute position without moving the cursor.</summary>
+    /// <exception cref="SmbWireFormatException">
+    /// If the <paramref name="offset"/>/<paramref name="count"/> window lies outside the buffer — an
+    /// attacker-controlled offset/length pair is a malformed frame, signalled like a truncated read
+    /// (Phase D / D3 fuzz hardening).
+    /// </exception>
     public readonly ReadOnlySpan<byte> Slice(int offset, int count)
     {
         if ((uint)offset > (uint)_buffer.Length || (uint)count > (uint)(_buffer.Length - offset))
-            throw new ArgumentOutOfRangeException(nameof(offset));
+            throw new SmbWireFormatException($"Slice out of range: offset {offset}, count {count}, length {_buffer.Length}.");
         return _buffer.Slice(offset, count);
     }
 

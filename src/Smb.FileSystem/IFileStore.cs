@@ -41,6 +41,17 @@ public interface IFileHandle : IDisposable
 public readonly record struct FileCreateResult(IFileHandle Handle, CreateOutcome Action);
 
 /// <summary>
+/// Result of a bounded directory enumeration (Phase D / D2,
+/// <see cref="IFileStore.QueryDirectoryAsync(IFileHandle,string,int,CancellationToken)"/>).
+/// </summary>
+/// <param name="Entries">The listed entries (at most the requested bound).</param>
+/// <param name="Truncated">
+/// <c>true</c> if the directory held more entries than the bound allowed — the server rejects the scan
+/// with <c>STATUS_INSUFFICIENT_RESOURCES</c> rather than serving a silently incomplete listing.
+/// </param>
+public readonly record struct BoundedDirectoryListing(IReadOnlyList<FileEntryInfo> Entries, bool Truncated);
+
+/// <summary>
 /// NTFS-semantic file backend behind a share (Context §2, §13). Returns NT status codes; a concrete
 /// backend (local FS, virtual, …) maps its semantics onto this. Paths are share-relative,
 /// '\\'-separated, without a leading backslash.
@@ -72,6 +83,35 @@ public interface IFileStore
     /// <summary>Lists a directory (optionally with a wildcard search pattern).</summary>
     ValueTask<FileStoreResult<IReadOnlyList<FileEntryInfo>>> QueryDirectoryAsync(
         IFileHandle handle, string searchPattern, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Bounded directory enumeration (Phase D / D2): lists at most <paramref name="maxEntries"/> entries and
+    /// reports whether the directory held more. This lets the server cap the memory a single QUERY_DIRECTORY
+    /// scan may materialize so a huge directory cannot exhaust it unbounded.
+    /// <para>The default implementation delegates to
+    /// <see cref="QueryDirectoryAsync(IFileHandle,string,CancellationToken)"/> and truncates after the fact
+    /// (a legacy backend still materializes the full list once). Backends that can enumerate lazily should
+    /// <b>override</b> this to stop enumerating early and never allocate the whole directory.</para>
+    /// <paramref name="maxEntries"/> &lt;= 0 means unbounded.
+    /// </summary>
+    async ValueTask<FileStoreResult<BoundedDirectoryListing>> QueryDirectoryAsync(
+        IFileHandle handle, string searchPattern, int maxEntries, CancellationToken cancellationToken = default)
+    {
+        FileStoreResult<IReadOnlyList<FileEntryInfo>> result =
+            await QueryDirectoryAsync(handle, searchPattern, cancellationToken).ConfigureAwait(false);
+        if (!result.IsSuccess)
+            return FileStoreResult<BoundedDirectoryListing>.Fail(result.Status);
+
+        IReadOnlyList<FileEntryInfo> all = result.Value!;
+        if (maxEntries > 0 && all.Count > maxEntries)
+        {
+            var capped = new List<FileEntryInfo>(maxEntries);
+            for (int i = 0; i < maxEntries; i++)
+                capped.Add(all[i]);
+            return FileStoreResult<BoundedDirectoryListing>.Ok(new BoundedDirectoryListing(capped, Truncated: true));
+        }
+        return FileStoreResult<BoundedDirectoryListing>.Ok(new BoundedDirectoryListing(all, Truncated: false));
+    }
 
     /// <summary>Sets the file size (SET FileEndOfFileInformation).</summary>
     ValueTask<NtStatus> SetEndOfFileAsync(IFileHandle handle, long length, CancellationToken cancellationToken = default);

@@ -4,6 +4,7 @@ using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Protocol.Wire;
 using Smb.Server.Concurrency;
+using Smb.Server.Diagnostics;
 using Smb.Server.State;
 
 namespace Smb.Server;
@@ -126,15 +127,26 @@ public sealed partial class Smb2Dispatcher
         Smb2Header header = frame.Header;
         _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} tid={header.TreeId} len={frame.Message.Length} (concurrent)");
 
+        // [D1] Per-command tracing scope also covers the concurrent path (pipelined READ/WRITE and, with
+        // ConcurrentMetadataOps, metadata ops) — so spans/per-op metrics are not lost off the barrier.
+        ISmbCommandTrace? trace = _server.Options.Metrics.BeginCommand(header.Command);
         ResponseSegment? response;
-        if (frame.Reservation is { } reservation)
+        try
         {
-            using var _ = await reservation.AcquireAsync(cancellationToken).ConfigureAwait(false);
-            response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true).ConfigureAwait(false);
+            if (frame.Reservation is { } reservation)
+            {
+                using var _ = await reservation.AcquireAsync(cancellationToken).ConfigureAwait(false);
+                response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true).ConfigureAwait(false);
+            }
+            else
+            {
+                response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true).ConfigureAwait(false);
+            }
+            trace?.SetStatus(response is { } tr ? tr.Header.Status : NtStatus.Success);
         }
-        else
+        finally
         {
-            response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true).ConfigureAwait(false);
+            trace?.Dispose();
         }
 
         _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");

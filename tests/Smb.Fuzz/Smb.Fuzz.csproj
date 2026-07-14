@@ -1,11 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <!-- Wire-parser fuzzing + robustness suite (docs/ENTERPRISE_HARDENING_ROADMAP.md, D3).
+       Runs under `dotnet test` like the main suite (no external fuzzing tool required): a seeded,
+       reproducible generator drives every Smb.Protocol wire reader with random, structure-primed and
+       exhaustively-truncated inputs and asserts the parse contract (malformed input → SmbWireFormatException,
+       never an unexpected crash, always terminates). See FUZZING.md in this folder for the coverage-guided
+       (SharpFuzz/libFuzzer) follow-up and the conformance-harness notes. -->
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <!-- Tests brauchen keine XML-Doku; xUnit-Analyzer-Warnungen nicht als Fehler. -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
@@ -18,13 +23,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Smb.Protocol\Smb.Protocol.csproj" />
-    <ProjectReference Include="..\..\src\Smb.Crypto\Smb.Crypto.csproj" />
-    <ProjectReference Include="..\..\src\Smb.Auth\Smb.Auth.csproj" />
-    <ProjectReference Include="..\..\src\Smb.Auth.DirectoryServices\Smb.Auth.DirectoryServices.csproj" />
-    <ProjectReference Include="..\..\src\Smb.Auth.Sspi\Smb.Auth.Sspi.csproj" />
-    <ProjectReference Include="..\..\src\Smb.FileSystem\Smb.FileSystem.csproj" />
     <ProjectReference Include="..\..\src\Smb.Server\Smb.Server.csproj" />
-    <ProjectReference Include="..\..\src\Smb.Server.OpenTelemetry\Smb.Server.OpenTelemetry.csproj" />
-    <ProjectReference Include="..\..\src\Smb.Host\Smb.Host.csproj" />
   </ItemGroup>
 </Project>

@@ -134,6 +134,13 @@ public sealed partial class Smb2Dispatcher
             }
         }
 
+        // [D2] Per-session open-handle cap (resource limit): reject a new open once the session already
+        // holds the configured maximum, before any backend side effect, so a client cannot exhaust server
+        // memory with unbounded opens. ≤ 0 disables the cap. Reconnect/durable-restore paths returned above.
+        int handleCap = _server.Options.MaxOpenHandlesPerSession;
+        if (handleCap > 0 && session.Opens.Count >= handleCap)
+            return BuildError(header, NtStatus.InsufficientResources);
+
         // Allocate the open up front so the share-mode reservation can be keyed to it.
         ulong volatileId = connection.AllocateFileId();
         var open = new SmbOpen
@@ -1026,12 +1033,19 @@ public sealed partial class Smb2Dispatcher
         // only; later (continuation) calls page through the snapshot regardless of any pattern sent.
         if (open.DirectoryListing is null)
         {
-            FileStoreResult<IReadOnlyList<FileEntryInfo>> listing = await store.QueryDirectoryAsync(open.LocalOpen, req.SearchPattern).ConfigureAwait(false);
+            // [D2] Bound the materialized listing so a huge directory cannot exhaust server memory. The
+            // built-in backend stops enumerating early; if the directory holds more than the cap the scan
+            // is refused (STATUS_INSUFFICIENT_RESOURCES) rather than served silently incomplete.
+            int maxEntries = _server.Options.MaxDirectoryEnumerationEntries;
+            FileStoreResult<BoundedDirectoryListing> listing =
+                await store.QueryDirectoryAsync(open.LocalOpen, req.SearchPattern, maxEntries).ConfigureAwait(false);
             if (!listing.IsSuccess)
                 return BuildError(header, listing.Status);
-            if (listing.Value!.Count == 0)
+            if (listing.Value.Truncated)
+                return BuildError(header, NtStatus.InsufficientResources);
+            if (listing.Value.Entries.Count == 0)
                 return BuildError(header, NtStatus.NoSuchFile);
-            open.DirectoryListing = listing.Value;
+            open.DirectoryListing = listing.Value.Entries;
             open.DirectoryCursor = 0;
         }
 

@@ -268,6 +268,46 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
         return FileStoreResult<IReadOnlyList<FileEntryInfo>>.Ok(entries);
     }
 
+    /// <summary>
+    /// [D2] Bounded enumeration that stops early so a huge directory is never fully materialized.
+    /// <see cref="DirectoryInfo.EnumerateFileSystemInfos(string)"/> is lazy, so this allocates at most
+    /// <paramref name="maxEntries"/> (+1 to detect overflow) entries. The synthetic "." / ".." entries
+    /// count toward the bound like any other.
+    /// </summary>
+    protected override FileStoreResult<BoundedDirectoryListing> QueryDirectory(IFileHandle handle, string searchPattern, int maxEntries)
+    {
+        var h = (LocalFileHandle)handle;
+        if (!h.IsDirectory) return FileStoreResult<BoundedDirectoryListing>.Fail(NtStatus.InvalidParameter);
+
+        string pattern = string.IsNullOrEmpty(searchPattern) ? "*" : searchPattern;
+        var entries = new List<FileEntryInfo>();
+
+        var dirInfo = new DirectoryInfo(h.FullPath);
+        entries.Add(ToEntry(dirInfo, "."));
+        if (Path.GetFullPath(h.FullPath) != _root)
+            entries.Add(ToEntry(dirInfo.Parent ?? dirInfo, ".."));
+
+        bool truncated = false;
+        try
+        {
+            foreach (FileSystemInfo info in dirInfo.EnumerateFileSystemInfos(pattern))
+            {
+                if (maxEntries > 0 && entries.Count >= maxEntries)
+                {
+                    truncated = true;
+                    break;
+                }
+                entries.Add(ToEntry(info, info.Name));
+            }
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return FileStoreResult<BoundedDirectoryListing>.Fail(NtStatus.ObjectNameNotFound);
+        }
+
+        return FileStoreResult<BoundedDirectoryListing>.Ok(new BoundedDirectoryListing(entries, truncated));
+    }
+
     protected override NtStatus SetEndOfFile(IFileHandle handle, long length)
     {
         if (_readOnly) return NtStatus.AccessDenied;
