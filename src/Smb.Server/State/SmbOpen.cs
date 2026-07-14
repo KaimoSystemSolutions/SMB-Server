@@ -40,6 +40,11 @@ public sealed class SmbOpen
     public bool IsPersistentHandle { get; set; }
 
     public uint GrantedAccess { get; set; }
+
+    /// <summary>The FILE_SHARE_* mask the open was created with (§2.2.13). Retained so a persistent handle
+    /// can re-establish the same share-mode reservation when rehydrated after a server restart (C2).</summary>
+    public uint ShareAccess { get; set; }
+
     public SmbFileAttributes FileAttributes { get; set; }
     public string PathName { get; set; } = string.Empty;
     public bool DeleteOnClose { get; set; }

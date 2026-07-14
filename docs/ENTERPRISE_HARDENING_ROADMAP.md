@@ -200,16 +200,90 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
 ## Phase C — High availability (market-dependent)
 
 ### C1 — SMB Witness protocol (MS-SWN)
-- Async failover notifications; witness registration RPC endpoint; CA capability
-  (`SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY`) advertised at share level.
-- **Files:** `src/Smb.Server/Witness/` (new), `src/Smb.Server/Rpc/*`, share-capability plumbing.
-- **Tests:** witness register/notify unit tests; CA capability negotiation test.
+Async failover notifications; witness registration RPC endpoint; CA capability
+(`SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY`) advertised at share level. Broken into sub-milestones
+(the async-notify delivery, C1.3, is the one hard, risky step — everything else is additive).
 
-### C2 — Durable persistent-handle store
-- A real persistent `IDurableHandleStore` (disk/external) so `IsPersistent` handles survive a full
-  server restart, replacing the in-memory default.
-- **Files:** `src/Smb.Server/Durable/` (new impl), builder wiring.
-- **Tests:** persist → simulate restart → reclaim handle.
+**Reusable substrate discovered up front (grounds the plan):** the existing DCERPC pipe stack
+(`Rpc/{Dcerpc,NdrWriter,RpcPipe,SrvsvcEndpoint}.cs`, dispatched via `SmbOpen.Pipe` on IPC$) handles
+BIND/REQUEST synchronously. The **CHANGE_NOTIFY** handler (`Smb2Dispatcher.Notification.cs`) already
+implements the exact deferred-response pattern C1.3 needs: `InterimResponse` (STATUS_PENDING) →
+`PendingAsyncRequest` → `SendAsyncFinalAsync`/`SendOutOfBandAsync`, guarded by `NotifyOnce`. C1.3
+reuses that template but completes with an IOCTL (FSCTL_PIPE_TRANSCEIVE) async final carrying the
+`RESP_ASYNC_NOTIFY` PDU, rather than a native CHANGE_NOTIFY body.
+
+#### C1.0 — CA capability at share level ✅ DONE
+- TREE_CONNECT advertises `ShareCapabilities.ContinuousAvailability` when `share.ContinuousAvailability`
+  **and** the connection is SMB3+ (`Dialect.IsSmb3OrLater()`) — never claim CA on a dialect that cannot
+  honour the persistent-handle/witness contract. `IShare.ContinuousAvailability` + `Share` impl already
+  existed; only the advertise path was missing.
+- **Files:** `src/Smb.Server/Smb2Dispatcher.cs` (`HandleTreeConnect`).
+- **Tests:** `tests/Smb.Tests/DurableHandleTests.cs` →
+  `TreeConnect_ContinuousAvailabilityShare_AdvertisesCaCapability` (reuses the existing `CA` share +
+  harness): CA share sets the bit, plain `Files` share does not. 10/10 green.
+
+#### C1.1 — NDR reader + witness wire types ✅ DONE
+- Add an NDR **reader** (only `NdrWriter` exists today): conformant/varying NUL-terminated wide strings,
+  unique-pointer referents, 4-byte scalars, alignment — enough to parse `WitnessrRegister(Ex)` args.
+- Witness constants/enums/structs: interface UUID `ccd8c074-d0e5-4a40-92b4-d074faa6ba28` v1.1, opnums
+  (0 GetInterfaceList, 1 Register, 2 UnRegister, 3 AsyncNotify, 4 RegisterEx), notification/version/state
+  enums, `WITNESS_INTERFACE_LIST`, `RESP_ASYNC_NOTIFY`, `RESOURCE_CHANGE`/move payloads.
+- **Files:** `src/Smb.Server/Rpc/NdrReader.cs` (new), `src/Smb.Server/Witness/WitnessWire.cs` (new).
+- **Tests:** NDR round-trip (writer→reader) for strings/scalars/referents; struct encode goldens.
+
+#### C1.2 — Witness RPC endpoint (synchronous ops) ✅ DONE
+- `WitnessEndpoint : IRpcEndpoint` bound at `\PIPE\witness`; accept the witness interface UUID in BIND;
+  wire `\PIPE\witness` into `HandlePipeCreate`. Implement `WitnessrGetInterfaceList`,
+  `WitnessrRegister`/`WitnessrRegisterEx` (allocate a 20-byte RPC context handle), `WitnessrUnRegister`.
+- `WitnessRegistrationStore` (context-handle → registration; per-connection lifetime).
+- **Files:** `src/Smb.Server/Witness/{WitnessEndpoint,WitnessRegistrationStore}.cs`,
+  `src/Smb.Server/Smb2Dispatcher.FileCommands.cs` (pipe-name dispatch), `Rpc/Dcerpc.cs` if BIND needs the UUID.
+- **Tests:** GetInterfaceList decodes; Register→handle→UnRegister; bad handle → error.
+
+#### C1.3 — Async notification delivery (WitnessrAsyncNotify) — the hard step ✅ DONE
+- Async-capable endpoint contract (endpoint may say "defer"); IOCTL handler returns `InterimResponse`
+  and registers a `PendingAsyncRequest`; on a queued notification (or timeout/unregister) completes via
+  `SendAsyncFinalAsync` with an IOCTL response carrying the `RESP_ASYNC_NOTIFY` stub. Per-registration
+  async notification channel; `NotifyOnce`-style one-shot.
+- **Files:** `Rpc/RpcPipe.cs` (async contract), `Smb2Dispatcher.FileCommands.cs` (IOCTL defer),
+  `src/Smb.Server/Witness/WitnessNotificationChannel.cs` (new).
+- **Tests:** AsyncNotify pends; a pushed notification completes it out-of-band; unregister/teardown cancels.
+
+#### C1.4 — Server-side trigger + public API ✅ DONE
+- `IWitnessService` hook so the host signals RESOURCE_CHANGE / CLIENT_MOVE; builder wiring; lifecycle
+  cleanup (drop registrations on connection/session teardown).
+- **Files:** `src/Smb.Server/Witness/IWitnessService.cs`, `Smb.Host/SmbServerBuilder.cs`, teardown paths.
+- **Tests:** trigger → registered client's pending AsyncNotify fires with the right MessageType.
+
+#### C1.5 — End-to-end + journal ✅ DONE (folded into C1.3/C1.4)
+- The full register → async-notify → **public trigger** → out-of-band final flow is exercised end-to-end by
+  `WitnessAsyncNotifyTests` (which drives the real dispatcher IOCTL path and completes via
+  `WitnessRegistrationStore.NotifyResourceChange`); CA negotiation is covered by C1.0. Journal updated below.
+
+### C2 — Durable persistent-handle store ✅ DONE
+- `FileDurableHandleStore : IDurableHandleStore, IPersistentHandleStore` persists **persistent (CA) handle
+  metadata** (`PersistentHandleRecord`: FileId, owner key, create GUID, share, path, granted+share access) as
+  one atomic JSON file per FileId under a directory; warm (in-process) durable behavior is identical to the
+  in-memory store. On startup the directory is scanned into a **cold** table.
+- **Rehydration on reconnect (the hard part):** the record is written at CREATE (survives even a crash before a
+  graceful disconnect). `TryClaimForReconnect` became **async** and tries the warm table first, then — for a
+  persistent handle after a restart — claims the cold record, validates owner/create-GUID against the record
+  metadata, and `RehydrateColdRecordAsync` rebuilds a **live `SmbOpen`**: re-opens the backend
+  (`IFileStore.CreateAsync`, Open disposition) on the reconnect share and re-reserves the share mode. The
+  dispatcher then resumes I/O on it via the existing `RestoreDurableOpenAsync`.
+- **Lifecycle:** record removed on CLOSE (`RemovePersisted`); `TakeAll` (shutdown) leaves records on disk;
+  cold record is **retained** on claim so it survives a *subsequent* restart; `SmbServerState` seeds the
+  persistent-id counter from `HighestPersistentId` so a fresh allocation can't collide with a rehydrated id.
+  New `SmbOpen.ShareAccess` field (so the share mode can be re-reserved).
+- **Scope (v1, documented):** only reconnectable metadata is persisted — byte-range locks/oplocks/leases are
+  **not** reconstructed (a rehydrated handle resumes READ/WRITE but holds no lock/lease until re-acquired).
+- **Files:** `src/Smb.Server/Durable/{PersistentHandleStore,FileDurableHandleStore}.cs` (new),
+  `Smb2Dispatcher.FileCommands.cs` (persist@CREATE, remove@CLOSE, async claim + rehydrate),
+  `State/{SmbOpen,SmbServerState}.cs`, `Smb.Host/SmbServerBuilder.cs`
+  (`UseDurableHandleStore` / `UsePersistentDurableHandles(dir)`).
+- **Tests:** `tests/Smb.Tests/PersistentHandleRestartTests.cs` (4) — end-to-end persistent open → **restart**
+  (fresh store+dispatcher, same dir+backend) → reconnect → **read returns content**; wrong create-GUID rejected
+  + record kept; store persist/reload/claim-retains-on-disk/remove; corrupt record skipped on load.
 
 ---
 
@@ -332,4 +406,78 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
   Next action: **Phase B complete.** Proceed to **C** (Witness / durable store) or **D** (OTel / resource
   limits / fuzzing) per target market — user's call. Manual-verify B1 + B2 against a real Windows client
   when a domain-joined host is available.
+- **2026-07-14** — **Phase B confirmed complete; started C1 (Witness) per user's call.** Broke C1 into
+  sub-milestones C1.0–C1.5 (see the C1 section) after reading the RPC substrate: the DCERPC pipe stack
+  (`Rpc/*`, `SmbOpen.Pipe`) is synchronous, and CHANGE_NOTIFY (`Smb2Dispatcher.Notification.cs`) already
+  provides the deferred-async-response template C1.3 will reuse. **C1.0 DONE:** TREE_CONNECT now advertises
+  `SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY` for `ContinuousAvailability` shares on SMB3+ connections
+  (`HandleTreeConnect`). Test `TreeConnect_ContinuousAvailabilityShare_AdvertisesCaCapability` added to
+  `DurableHandleTests` (reuses the existing `CA` share) — CA share sets the bit, plain share doesn't;
+  DurableHandleTests 10/10 green. (Pre-existing unrelated `SspiKerberosTests` CA1416 warning noted, not new.)
+  Next action: **C1.1** — new `Rpc/NdrReader.cs` + `Witness/WitnessWire.cs` (witness UUID/opnums/structs).
+- **2026-07-14** — **C1.1 DONE.** `Rpc/NdrReader.cs` (LE NDR decoder: scalars, referents, conformant+varying
+  wide strings, fixed WCHAR arrays, raw bytes; truncation → `SmbWireFormatException`) + `NdrWriter` extended
+  with `UInt16`/`Bytes`/`FixedWideString`. `Witness/WitnessWire.cs`: opnums, versions (V1 0x00010001 /
+  V2 0x00020000), node states, interface/notify/resource-change enums, interface UUID in DCE wire order, and
+  encode (`EncodeInterfaceList`, `EncodeAsyncNotifyResponse`, `EncodeResourceChange`) + parse
+  (`ParseRegister`, `ParseRegisterEx` — top-level unique-string pointers: referent immediately followed by its
+  string). Tests `WitnessWireTests` (7, green): NDR round-trip, truncation throw, register/registerEx parse,
+  null-pointer arg, interface-list field-by-field decode, async-notify+resource-change round-trip.
+  Next action: **C1.2** — `WitnessEndpoint : IRpcEndpoint` at `\PIPE\witness` (BIND UUID, opnum dispatch,
+  GetInterfaceList/Register/UnRegister, context handles) + `WitnessRegistrationStore`; wire `\PIPE\witness`
+  into `HandlePipeCreate`.
+- **2026-07-14** — **C1.2 DONE.** `Witness/WitnessEndpoint.cs` (IRpcEndpoint at `\PIPE\witness`: BIND ack,
+  opnum dispatch for GetInterfaceList/Register/RegisterEx/UnRegister; version + NetName validation returning
+  Win32 codes; 20-byte context handle = attrs(4)+UUID(16)) + `Witness/WitnessRegistrationStore.cs`
+  (context-handle-keyed, connection-scoped, `Snapshot`/`RemoveAllForConnection` for the C1.4 trigger/teardown).
+  Store hung on `SmbServerState.WitnessRegistrations` (server-global). `HandlePipeCreate` refactored to a
+  pipe-name→endpoint resolver (`OpenRpcEndpoint`) that now also serves `witness`; srvsvc behavior byte-identical.
+  **AsyncNotify (opnum 3) faults for now** — C1.3 serves it out-of-band. Tests `WitnessEndpointTests` (6, green):
+  BIND ack; GetInterfaceList decodes self-interface; Register→handle→store→UnRegister→drop; bad version →
+  REVISION_MISMATCH + null handle; unknown UnRegister handle → INVALID_PARAMETER; sync AsyncNotify faults.
+  **Full suite 516/516 green** (502 + 1 C1.0 + 7 C1.1 + 6 C1.2) — pipe refactor caused zero regressions.
+  Next action: **C1.3** — the invasive async-notify step (design in the C1.3 section; reuses the CHANGE_NOTIFY
+  deferred-response mechanism at the IOCTL layer). Present design before wiring.
+- **2026-07-14** — **C1.3 DONE (design approved, then implemented).** AsyncNotify is now served out-of-band:
+  the FSCTL_PIPE_TRANSCEIVE branch detects a witness pipe (`RpcPipe.Endpoint`) and, via
+  `WitnessEndpoint.TryBeginAsyncNotify` (parses opnum 3 + context handle, scoped to the owning connection),
+  hands off to `BeginWitnessAsyncNotify` (new, in `Smb2Dispatcher.Notification.cs` next to CHANGE_NOTIFY,
+  reusing `InterimResponse`/`PendingAsyncRequest`/`SendAsyncFinalAsync`/`NotifyOnce`). Notification rendezvous
+  is `WitnessNotificationChannel` (one-shot waiter + bounded buffer; a buffered notify is delivered on a
+  pooled thread, never inline, so the STATUS_PENDING interim always precedes the out-of-band final). The final
+  is an IOCTL response carrying the RESP_ASYNC_NOTIFY DCERPC PDU (callId echoed). CANCEL/teardown →
+  STATUS_CANCELLED. Tests `WitnessAsyncNotifyTests` (2, green): pend→push→out-of-band ResourceChange (asserts
+  AsyncId match + decoded MessageType) and CANCEL→STATUS_CANCELLED. **Full suite 518/518 green** — IOCTL
+  hot-path change caused zero regressions. Gotcha found while testing: each SMB2 request needs a distinct
+  increasing MessageId (reusing one trips the sequence-window check); CANCEL must reuse the async op's MID.
+  Next action: **C1.4** — public failover-trigger API (`WitnessRegistrationStore.NotifyResourceChange` +
+  builder exposure) + drop registrations on connection teardown.
+- **2026-07-14** — **C1.4 + C1.5 DONE → C1 (Witness) COMPLETE.** C1.4: public failover trigger
+  `WitnessRegistrationStore.NotifyResourceChange(netName, change, resourceName)` (case-insensitive net-name
+  match, null=all; delivers to a waiting AsyncNotify or buffers) surfaced ergonomically as
+  `SmbServer.NotifyWitnessResourceChange(...)` (the host already exposed `SmbServer.State`, so no builder
+  plumbing needed). Registrations are dropped on connection teardown — `RemoveAllForConnection` wired into
+  both `OnConnectionClosedAsync` and `OnConnectionClosed` (a pending AsyncNotify is already cancelled →
+  STATUS_CANCELLED by the existing `CancelNonSurvivingPending`). C1.5 folded in: the e2e notify test now
+  triggers via the public API. Tests: `WitnessEndpointTests` +2 (net-name filter incl. non-match=0; teardown
+  drops only that connection's regs), e2e trigger test updated. **Full suite 520/520 green.**
+  **Phase C1 (C1.0–C1.5) complete:** CA capability advertised (SMB3), full `\PIPE\witness` MS-SWN endpoint
+  (GetInterfaceList/Register/RegisterEx/UnRegister/AsyncNotify), async out-of-band failover notifications, and
+  a public server-side trigger. **Manual-verify against a real Windows failover cluster client when available**
+  (the CI tests drive the wire/dispatch paths but not a genuine SMB witness client). Deferred niceties (not
+  blocking): real per-NIC interface list in GetInterfaceList (currently a single self-interface, IPv4=0);
+  ClientMove/ShareMove/IpChange notify types are encodable but no trigger API yet (only ResourceChange shipped).
+  Next action (C-phase): **C2** — durable persistent-handle store (survives restart), or **D** (OTel / resource
+  limits / fuzzing) per target market — user's call.
+- **2026-07-14** — **C2 DONE → Phase C (HA) COMPLETE.** Restart-surviving persistent handles shipped:
+  `FileDurableHandleStore` persists CA-handle metadata (`PersistentHandleRecord`, atomic JSON-per-FileId) and
+  reloads it as cold records on startup; the reconnect path is now async and, on a warm miss, rehydrates a live
+  `SmbOpen` from the cold record (re-open backend + re-reserve share mode) so I/O resumes. Record written at
+  CREATE (crash-safe), removed at CLOSE; persistent-id counter seeded from the store so allocations can't
+  collide with rehydrated ids; new `SmbOpen.ShareAccess`. Builder: `UsePersistentDurableHandles(dir)`. **v1
+  scope:** locks/oplocks/leases not reconstructed (documented in the C2 section + `IPersistentHandleStore`).
+  Tests `PersistentHandleRestartTests` (4, incl. full open→restart→reconnect→read). **Full suite 524/524 green**
+  — the async reconnect refactor + persist wiring caused zero regressions in the durable-handle tests.
+  Phase C (C1 Witness + C2 persistent store) is complete. Remaining in this roadmap: **Phase D** (D1 OTel,
+  D2 resource limits, D3 fuzzing/conformance) — Ops hardening, independently startable, user's call.
 - _(append progress entries here as milestones complete; check items off in the phase sections)_

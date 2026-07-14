@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using Smb.Auth;
 using Smb.FileSystem;
 using Smb.Server.Authorization;
+using Smb.Server.Durable;
+using Smb.Server.Witness;
 
 namespace Smb.Server.State;
 
@@ -19,6 +21,11 @@ public sealed class SmbServerState
     {
         Options = options;
         Shares = options.Shares;
+
+        // [C2] Seed the persistent-id counter past any handle recovered from a persistent durable store so a
+        // freshly allocated durable FileId cannot collide with a rehydrated persistent handle after a restart.
+        if (options.DurableHandleStore is IPersistentHandleStore persistent)
+            _persistentIdCounter = (long)(persistent.HighestPersistentId & 0x7FFF_FFFF_FFFF_FFFF);
     }
 
     public SmbServerOptions Options { get; }
@@ -29,6 +36,9 @@ public sealed class SmbServerState
 
     /// <summary>Active connections.</summary>
     public ConcurrentDictionary<Guid, SmbConnection> Connections { get; } = new();
+
+    /// <summary>Server-global witness (MS-SWN) registrations, shared by all <c>\PIPE\witness</c> endpoints (C1).</summary>
+    public WitnessRegistrationStore WitnessRegistrations { get; } = new();
 
     /// <summary>
     /// Returns the shares visible to <paramref name="identity"/> according to

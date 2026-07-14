@@ -2,6 +2,7 @@ using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Server.Notification;
 using Smb.Server.State;
+using Smb.Server.Witness;
 
 namespace Smb.Server;
 
@@ -76,6 +77,47 @@ public sealed partial class Smb2Dispatcher
         // Note: theoretically a change can arrive in the µs window between Watch() and sending
         // this interim response; in practice filesystem watchers deliver events ms later.
         // Correct buffering of changes between two requests remains an open issue.
+        return InterimResponse(header, session, asyncId);
+    }
+
+    /// <summary>
+    /// [C1.3] Begins a witness <c>WitnessrAsyncNotify</c> as a long-pending async op: sends the
+    /// <c>STATUS_PENDING</c> interim now and arms the registration's notification channel. When a failover
+    /// notification is queued (server trigger, C1.4) the final response is sent out-of-band as an IOCTL
+    /// (FSCTL_PIPE_TRANSCEIVE) response carrying the RESP_ASYNC_NOTIFY PDU; CANCEL/CLOSE/teardown completes
+    /// it with <c>STATUS_CANCELLED</c>. Mirrors the CHANGE_NOTIFY mechanism (shared <see cref="NotifyOnce"/>).
+    /// </summary>
+    private ResponseSegment BeginWitnessAsyncNotify(
+        SmbConnection connection, Smb2Header header, SmbSession session, SmbOpen open,
+        WitnessRegistration registration, uint callId, ulong persistentId, ulong volatileId)
+    {
+        // Cap outstanding async operations per connection (resource protection), as CHANGE_NOTIFY does.
+        if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
+            return BuildError(header, NtStatus.InsufficientResources);
+
+        ulong asyncId = connection.AllocateAsyncId();
+        var pending = new PendingAsyncRequest { MessageId = header.MessageId, AsyncId = asyncId, Owner = open };
+        var once = new NotifyOnce();
+        bool encrypt = ResponseNeedsEncryption(session, open);
+
+        void Complete(NtStatus status, byte[] body)
+        {
+            if (!once.TryFire()) return;
+            connection.PendingRequests.TryRemove(pending.MessageId, out _);
+            _ = SendAsyncFinalAsync(connection, header, session, asyncId, status, body, encrypt);
+        }
+
+        IDisposable subscription = registration.Notifications.Wait(n =>
+        {
+            byte[] pdu = WitnessEndpoint.BuildAsyncNotifyPdu(callId, n);
+            byte[] ioctlBody = IoctlMessage.BuildResponseBody(IoctlMessage.FsctlPipeTransceive, persistentId, volatileId, pdu);
+            Complete(NtStatus.Success, ioctlBody);
+        });
+
+        once.Attach(subscription);                 // if a buffered notification already fired, disposed here
+        connection.PendingRequests[header.MessageId] = pending;
+        pending.Token.Register(() => Complete(NtStatus.Cancelled, ErrorResponse.BuildBody()));
+
         return InterimResponse(header, session, asyncId);
     }
 

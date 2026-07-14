@@ -15,6 +15,7 @@ using Smb.Server.Quota;
 using Smb.Server.Rpc;
 using Smb.Server.Sharing;
 using Smb.Server.State;
+using Smb.Server.Witness;
 
 namespace Smb.Server;
 
@@ -142,6 +143,7 @@ public sealed partial class Smb2Dispatcher
             Session = session,
             TreeConnect = tree,
             GrantedAccess = grantedAccess,
+            ShareAccess = request.ShareAccess,
             PathName = request.Name,
         };
 
@@ -274,6 +276,14 @@ public sealed partial class Smb2Dispatcher
                 responseCtxList.Add(DurableHandleMessages.BuildV1ResponseContext());
             }
             session.Opens[open.Key] = open;
+
+            // [C2] A persistent (CA) handle must survive a full server restart: write its reconnect metadata
+            // to the durable store now, while the handle is live, so even a crash before a graceful disconnect
+            // leaves a record to rehydrate from.
+            if (open.IsPersistentHandle && _server.Options.DurableHandleStore is IPersistentHandleStore persistent)
+                persistent.Persist(new PersistentHandleRecord(
+                    open.PersistentFileId, open.VolatileFileId, OwnerKey(session.Identity), open.DurableCreateGuid,
+                    tree.Share.Name, open.PathName, open.GrantedAccess, open.ShareAccess));
         }
 
         // A newly created entry changes its parent directory's listing → break any directory lease
@@ -312,16 +322,11 @@ public sealed partial class Smb2Dispatcher
         CreateRequest request = CreateRequest.Parse(segment, Smb2Header.Size);
         string pipeName = request.Name.TrimStart('\\');
 
-        // Currently only srvsvc (share enumeration). Other pipes → not found.
-        if (!pipeName.Equals("srvsvc", StringComparison.OrdinalIgnoreCase))
-            return BuildError(header, NtStatus.ObjectNameNotFound);
+        IRpcEndpoint? endpoint = OpenRpcEndpoint(connection, session, pipeName);
+        if (endpoint is null)
+            return BuildError(header, NtStatus.ObjectNameNotFound); // unknown pipe
 
-        // Visible shares (filtered by the authorization policy) as the enumeration source.
-        var entries = new List<ShareEntry>();
-        foreach (IShare share in _server.GetVisibleShares(session.Identity ?? AnonymousIdentity, connection))
-            entries.Add(new ShareEntry(share.Name, SrvsvcEndpoint.MapStype(share.Type), share.Remark));
-
-        var pipe = new RpcPipe(new SrvsvcEndpoint(entries));
+        var pipe = new RpcPipe(endpoint);
 
         ulong volatileId = connection.AllocateFileId();
         var open = new SmbOpen
@@ -347,6 +352,32 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), response.ToBody());
     }
 
+    /// <summary>
+    /// Resolves a well-known IPC$ named pipe to its DCERPC endpoint, or null if the pipe is unknown.
+    /// <c>srvsvc</c> serves share enumeration; <c>witness</c> serves the MS-SWN witness service (C1).
+    /// </summary>
+    private IRpcEndpoint? OpenRpcEndpoint(SmbConnection connection, SmbSession session, string pipeName)
+    {
+        if (pipeName.Equals("srvsvc", StringComparison.OrdinalIgnoreCase))
+        {
+            // Visible shares (filtered by the authorization policy) as the enumeration source.
+            var entries = new List<ShareEntry>();
+            foreach (IShare share in _server.GetVisibleShares(session.Identity ?? AnonymousIdentity, connection))
+                entries.Add(new ShareEntry(share.Name, SrvsvcEndpoint.MapStype(share.Type), share.Remark));
+            return new SrvsvcEndpoint(entries);
+        }
+
+        if (pipeName.Equals("witness", StringComparison.OrdinalIgnoreCase))
+        {
+            string serverName = _server.Options.ServerName;
+            return new WitnessEndpoint(
+                _server.WitnessRegistrations, connection.ConnectionId,
+                () => WitnessEndpoint.SelfInterfaces(serverName));
+        }
+
+        return null;
+    }
+
     private async ValueTask<ResponseSegment?> HandleIoctlAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
@@ -369,6 +400,12 @@ public sealed partial class Smb2Dispatcher
             && TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open)
             && open.Pipe is { } pipe)
         {
+            // [C1.3] Witness WitnessrAsyncNotify is a long-pending call: send STATUS_PENDING now and the
+            // RESP_ASYNC_NOTIFY out-of-band once a failover event is queued (or on cancel/teardown).
+            if (pipe.Endpoint is WitnessEndpoint witness
+                && witness.TryBeginAsyncNotify(req.Input, out WitnessRegistration reg, out uint callId))
+                return BeginWitnessAsyncNotify(connection, header, session, open, reg, callId, req.PersistentId, req.VolatileId);
+
             byte[] output = pipe.Transceive(req.Input);
             return MaybeSigned(session, RespHeader(header, session),
                 IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, output));
@@ -834,6 +871,10 @@ public sealed partial class Smb2Dispatcher
         _server.Options.OplockManager.ReleaseOwner(open);
         _server.Options.LeaseManager.ReleaseOwner(open);
         if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
+
+        // [C2] A persistent handle is gone for good on CLOSE → drop its restart-surviving record.
+        if (open.IsPersistentHandle && _server.Options.DurableHandleStore is IPersistentHandleStore persistentStore)
+            persistentStore.RemovePersisted(open.PersistentFileId, open.VolatileFileId);
 
         // A DELETE_ON_CLOSE entry disappears from its parent directory on dispose → capture the path
         // beforehand and break the parent's directory lease afterwards (directory leasing, M1.3).
@@ -1457,6 +1498,7 @@ public sealed partial class Smb2Dispatcher
                 await handle.DisposeAsync().ConfigureAwait(false);
 
         CancelNonSurvivingPending(connection);
+        _server.WitnessRegistrations.RemoveAllForConnection(connection.ConnectionId); // [C1.4] drop witness registrations
     }
 
     public void OnConnectionClosed(SmbConnection connection)
@@ -1466,6 +1508,7 @@ public sealed partial class Smb2Dispatcher
                 handle.Dispose();
 
         CancelNonSurvivingPending(connection);
+        _server.WitnessRegistrations.RemoveAllForConnection(connection.ConnectionId); // [C1.4] drop witness registrations
     }
 
     /// <summary>
@@ -1567,8 +1610,10 @@ public sealed partial class Smb2Dispatcher
         Smb2Header header, SmbSession session, SmbTreeConnect tree, CreateContext reconnectCtx)
     {
         (ulong persistentId, ulong volatileId) = DurableHandleMessages.ParseReconnect(reconnectCtx.Data);
-        if (!TryClaimForReconnect(header, session, persistentId, volatileId, expectedGuid: null, out DurableHandle dh, out ResponseSegment error))
-            return error;
+        (DurableHandle? dh, ResponseSegment? error) =
+            await TryClaimForReconnectAsync(header, session, tree, persistentId, volatileId, expectedGuid: null).ConfigureAwait(false);
+        if (dh is null)
+            return error!.Value;
         return await RestoreDurableOpenAsync(header, session, tree, dh, DurableHandleMessages.BuildV1ResponseContext()).ConfigureAwait(false);
     }
 
@@ -1576,8 +1621,10 @@ public sealed partial class Smb2Dispatcher
         Smb2Header header, SmbSession session, SmbTreeConnect tree, CreateContext reconnectCtx)
     {
         DurableHandleMessages.V2Reconnect rc = DurableHandleMessages.ParseV2Reconnect(reconnectCtx.Data);
-        if (!TryClaimForReconnect(header, session, rc.PersistentId, rc.VolatileId, rc.CreateGuid, out DurableHandle dh, out ResponseSegment error))
-            return error;
+        (DurableHandle? dh, ResponseSegment? error) =
+            await TryClaimForReconnectAsync(header, session, tree, rc.PersistentId, rc.VolatileId, rc.CreateGuid).ConfigureAwait(false);
+        if (dh is null)
+            return error!.Value;
         CreateContext responseCtx = DurableHandleMessages.BuildV2ResponseContext(
             (uint)dh.Open.DurableTimeout.TotalMilliseconds, dh.IsPersistent);
         return await RestoreDurableOpenAsync(header, session, tree, dh, responseCtx).ConfigureAwait(false);
@@ -1585,44 +1632,114 @@ public sealed partial class Smb2Dispatcher
 
     /// <summary>
     /// Claims a durable open for a reconnect and validates it: exists, not expired, matching create GUID
-    /// (v2) and owned by the same principal. On any failure the handle is left intact (re-added when it
-    /// was claimed) and <paramref name="error"/> carries the status to return.
+    /// (v2) and owned by the same principal. Two sources are tried in order — the <b>warm</b> in-process
+    /// table (survives a TCP drop) and, for a persistent (CA) handle after a server restart, the <b>cold</b>
+    /// restart-surviving record, which is rehydrated into a live open (C2). On any failure the claimed entry
+    /// is left intact (re-added) and the returned <c>Error</c> carries the status; on success <c>Handle</c> is set.
     /// </summary>
-    private bool TryClaimForReconnect(
-        Smb2Header header, SmbSession session, ulong persistentId, ulong volatileId, Guid? expectedGuid,
-        out DurableHandle dh, out ResponseSegment error)
+    private async ValueTask<(DurableHandle? Handle, ResponseSegment? Error)> TryClaimForReconnectAsync(
+        Smb2Header header, SmbSession session, SmbTreeConnect tree, ulong persistentId, ulong volatileId, Guid? expectedGuid)
     {
-        error = default;
-        if (!_server.Options.DurableHandleStore.TryClaim(persistentId, volatileId, out dh))
+        // Warm path: a handle still live in this process (disconnected across a TCP drop).
+        if (_server.Options.DurableHandleStore.TryClaim(persistentId, volatileId, out DurableHandle dh))
         {
-            error = BuildError(header, NtStatus.ObjectNameNotFound); // unknown or already scavenged
-            return false;
+            // Expired but not yet scavenged → release it now and report as gone.
+            if (!dh.IsPersistent && dh.Deadline <= _server.Options.TimeProvider.GetUtcNow())
+            {
+                ReleaseDurable(dh);
+                return (null, BuildError(header, NtStatus.ObjectNameNotFound));
+            }
+            if (expectedGuid is { } guid && dh.CreateGuid != guid)
+            {
+                _server.Options.DurableHandleStore.Add(dh);
+                return (null, BuildError(header, NtStatus.ObjectNameNotFound));
+            }
+            if (!string.Equals(dh.OwnerKey, OwnerKey(session.Identity), StringComparison.Ordinal))
+            {
+                _server.Options.DurableHandleStore.Add(dh);
+                return (null, BuildError(header, NtStatus.AccessDenied));
+            }
+            return (dh, null);
         }
 
-        // Expired but not yet scavenged → release it now and report as gone.
-        if (!dh.IsPersistent && dh.Deadline <= _server.Options.TimeProvider.GetUtcNow())
+        // [C2] Cold path: after a restart the warm table is empty, but a persistent handle's record survives.
+        // Validate against the record metadata FIRST (no backend work), then rehydrate a live open.
+        if (_server.Options.DurableHandleStore is IPersistentHandleStore persistent
+            && persistent.TryClaimColdRecord(persistentId, volatileId, out PersistentHandleRecord record))
         {
-            ReleaseDurable(dh);
-            error = BuildError(header, NtStatus.ObjectNameNotFound);
-            return false;
+            if (expectedGuid is { } guid && record.CreateGuid != guid)
+            {
+                persistent.ReturnColdRecord(record);
+                return (null, BuildError(header, NtStatus.ObjectNameNotFound));
+            }
+            if (!string.Equals(record.OwnerKey, OwnerKey(session.Identity), StringComparison.Ordinal))
+            {
+                persistent.ReturnColdRecord(record);
+                return (null, BuildError(header, NtStatus.AccessDenied));
+            }
+
+            DurableHandle? rehydrated = await RehydrateColdRecordAsync(tree, record).ConfigureAwait(false);
+            if (rehydrated is null)
+            {
+                persistent.ReturnColdRecord(record);
+                return (null, BuildError(header, NtStatus.ObjectNameNotFound));
+            }
+            return (rehydrated, null);
         }
 
-        // A v2 reconnect must present the create GUID the handle was granted with (§3.3.5.9.12).
-        if (expectedGuid is { } guid && dh.CreateGuid != guid)
-        {
-            _server.Options.DurableHandleStore.Add(dh);
-            error = BuildError(header, NtStatus.ObjectNameNotFound);
-            return false;
-        }
+        return (null, BuildError(header, NtStatus.ObjectNameNotFound)); // unknown or already scavenged
+    }
 
-        // The reconnect must come from the same principal; otherwise keep the handle and refuse.
-        if (!string.Equals(dh.OwnerKey, OwnerKey(session.Identity), StringComparison.Ordinal))
+    /// <summary>
+    /// [C2] Rebuilds a live persistent open from a restart-surviving record: validates the reconnect share,
+    /// re-reserves the share-mode and re-opens the backend handle so the dispatcher can resume I/O on it.
+    /// Byte-range locks, oplocks and leases are not reconstructed (v1 scope). Returns null if the share is
+    /// gone, the share-mode conflicts, or the backend re-open fails.
+    /// </summary>
+    private async ValueTask<DurableHandle?> RehydrateColdRecordAsync(SmbTreeConnect tree, PersistentHandleRecord record)
+    {
+        if (!string.Equals(record.ShareName, tree.Share.Name, StringComparison.OrdinalIgnoreCase) || tree.Share.FileStore is null)
+            return null;
+
+        var open = new SmbOpen
         {
-            _server.Options.DurableHandleStore.Add(dh);
-            error = BuildError(header, NtStatus.AccessDenied);
-            return false;
+            PersistentFileId = record.PersistentId,
+            VolatileFileId = record.VolatileId,
+            GrantedAccess = record.GrantedAccess,
+            ShareAccess = record.ShareAccess,
+            PathName = record.Path,
+            IsDurable = true,
+            IsPersistentHandle = true,
+            DurableCreateGuid = record.CreateGuid,
+            DurableTimeout = _server.Options.DurableHandleTimeout,
+        };
+
+        FileAccessIntent access = MapAccess(record.GrantedAccess);
+        string shareKey = ShareModeKey(tree, record.Path);
+        if (!_server.Options.ShareModeManager.TryOpen(shareKey, open, access, MapShare(record.ShareAccess)))
+            return null;
+        open.ShareModeKey = shareKey;
+
+        FileStoreResult<FileCreateResult> result = await tree.Share.FileStore.CreateAsync(
+            record.Path, access, CreateDispositionIntent.Open, directoryRequired: false, nonDirectoryRequired: false)
+            .ConfigureAwait(false);
+        if (!result.IsSuccess)
+        {
+            _server.Options.ShareModeManager.Close(shareKey, open);
+            return null;
         }
-        return true;
+        open.LocalOpen = result.Value.Handle;
+
+        return new DurableHandle
+        {
+            PersistentId = record.PersistentId,
+            VolatileId = record.VolatileId,
+            Open = open,
+            Deadline = DateTimeOffset.MaxValue,
+            OwnerKey = record.OwnerKey,
+            CreateGuid = record.CreateGuid,
+            IsPersistent = true,
+        };
     }
 
     /// <summary>Re-attaches a validated durable open to the reconnecting session and answers as a CREATE.</summary>

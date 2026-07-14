@@ -71,6 +71,30 @@ public class DurableHandleTests : IDisposable
     }
 
     [Fact]
+    public void TreeConnect_ContinuousAvailabilityShare_AdvertisesCaCapability()
+    {
+        // [C1.0] A CA share advertises SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY on an SMB3 connection;
+        // a plain share (and the mandatory IPC$) does not.
+        Assert.True((TreeConnectCapabilities("CA") & (uint)ShareCapabilities.ContinuousAvailability) != 0);
+        Assert.True((TreeConnectCapabilities("Files") & (uint)ShareCapabilities.ContinuousAvailability) == 0);
+    }
+
+    /// <summary>Connects a fresh SMB3.1.1 client and returns the TREE_CONNECT response Capabilities field.</summary>
+    private uint TreeConnectCapabilities(string share)
+    {
+        var conn = new SmbConnection();
+        var c = new Client(conn);
+        _dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        var client = new NtlmClient("DOM", "alice", "pw");
+        byte[] r1 = _dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(c.NextMid(), 0, client.BuildNegotiate()));
+        c.Sid = Smb2Header.Read(r1).SessionId;
+        _dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(c.NextMid(), c.Sid, client.BuildAuthenticate(ExtractSecurityBuffer(r1))));
+        byte[] tc = _dispatcher.ProcessMessage(conn, TestHelpers.BuildTreeConnectRequest(c.NextMid(), c.Sid, $@"\\s\{share}"));
+        // TREE_CONNECT response body: StructureSize(2) ShareType(1) Reserved(1) ShareFlags(4) Capabilities(4).
+        return BinaryPrimitives.ReadUInt32LittleEndian(tc.AsSpan(Smb2Header.Size + 8, 4));
+    }
+
+    [Fact]
     public void DurableRequest_WithoutOplock_IsNotGranted()
     {
         Client c = Connect("alice");

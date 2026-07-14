@@ -21,10 +21,34 @@ public sealed class NdrWriter
         while (_w.Position % alignment != 0) _w.WriteByte(0);
     }
 
+    public void UInt16(ushort value)
+    {
+        Align(2);
+        _w.WriteUInt16(value);
+    }
+
     public void UInt32(uint value)
     {
         Align(4);
         _w.WriteUInt32(value);
+    }
+
+    /// <summary>Writes raw bytes verbatim (no alignment); used for fixed-size octet fields.</summary>
+    public void Bytes(ReadOnlySpan<byte> value)
+    {
+        foreach (byte b in value) _w.WriteByte(b);
+    }
+
+    /// <summary>
+    /// Writes a fixed-length WCHAR array (<paramref name="lengthChars"/> UTF-16 code units): the value is
+    /// NUL-terminated, then truncated or zero-padded to exactly the fixed width. No count prefix (NDR fixed array).
+    /// </summary>
+    public void FixedWideString(string value, int lengthChars)
+    {
+        Span<byte> chars = new byte[lengthChars * 2]; // zero-filled = NUL padding
+        int copy = Math.Min(value.Length, lengthChars - 1); // reserve one code unit for the terminator
+        if (copy > 0) Encoding.Unicode.GetBytes(value.AsSpan(0, copy), chars);
+        Bytes(chars);
     }
 
     /// <summary>Writes a new, unique (non-null) referent ID for a unique pointer.</summary>

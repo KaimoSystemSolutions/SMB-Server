@@ -266,6 +266,27 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
+    /// Sets durable/persistent handle storage (Phase 4 / C2). Default is process-local
+    /// (<see cref="InMemoryDurableHandleStore"/>): durable handles survive a TCP drop but not a restart.
+    /// A custom <see cref="IDurableHandleStore"/> — e.g. <see cref="FileDurableHandleStore"/> — can persist
+    /// continuously-available (persistent) handles across a full server restart.
+    /// </summary>
+    public SmbServerBuilder UseDurableHandleStore(IDurableHandleStore store)
+    {
+        _options.DurableHandleStore = store;
+        return this;
+    }
+
+    /// <summary>
+    /// Persists continuously-available (persistent) handles to <paramref name="directory"/> so they survive a
+    /// full server restart (C2): after a restart a reconnecting client's handle is rehydrated (backend re-opened,
+    /// share-mode re-reserved). Requires a share with <see cref="Share.ContinuousAvailability"/>. Convenience for
+    /// <c>UseDurableHandleStore(new FileDurableHandleStore(directory))</c>.
+    /// </summary>
+    public SmbServerBuilder UsePersistentDurableHandles(string directory)
+        => UseDurableHandleStore(new FileDurableHandleStore(directory));
+
+    /// <summary>
     /// Sets oplock management (SMB2 oplocks, Context §15). Default is process-local
     /// (<see cref="InMemoryOplockManager"/>); pass <see cref="NullOplockManager"/> to disable oplocks
     /// (CREATE then always grants <c>None</c>), or a custom <see cref="IOplockManager"/> to delegate to a

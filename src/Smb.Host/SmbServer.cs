@@ -76,6 +76,16 @@ public sealed class SmbServer : IAsyncDisposable
     public IReadOnlyCollection<IShare> Shares => _state.Shares.All;
 
     /// <summary>
+    /// [C1.4] Signals a resource/node availability change to witness-registered clients (MS-SWN): every client
+    /// that registered on <paramref name="netName"/> (case-insensitive; null/empty targets all) is asynchronously
+    /// notified so it can fail over. Returns the number of clients notified. Call this when a clustered resource
+    /// moves or a node goes down. Requires the affected share to advertise continuous availability (C1.0).
+    /// </summary>
+    public int NotifyWitnessResourceChange(
+        string? netName, Smb.Server.Witness.WitnessResourceChange change, string resourceName)
+        => _state.WitnessRegistrations.NotifyResourceChange(netName, change, resourceName);
+
+    /// <summary>
     /// Adds (or replaces) a share at runtime. New TREE_CONNECTs see it immediately; existing tree
     /// connections are unaffected. No restart required.
     /// </summary>

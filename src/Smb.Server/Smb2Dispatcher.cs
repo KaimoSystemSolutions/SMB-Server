@@ -884,6 +884,13 @@ public sealed partial class Smb2Dispatcher
             shareCaps |= ShareCapabilities.Dfs;
         }
 
+        // [C1.0] Continuous availability (SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY, §2.2.10): only valid on
+        // SMB 3.x. When advertised, the client requests persistent handles and (C1) may register with the
+        // witness service for fast failover. Gated on a real SMB3 connection so we never claim CA on a
+        // dialect that cannot honour the persistent-handle/witness contract.
+        if (share.ContinuousAvailability && connection.Dialect.IsSmb3OrLater())
+            shareCaps |= ShareCapabilities.ContinuousAvailability;
+
         var response = new TreeConnectResponse
         {
             ShareType = (byte)share.Type,

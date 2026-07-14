@@ -19,6 +19,9 @@ public sealed class RpcPipe
 
     public RpcPipe(IRpcEndpoint endpoint) => _endpoint = endpoint;
 
+    /// <summary>The bound endpoint (e.g. to detect a witness pipe for the long-pending AsyncNotify path).</summary>
+    public IRpcEndpoint Endpoint => _endpoint;
+
     /// <summary>Processes an incoming PDU and returns the response PDU (also buffered for READ).</summary>
     public byte[] Transceive(ReadOnlySpan<byte> requestPdu)
     {
