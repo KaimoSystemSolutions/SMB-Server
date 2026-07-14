@@ -72,31 +72,59 @@ themselves. That is a reader/writer relation with FIFO fairness (no writer starv
   (FIFO, no reordering); writer not starved by a shared stream; cancellation of a queued node unblocks
   the rest; eviction leaves no state.
 
-### A2b — Classify metadata ops as concurrency-eligible & wire the queue
-- Extend the read-loop classifier so single, non-compound CREATE/CLOSE/SET_INFO/QUERY_INFO/
-  QUERY_DIRECTORY/FLUSH (and the existing READ/WRITE) each `Reserve` a scope on the read loop:
-  - READ/WRITE/QUERY_INFO/QUERY_DIRECTORY → `Shared`, keyed `OpenScope(fileId)`.
-  - CLOSE/SET_INFO/FLUSH → `Exclusive`, keyed `OpenScope(fileId)`.
-  - CREATE → `Exclusive`, keyed `PathScope(treeId, normalizedName)` (parse the CREATE name on the read
-    loop to form the key).
-- The executing task `AcquireAsync`es its reservation before `DispatchOneAsync`. Lifecycle commands
-  (LOGOFF, TREE_DISCONNECT, SESSION_SETUP, NEGOTIATE, CANCEL) and compound/related requests stay
-  **barrier** ops (still drain all inflight first). Gate the whole metadata-concurrency behind an
-  option (default off until A3 lands + it is validated) so it can be rolled back.
-- **Files:** `src/Smb.Server/Smb2Dispatcher.Concurrency.cs`, `src/Smb.Host/SmbConnectionHandler.cs`,
-  `src/Smb.Server/SmbServerOptions.cs`.
-- **Tests:** `tests/Smb.Tests/ConcurrentMetadataDispatchTests.cs` — parallel CREATE/CLOSE on distinct
-  paths overlap; SET_INFO→CLOSE on the same FileId keep order; a LOGOFF drains inflight metadata ops
-  before tearing down the session; a CLOSE waits for an inflight WRITE on the same Open.
+### A2b — Classify metadata ops as concurrency-eligible & wire the queue ✅ DONE
+Gated behind `SmbServerOptions.ConcurrentMetadataOps` (**default off**). Read-loop classifier
+(`Smb2Dispatcher.TryClassifyConcurrent`) admits single, non-compound
+CREATE/CLOSE/SET_INFO/QUERY_INFO/QUERY_DIRECTORY/FLUSH (plus the existing READ/WRITE) and assigns:
+  - READ/WRITE/QUERY_INFO → `Shared`, keyed `OpenScope(fileId)`.
+  - CLOSE/SET_INFO/FLUSH/QUERY_DIRECTORY → `Exclusive`, keyed `OpenScope(fileId)`. QUERY_DIRECTORY is
+    exclusive because it mutates the open's paging cursor (A3 finding).
+  - **CREATE → runs free (no reservation).** *Refinement vs. the original PathScope plan:* a CREATE's
+    FileId does not exist yet, so no other frame can reference the Open it produces, and every store it
+    touches is atomic (A3) — so serializing CREATEs by path buys nothing. The natural request/response
+    dependency (a client can't send an op on a FileId it hasn't been given) means per-Open ops always
+    arrive after their CREATE is client-observably complete, so no CREATE↔per-Open ordering is needed.
+- **Ordering is fixed on the read loop, not at acquisition.** `TryBeginConcurrentFrame` only classifies +
+  consumes the sequence window; the host takes the reservation via `ReserveScope` **after** its `_ioGate`
+  (still on the serial read loop, so arrival order holds) — this also means a gate-cancelled frame never
+  orphans a reservation. The executing task `AcquireAsync`es before `DispatchOneAsync` and releases via
+  `using` (success or error). FileId for the scope key is read on the read loop by `TryReadFileId`
+  (reuses validated parsers; no-copy direct read for READ/WRITE/FLUSH). Lifecycle
+  (LOGOFF/TREE_DISCONNECT/SESSION_SETUP/NEGOTIATE/CANCEL) and compound stay **barrier** ops.
+- **Files:** `src/Smb.Server/Smb2Dispatcher.Concurrency.cs` (rewritten), `src/Smb.Host/SmbConnectionHandler.cs`
+  (`ReserveScope` after gate; pass `ct` to `ExecutePreparedFrameAsync`), `src/Smb.Server/SmbServerOptions.cs`.
+- **Tests:** `tests/Smb.Tests/ConcurrentMetadataDispatchTests.cs` (6, green) — classifier accepts metadata
+  ops with the feature on / rejects with it off / lifecycle stays barrier; **CLOSE waits for an inflight
+  WRITE on the same Open**; a metadata op on a different Open is not blocked; a concurrent CLOSE really
+  removes the Open (follow-up CLOSE → FILE_CLOSED); end-to-end CREATE→QUERY_INFO→CLOSE over the real host
+  loop (TCP) with the feature on. Full suite **489/489 green** (feature off = zero behavior change).
 
-### A3 — Make state stores safe for concurrent metadata ops
-- Audit `SmbSession.Opens`, `SmbTreeConnect`, `DurableHandleStore`, `InMemoryShareModeManager`,
-  `InMemoryLockManager`, `InMemoryLeaseManager`, `InMemoryOplockManager` for races once the barrier
-  is gone. Convert plain `Dictionary`/`List` open-tables to concurrent/guarded structures where a
-  metadata op now mutates them off the read loop.
-- **Files:** `src/Smb.Server/State/*.cs`, `src/Smb.Server/Sharing/*`, `src/Smb.Server/Durable/*`.
-- **Tests:** stress test in `ConcurrentMetadataDispatchTests` — N parallel opens/closes on one
-  session, assert `Opens` count consistency and no lost/duplicate FileIds.
+### A3 — Make state stores safe for concurrent metadata ops ✅ DONE (audit + hardening test)
+**Audit result — the shared stores were already concurrency-safe:**
+- `SmbSession.Opens` / `TreeConnects` / `Channels` are `ConcurrentDictionary` (`SmbSession.cs:61-70`).
+- `InMemoryShareModeManager`, `InMemoryLockManager`, `InMemoryLeaseManager`, `InMemoryOplockManager`
+  each guard their internal `Dictionary`/`List`/`HashSet` with a single `lock (_gate)` around the whole
+  check-then-act — atomic.
+- `InMemoryDurableHandleStore` is `ConcurrentDictionary`-based; `TryClaim` = atomic `TryRemove`.
+- All server/connection IDs (`Session`/`Persistent`/`Tree`/`File`/`Async`) are allocated via
+  `Interlocked.Increment` — no torn IDs under parallel CREATE.
+- The CREATE flow rolls the share-mode reservation back on every failure branch (backend error, DACL
+  deny, delete-on-close deny), so a losing concurrent CREATE leaves no orphan reservation.
+
+**The one genuinely new concern is per-`SmbOpen` mutable field ownership**, not the shared stores:
+`SmbOpen.DirectoryListing`/`DirectoryCursor` (QUERY_DIRECTORY paging) and `ResumeKey` are mutated by
+the op holding the open. The A2b keying model protects them: same-Open exclusive ops serialize, and
+QUERY_DIRECTORY is therefore classified **Exclusive** (not Shared) — see A2b. READ/WRITE staying
+`Shared` is safe because SMB2 READ/WRITE carry explicit offsets (no shared cursor on the open).
+
+**Observation (not fixed — out of scope):** `SmbTreeConnect.OpenCount` is incremented (Interlocked) at
+both CREATE sites but never decremented and never read anywhere — dead write-only state, no race.
+
+- **Files:** audit only; no store changes needed.
+- **Tests:** `tests/Smb.Tests/ShareModeManagerConcurrencyTests.cs` (2, green) — 8 threads × 20k
+  exclusive open attempts never observe two concurrent holders (atomic check-then-insert); compatible
+  shares all coexist then drain clean. The full dispatch-level parallel open/close stress test is
+  deferred to **A2b** (needs the concurrent path wired).
 
 ### A4 — Close the async contract (small, from review #2)
 - Convert the two remaining sync `Dispose()` teardown sites to `DisposeAsync()`
@@ -200,4 +228,31 @@ themselves. That is a reader/writer relation with FIFO fairness (no writer starv
        FIRST, and the metadata-concurrency must ship behind a default-off option for rollback. -->
   Next action: **A3** (make state stores concurrency-safe) — audit `SmbSession.Opens` &
   managers — then **A2b** (read-loop classifier + `Reserve`/`AcquireAsync` wiring, option-gated).
+- **2026-07-14** — **A3 done (audit + hardening test).** Finding: the shared stores are already
+  concurrency-safe (ConcurrentDictionary open-tables, `lock`-guarded managers, Interlocked IDs, CREATE
+  rolls back share-mode on every failure branch) — no store changes required. The real new concern is
+  per-`SmbOpen` mutable-field ownership (`DirectoryListing`/`DirectoryCursor`), which drove an **A2b
+  classification fix**: QUERY_DIRECTORY is **Exclusive** on `OpenScope` (not Shared), else two scans on
+  one directory open corrupt the paging cursor. Added `tests/Smb.Tests/ShareModeManagerConcurrencyTests.cs`
+  (2, green) locking in the atomic check-then-insert. Noted dead write-only `SmbTreeConnect.OpenCount`
+  (never read/decremented — not a race, left as-is).
+  Next action: **A2b** — the invasive wiring. Steps: (1) add default-off option
+  `SmbServerOptions.ConcurrentMetadataOps`; (2) read-loop classifier computes `(scope, mode)` per
+  eligible frame and calls `Reserve` in arrival order; (3) executing task `AcquireAsync`es before
+  `DispatchOneAsync`; (4) lifecycle/compound stay barrier; (5) `ConcurrentMetadataDispatchTests`
+  incl. the deferred parallel open/close stress test + SET_INFO→CLOSE ordering + CLOSE-waits-for-WRITE.
+- **2026-07-14** — **A2b DONE — the metadata-throughput fix is functional** (behind default-off
+  `ConcurrentMetadataOps`). Wiring: `TryBeginConcurrentFrame` classifies + consumes the seq window;
+  host takes the per-Open reservation via new `ReserveScope` **after** the `_ioGate` (avoids orphaning a
+  reservation on gate-cancel); `ExecutePreparedFrameAsync` acquires (FIFO shared/exclusive) then
+  dispatches, releasing via `using`. **Design refinement:** CREATE runs **free** (no PathScope) — its
+  FileId doesn't exist yet + atomic stores + request/response FileId dependency make per-Open ordering
+  automatic; documented in A2b. FileId scope key read on the read loop by `TryReadFileId` (reuses the
+  validated parsers; no-copy for READ/WRITE/FLUSH — offsets cross-checked against `TestHelpers` builders).
+  Tests: `ConcurrentMetadataDispatchTests` (6, incl. CLOSE-waits-for-WRITE and an end-to-end TCP run).
+  **Suite 489/489 green; feature off = byte-identical behavior** (existing 483 unchanged).
+  <!-- NOTE consumers enable it via SmbServerBuilder.Configure(o => o.ConcurrentMetadataOps = true);
+       requires MaxConcurrentFileOpsPerConnection > 1 (the concurrent path). -->
+  Next action: **A4** (mark `IFileHandle.Dispose()`/`GetInfo()` `[Obsolete]`; the 2 sync teardown
+  Dispose() sites were already converted earlier) then **A5** (metadata-throughput micro-benchmark).
 - _(append progress entries here as milestones complete; check items off in the phase sections)_

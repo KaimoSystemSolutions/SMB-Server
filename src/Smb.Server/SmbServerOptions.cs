@@ -123,6 +123,19 @@ public sealed class SmbServerOptions
     /// </summary>
     public int MaxConcurrentFileOpsPerConnection { get; set; } = 8;
 
+    /// <summary>
+    /// Also process metadata ops (CREATE/CLOSE/SET_INFO/QUERY_INFO/QUERY_DIRECTORY/FLUSH) concurrently
+    /// instead of on the per-connection barrier (docs/ENTERPRISE_HARDENING_ROADMAP.md, A2b). Ordering and
+    /// resource-lifetime safety are preserved by a per-Open reader/writer queue: READ/WRITE/QUERY_INFO
+    /// take a shared lock on their Open (run in parallel), CLOSE/SET_INFO/FLUSH/QUERY_DIRECTORY take an
+    /// exclusive lock (serialize after inflight I/O of the same Open), CREATE runs free (its FileId does
+    /// not exist yet, so nothing can reference it). Requires <see cref="MaxConcurrentFileOpsPerConnection"/>
+    /// &gt; 1 (the concurrent path). Lifecycle/compound requests still act as a barrier.
+    /// <para><b>Default off</b> while this rolls out — turn on to break the metadata-throughput bottleneck
+    /// (e.g. delete-heavy backup/AV/dev workloads).</para>
+    /// </summary>
+    public bool ConcurrentMetadataOps { get; set; }
+
     /// <summary>SPNEGO negotiator (auth). Required — e.g. NTLM-based or (test) <see cref="DevSpnegoNegotiator"/>.</summary>
     public ISpnegoNegotiator? SpnegoNegotiator { get; set; }
 

@@ -155,6 +155,9 @@ internal sealed class SmbConnectionHandler
                     && _dispatcher.TryBeginConcurrentFrame(connection, message, transportEncrypted, out Smb2Dispatcher.PreparedFrame prepared))
                 {
                     await _ioGate.WaitAsync(connCt).ConfigureAwait(false); // cap: waits until a slot is free
+                    // Take the per-Open scope AFTER the gate, still on the (serial) read loop so arrival
+                    // order is preserved — and so a gate-cancelled frame never orphans a reservation.
+                    prepared = _dispatcher.ReserveScope(prepared);
                     lock (_inflight)
                     {
                         _inflight.RemoveAll(t => t.IsCompleted);
@@ -288,7 +291,7 @@ internal sealed class SmbConnectionHandler
     {
         try
         {
-            byte[] response = await _dispatcher.ExecutePreparedFrameAsync(connection, frame).ConfigureAwait(false);
+            byte[] response = await _dispatcher.ExecutePreparedFrameAsync(connection, frame, ct).ConfigureAwait(false);
             if (response.Length != 0)
                 await SendFramedAsync(stream, connection, response, forceEncrypt: false, ct).ConfigureAwait(false);
         }
