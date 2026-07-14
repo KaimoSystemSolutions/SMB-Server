@@ -370,9 +370,11 @@ public sealed partial class Smb2Dispatcher
         if (pipeName.Equals("witness", StringComparison.OrdinalIgnoreCase))
         {
             string serverName = _server.Options.ServerName;
+            var nicProvider = _server.Options.NetworkInterfaceProvider;
+            // Snapshot the live NICs per GetInterfaceList call (same source multichannel advertises).
             return new WitnessEndpoint(
                 _server.WitnessRegistrations, connection.ConnectionId,
-                () => WitnessEndpoint.SelfInterfaces(serverName));
+                () => WitnessEndpoint.FromNetworkInterfaces(serverName, nicProvider.GetInterfaces()));
         }
 
         return null;

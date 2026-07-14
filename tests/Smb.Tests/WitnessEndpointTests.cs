@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Net;
+using Smb.Protocol.Messages;
 using Smb.Protocol.Wire;
 using Smb.Server.Rpc;
 using Smb.Server.Witness;
@@ -116,6 +118,46 @@ public class WitnessEndpointTests
 
         Assert.Equal(2, _store.RemoveAllForConnection(_conn));
         Assert.Single(_store.Snapshot());
+    }
+
+    [Fact]
+    public void FromNetworkInterfaces_MapsIPv4Nics_AndSkipsIPv6()
+    {
+        var nics = new[]
+        {
+            new NetworkInterfaceInfo(1, NetworkInterfaceCapability.None, 1_000_000_000, IPAddress.Parse("10.0.0.5")),
+            new NetworkInterfaceInfo(2, NetworkInterfaceCapability.None, 1_000_000_000, IPAddress.Parse("fe80::1")),
+            new NetworkInterfaceInfo(3, NetworkInterfaceCapability.None, 1_000_000_000, IPAddress.Parse("192.168.1.20")),
+        };
+
+        IReadOnlyList<WitnessInterfaceInfo> ifs = WitnessEndpoint.FromNetworkInterfaces("NODE1", nics);
+
+        Assert.Equal(2, ifs.Count); // the IPv6 address is skipped
+        Assert.All(ifs, i =>
+        {
+            Assert.Equal("NODE1", i.InterfaceGroupName);
+            Assert.Equal(WitnessNodeState.Available, i.NodeState);
+            Assert.True(i.Flags.HasFlag(WitnessInterfaceFlags.IPv4Valid));
+            Assert.True(i.Flags.HasFlag(WitnessInterfaceFlags.InterfaceWitness));
+        });
+        // IPV4 is the address bytes read little-endian (network-order bytes reproduced on a LE wire write).
+        Assert.Equal(BinaryPrimitives.ReadUInt32LittleEndian(IPAddress.Parse("10.0.0.5").GetAddressBytes()), ifs[0].IPv4);
+        Assert.Equal(BinaryPrimitives.ReadUInt32LittleEndian(IPAddress.Parse("192.168.1.20").GetAddressBytes()), ifs[1].IPv4);
+    }
+
+    [Fact]
+    public void FromNetworkInterfaces_NoIPv4_FallsBackToSelfInterface()
+    {
+        var nics = new[]
+        {
+            new NetworkInterfaceInfo(1, NetworkInterfaceCapability.None, 1_000_000_000, IPAddress.Parse("fe80::1")),
+        };
+
+        IReadOnlyList<WitnessInterfaceInfo> ifs = WitnessEndpoint.FromNetworkInterfaces("NODE1", nics);
+
+        Assert.Single(ifs);
+        Assert.Equal("NODE1", ifs[0].InterfaceGroupName);
+        Assert.Equal(0u, ifs[0].IPv4); // the self-interface sentinel
     }
 
     // --- helpers ------------------------------------------------------------------------------------

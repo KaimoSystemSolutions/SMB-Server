@@ -156,8 +156,31 @@ public sealed class WitnessRegistrationStore
     /// the client's next AsyncNotify. Returns the number of registrations notified.
     /// </summary>
     public int NotifyResourceChange(string? netName, WitnessResourceChange change, string resourceName)
+        => Notify(netName, WitnessNotifyType.ResourceChange, WitnessWire.EncodeResourceChange(change, resourceName));
+
+    /// <summary>
+    /// [C1.4] Server-side failover trigger: tells every registration monitoring <paramref name="netName"/> to
+    /// move to <paramref name="destination"/> (a CLIENT_MOVE notification — MS-SWN §3.1.4, the SMB client
+    /// reconnects the session to the given addresses). See <see cref="NotifyResourceChange"/> for matching rules.
+    /// </summary>
+    public int NotifyClientMove(string? netName, IReadOnlyList<WitnessIpAddr> destination)
+        => Notify(netName, WitnessNotifyType.ClientMove, WitnessWire.EncodeIpAddrInfoList(destination));
+
+    /// <summary>[C1.4] SHARE_MOVE trigger: the monitored share has moved to <paramref name="destination"/>.</summary>
+    public int NotifyShareMove(string? netName, IReadOnlyList<WitnessIpAddr> destination)
+        => Notify(netName, WitnessNotifyType.ShareMove, WitnessWire.EncodeIpAddrInfoList(destination));
+
+    /// <summary>[C1.4] IP_CHANGE trigger: the set of witness/service IP addresses changed to <paramref name="addresses"/>.</summary>
+    public int NotifyIpChange(string? netName, IReadOnlyList<WitnessIpAddr> addresses)
+        => Notify(netName, WitnessNotifyType.IpChange, WitnessWire.EncodeIpAddrInfoList(addresses));
+
+    /// <summary>
+    /// Pushes one <paramref name="messageBuffer"/> of type <paramref name="type"/> to every registration whose
+    /// monitored net name matches <paramref name="netName"/> (case-insensitive; null/empty matches all). A waiting
+    /// <c>WitnessrAsyncNotify</c> completes immediately, otherwise it is buffered. Returns the count notified.
+    /// </summary>
+    private int Notify(string? netName, WitnessNotifyType type, byte[] messageBuffer)
     {
-        byte[] buffer = WitnessWire.EncodeResourceChange(change, resourceName);
         int notified = 0;
         foreach (WitnessRegistration reg in _byId.Values)
         {
@@ -165,9 +188,9 @@ public sealed class WitnessRegistrationStore
                 continue;
             reg.Notifications.Push(new WitnessNotification
             {
-                Type = WitnessNotifyType.ResourceChange,
+                Type = type,
                 MessageCount = 1,
-                MessageBuffer = buffer,
+                MessageBuffer = messageBuffer,
             });
             notified++;
         }

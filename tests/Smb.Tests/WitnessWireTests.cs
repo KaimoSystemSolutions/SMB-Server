@@ -133,4 +133,51 @@ public class WitnessWireTests
         string name = Encoding.Unicode.GetString(body.Slice(8, body.Length - 8)).TrimEnd('\0');
         Assert.Equal("Data", name);
     }
+
+    [Fact]
+    public void EncodeIpAddrInfoList_LaysOutHeaderAndEntries()
+    {
+        var addrs = new[]
+        {
+            new WitnessIpAddr(WitnessIpAddrFlags.IPv4 | WitnessIpAddrFlags.Online, IPv4: 0x0100000A),
+            new WitnessIpAddr(WitnessIpAddrFlags.IPv4 | WitnessIpAddrFlags.Offline, IPv4: 0x0200000A),
+        };
+
+        byte[] body = WitnessWire.EncodeIpAddrInfoList(addrs);
+
+        Assert.Equal(12 + 2 * 24, body.Length);
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0, 4)));  // Reserved
+        Assert.Equal((uint)body.Length, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4, 4))); // Length
+        Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(8, 4)));  // IPAddrInstances
+
+        // First entry: Flags(4) IPV4(4) IPV6[16].
+        Assert.Equal((uint)(WitnessIpAddrFlags.IPv4 | WitnessIpAddrFlags.Online), BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(12, 4)));
+        Assert.Equal(0x0100000Au, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(16, 4)));
+        for (int k = 0; k < 16; k++) Assert.Equal(0, body[20 + k]); // IPV6 zero-filled
+
+        // Second entry starts at 12 + 24.
+        Assert.Equal(0x0200000Au, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(36 + 4, 4)));
+    }
+
+    [Theory]
+    [InlineData(WitnessNotifyType.ClientMove)]
+    [InlineData(WitnessNotifyType.ShareMove)]
+    [InlineData(WitnessNotifyType.IpChange)]
+    public void EncodeAsyncNotify_WithIpAddrList_CarriesTypeAndBody(WitnessNotifyType type)
+    {
+        byte[] msg = WitnessWire.EncodeIpAddrInfoList(
+            [new WitnessIpAddr(WitnessIpAddrFlags.IPv4 | WitnessIpAddrFlags.Online, IPv4: 0x0100000A)]);
+        byte[] stub = WitnessWire.EncodeAsyncNotifyResponse(type, 1, msg);
+
+        var r = new NdrReader(stub);
+        Assert.NotEqual(0u, r.ReferentId());          // pResp
+        Assert.Equal((uint)type, r.UInt32());         // MessageType
+        uint length = r.UInt32();
+        Assert.Equal((uint)msg.Length, length);
+        Assert.Equal(1u, r.UInt32());                 // NumberOfMessages
+        Assert.NotEqual(0u, r.ReferentId());          // -> MessageBuffer
+        Assert.Equal((uint)msg.Length, r.UInt32());   // max_count
+        ReadOnlySpan<byte> body = r.Bytes((int)length);
+        Assert.True(body.SequenceEqual(msg));
+    }
 }

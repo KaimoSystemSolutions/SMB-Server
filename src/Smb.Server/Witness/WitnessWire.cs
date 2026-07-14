@@ -58,6 +58,20 @@ public enum WitnessResourceChange : uint
     Unavailable = 0x000000FF,
 }
 
+/// <summary>WITNESS_IPADDR_INFO flags (MS-SWN §2.2.2.4 <c>Flags</c>) — carried by CLIENT_MOVE / SHARE_MOVE / IP_CHANGE.</summary>
+[Flags]
+public enum WitnessIpAddrFlags : uint
+{
+    None = 0,
+    IPv4 = 0x00000001,
+    IPv6 = 0x00000002,
+    Online = 0x00000008,
+    Offline = 0x00000010,
+}
+
+/// <summary>One WITNESS_IPADDR_INFO (MS-SWN §2.2.2.4): a destination/changed address for a move/IP-change message.</summary>
+public sealed record WitnessIpAddr(WitnessIpAddrFlags Flags, uint IPv4, byte[]? IPv6 = null);
+
 /// <summary>One witness interface advertised by <c>WitnessrGetInterfaceList</c>.</summary>
 public sealed record WitnessInterfaceInfo(
     string InterfaceGroupName,
@@ -157,6 +171,32 @@ public static class WitnessWire
         w.WriteUInt32((uint)(8 + name.Length)); // Length (whole structure)
         w.WriteUInt32((uint)change);            // ChangeType
         w.WriteBytes(name);
+        return w.ToArray();
+    }
+
+    /// <summary>Byte length of one custom-marshaled WITNESS_IPADDR_INFO: <c>Flags(4) IPV4(4) IPV6[16]</c>.</summary>
+    private const int IpAddrInfoSize = 24;
+
+    /// <summary>
+    /// Custom-marshaled WITNESS_IPADDR_INFO_LIST (MS-SWN §2.2.2.4): <c>Reserved(4) Length(4) IPAddrInstances(4)</c>
+    /// then one <c>Flags(4) IPV4(4) IPV6[16]</c> entry per address (little-endian, not NDR-aligned). This is the
+    /// <c>MessageBuffer</c> content for <see cref="WitnessNotifyType.ClientMove"/>, <see cref="WitnessNotifyType.ShareMove"/>,
+    /// and <see cref="WitnessNotifyType.IpChange"/> notifications.
+    /// </summary>
+    public static byte[] EncodeIpAddrInfoList(IReadOnlyList<WitnessIpAddr> addresses)
+    {
+        int length = 12 + addresses.Count * IpAddrInfoSize;
+        var w = new GrowableWriter(length);
+        w.WriteUInt32(0);                     // Reserved
+        w.WriteUInt32((uint)length);          // Length (whole structure)
+        w.WriteUInt32((uint)addresses.Count); // IPAddrInstances
+        foreach (WitnessIpAddr a in addresses)
+        {
+            w.WriteUInt32((uint)a.Flags);
+            w.WriteUInt32(a.IPv4);
+            if (a.IPv6 is { Length: 16 }) w.WriteBytes(a.IPv6);
+            else for (int k = 0; k < 16; k++) w.WriteByte(0); // IPV6[16] (zero when IPv4-only)
+        }
         return w.ToArray();
     }
 

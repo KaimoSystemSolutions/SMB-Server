@@ -54,6 +54,43 @@ public class WitnessAsyncNotifyTests
         Assert.Equal((uint)WitnessNotifyType.ResourceChange, r.UInt32());
     }
 
+    [Theory]
+    [InlineData(WitnessNotifyType.ClientMove)]
+    [InlineData(WitnessNotifyType.ShareMove)]
+    [InlineData(WitnessNotifyType.IpChange)]
+    public void AsyncNotify_DeliversMoveNotification_WithMatchingType(WitnessNotifyType expected)
+    {
+        var (d, state, conn, sid, tid) = Setup();
+        (ulong pid, ulong vid) = CreateWitnessPipe(d, conn, sid, tid);
+        byte[] handle = Register(d, conn, sid, tid, pid, vid);
+
+        var sent = new ConcurrentQueue<byte[]>();
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
+
+        byte[] interim = Transceive(d, conn, sid, tid, pid, vid, mid: 10, BuildRequestPdu(10, (ushort)WitnessOpnum.AsyncNotify, handle));
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(interim).Status);
+
+        // Server-side trigger via the public failover API (C1.4): move the client to a new address.
+        var dest = new[] { new WitnessIpAddr(WitnessIpAddrFlags.IPv4 | WitnessIpAddrFlags.Online, IPv4: 0x0100000A) };
+        int notified = expected switch
+        {
+            WitnessNotifyType.ClientMove => state.WitnessRegistrations.NotifyClientMove(@"\\cluster", dest),
+            WitnessNotifyType.ShareMove => state.WitnessRegistrations.NotifyShareMove(@"\\cluster", dest),
+            WitnessNotifyType.IpChange => state.WitnessRegistrations.NotifyIpChange(@"\\cluster", dest),
+            _ => throw new ArgumentOutOfRangeException(nameof(expected)),
+        };
+        Assert.Equal(1, notified);
+
+        byte[] final = WaitForSend(sent);
+        Smb2Header fh = Smb2Header.Read(final);
+        Assert.Equal(NtStatus.Success, fh.Status);
+        Assert.True(fh.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand));
+
+        var r = new NdrReader(DcerpcStub(IoctlOutput(final)));
+        Assert.NotEqual(0u, r.ReferentId());
+        Assert.Equal((uint)expected, r.UInt32());
+    }
+
     [Fact]
     public void Cancel_AbortsPendingAsyncNotify_WithStatusCancelled()
     {

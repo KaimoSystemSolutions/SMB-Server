@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.Net.Sockets;
+using Smb.Protocol.Messages;
 using Smb.Protocol.Wire;
 using Smb.Server.Rpc;
 
@@ -40,6 +43,33 @@ public sealed class WitnessEndpoint : IRpcEndpoint
             serverName, WitnessVersion.V1, WitnessNodeState.Available,
             IPv4: 0, WitnessInterfaceFlags.InterfaceWitness),
     ];
+
+    /// <summary>
+    /// Builds the <c>WitnessrGetInterfaceList</c> reply from the server's live NICs (the same
+    /// <c>INetworkInterfaceProvider</c> source multichannel advertises): one available, witness-serving
+    /// WITNESS_INTERFACE_INFO per IPv4 address, named <paramref name="serverName"/>. IPv6-only addresses are
+    /// skipped — the WITNESS_INTERFACE_INFO IPV4/IPV6 split advertises IPv4 here (IPv6 payload is a documented
+    /// follow-up). Falls back to <see cref="SelfInterfaces"/> when no IPv4 interface is available, so the call
+    /// always yields at least the serving node rather than an empty list.
+    /// </summary>
+    public static IReadOnlyList<WitnessInterfaceInfo> FromNetworkInterfaces(
+        string serverName, IReadOnlyList<NetworkInterfaceInfo> nics)
+    {
+        var list = new List<WitnessInterfaceInfo>();
+        foreach (NetworkInterfaceInfo nic in nics)
+        {
+            if (nic.Address.AddressFamily != AddressFamily.InterNetwork)
+                continue; // IPv4 only (see remarks)
+
+            // The IPV4 field is the 4 address bytes in network order; read LE so a little-endian
+            // wire write reproduces them in order (matches EncodeInterfaceList / its golden test).
+            uint ipv4 = BinaryPrimitives.ReadUInt32LittleEndian(nic.Address.GetAddressBytes());
+            list.Add(new WitnessInterfaceInfo(
+                serverName, WitnessVersion.V1, WitnessNodeState.Available,
+                ipv4, WitnessInterfaceFlags.IPv4Valid | WitnessInterfaceFlags.InterfaceWitness));
+        }
+        return list.Count > 0 ? list : SelfInterfaces(serverName);
+    }
 
     /// <summary>
     /// If <paramref name="pdu"/> is a <c>WitnessrAsyncNotify</c> request for a live registration owned by

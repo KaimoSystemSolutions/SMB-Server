@@ -467,6 +467,7 @@ reuses that template but completes with an IOCTL (FSCTL_PIPE_TRANSCEIVE) async f
   (the CI tests drive the wire/dispatch paths but not a genuine SMB witness client). Deferred niceties (not
   blocking): real per-NIC interface list in GetInterfaceList (currently a single self-interface, IPv4=0);
   ClientMove/ShareMove/IpChange notify types are encodable but no trigger API yet (only ResourceChange shipped).
+  _(Update 2026-07-14: both deferred items are now DONE — the three move/IP notify types have encoders + trigger APIs (C1.6) and GetInterfaceList reports the real per-NIC list (C1.7); see the entries below. C1 has no remaining deferred niceties; the only open item is interop against a real Windows witness client.)_
   Next action (C-phase): **C2** — durable persistent-handle store (survives restart), or **D** (OTel / resource
   limits / fuzzing) per target market — user's call.
 - **2026-07-14** — **C2 DONE → Phase C (HA) COMPLETE.** Restart-surviving persistent handles shipped:
@@ -480,4 +481,26 @@ reuses that template but completes with an IOCTL (FSCTL_PIPE_TRANSCEIVE) async f
   — the async reconnect refactor + persist wiring caused zero regressions in the durable-handle tests.
   Phase C (C1 Witness + C2 persistent store) is complete. Remaining in this roadmap: **Phase D** (D1 OTel,
   D2 resource limits, D3 fuzzing/conformance) — Ops hardening, independently startable, user's call.
+- **2026-07-14** — **C1.6 — Move/IP notify types shipped (closes most of the C1 deferred caveat).** Added the
+  three remaining MS-SWN async-notify message types alongside the existing ResourceChange: `WITNESS_IPADDR_INFO_LIST`
+  wire body (`WitnessIpAddr` + `WitnessIpAddrFlags` + `WitnessWire.EncodeIpAddrInfoList`, §2.2.2.4 — shared by
+  CLIENT_MOVE/SHARE_MOVE/IP_CHANGE, only the `MessageType` differs) and public trigger APIs
+  `WitnessRegistrationStore.NotifyClientMove/NotifyShareMove/NotifyIpChange` (the per-type `NotifyResourceChange`
+  logic refactored into a shared private `Notify(netName, type, buffer)`). Tests: `WitnessWireTests` +4 (IPADDR
+  list layout golden + AsyncNotify-wraps-type theory ×3) and `WitnessAsyncNotifyTests` +3 (e2e theory driving each
+  move type through the real IOCTL/dispatcher path → asserts `MessageType` in the out-of-band RESP_ASYNC_NOTIFY).
+  **Full suite 531/531 green.** Still deferred (not blocking): real per-NIC interface list in `GetInterfaceList`
+  (still a single self-interface, IPv4=0). The only true interop gap remaining is a real Windows witness client;
+  next-best automatable closers discussed: golden byte-vectors from the MS-SWN spec + Samba `smbtorture smb2.witness`.
+- **2026-07-14** — **C1.7 — real per-NIC GetInterfaceList (closes the last C1 deferred item).** `WitnessrGetInterfaceList`
+  no longer returns a single self-interface with IPv4=0. New mapper `WitnessEndpoint.FromNetworkInterfaces(serverName, nics)`
+  reuses the existing multichannel `INetworkInterfaceProvider` (`SmbServerOptions.NetworkInterfaceProvider`,
+  default `SystemNetworkInterfaceProvider`) — one available, witness-serving `WITNESS_INTERFACE_INFO` per IPv4
+  address (IPV4 = address bytes read LE so a LE wire write reproduces network order; flags IPv4Valid|InterfaceWitness).
+  IPv6-only addresses skipped (the WITNESS_INTERFACE_INFO IPv4/IPv6 split advertises IPv4; IPv6 payload is a
+  documented follow-up). Falls back to `SelfInterfaces` when no IPv4 NIC is enumerable → the call never returns
+  empty. Wired in `OpenRpcEndpoint` (snapshots live NICs per call). Tests: `WitnessEndpointTests` +2 (maps IPv4 /
+  skips IPv6 with correct IPV4 uint + flags; IPv6-only → self-interface fallback). **Full suite 531 → 533 green.**
+  **C1 has no remaining deferred niceties** — the only open item is genuine interop against a real Windows witness
+  client (automatable closers still noted: MS-SWN golden byte-vectors + Samba `smbtorture smb2.witness`).
 - _(append progress entries here as milestones complete; check items off in the phase sections)_
