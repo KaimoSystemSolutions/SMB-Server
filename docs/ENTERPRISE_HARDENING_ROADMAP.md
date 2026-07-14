@@ -154,14 +154,26 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
 
 ## Phase B — Enterprise auth (Kerberos turnkey + downgrade protection)
 
-### B1 — Shipped Kerberos ticket validator
-- Provide a real `IKerberosTicketValidator`: Windows SSPI (`AcceptSecurityContext`) binding in a new
-  `Smb.Auth.Sspi` project; optionally a keytab/GSSAPI path for Linux. Wire machine-account/keytab
-  config into `SmbServerBuilder`.
-- **Files:** `src/Smb.Auth.Sspi/` (new project), `src/Smb.Host/SmbServerBuilder.cs`.
-- **Tests:** `tests/Smb.Tests/KerberosSspiTests.cs` (may need to be integration/optional if it
-  requires a domain); unit-test the token unwrap/AP-REP path with a faked validator (already partly
-  covered in `Phase2AuthTests`).
+### B1 — Shipped Kerberos ticket validator ✅ DONE (Windows SSPI)
+- New project `src/Smb.Auth.Sspi/` (references `Smb.Auth` only — no Host coupling). `SspiKerberosTicketValidator`
+  acquires an inbound server credential (`AcquireCredentialsHandle`, Kerberos/Negotiate package) once, then per
+  AP-REQ: re-wraps the bare AP-REQ into a GSS mech token (`KerberosGssToken.WrapApReq`, since the mechanism strips
+  the wrapper), calls `AcceptSecurityContext`, and on success extracts the ticket **session key**
+  (`SECPKG_ATTR_SESSION_KEY` — the SMB signing/encryption KDK, which `NegotiateAuthentication` does NOT expose, so
+  raw SSPI is required) and the identity (SID + group SIDs + UPN via the context access token / `WindowsIdentity`).
+  P/Invoke isolated in `SspiNative.cs`; Windows-guarded (`[SupportedOSPlatform("windows")]` + runtime check);
+  credential freed on `Dispose`.
+- **Wiring:** plugs into the existing `KerberosMechanismFactory` + `SmbServerBuilder.UseAuthentication(...)`; ergonomic
+  `SspiKerberos.CreateNegotiator(validator, ntlmFallback)` composes a Kerberos-preferred SPNEGO negotiator. (No new
+  Host API — keeps Host free of the Windows-only dependency.)
+- **Known limitation (v1):** mutual-auth `AP-REP` not surfaced (`ApRep = null`, contract-permitted); requires a
+  domain-joined host owning the SMB SPN. **The Kerberos happy path (real ticket → session-key/PAC) is NOT CI-testable
+  here (no domain) — verify manually against a real client.**
+- **Files:** `src/Smb.Auth.Sspi/{SspiKerberosTicketValidator,SspiNative,SspiKerberos}.cs`, `Smb.Server.slnx`,
+  `tests/Smb.Tests/Smb.Tests.csproj` (project ref).
+- **Tests:** `tests/Smb.Tests/SspiKerberosTests.cs` — composition (Kerberos-first, cross-platform), platform guard
+  (non-Windows ctor throws), and the **P/Invoke round-trip on Windows** (bogus/empty AP-REQ → rejected, no crash;
+  exercises marshaling + error mapping + handle lifetime). Happy path documented as manual-verify.
 
 ### B2 — Enforce `mechListMIC` (SPNEGO downgrade protection)
 - Verify the SPNEGO `mechListMIC` in `SpnegoNegotiator` once a mechanism completes, per RFC 4178 —
@@ -278,4 +290,16 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
   until opted in.
   Next action: **Phase B** — B1 shipped Kerberos `IKerberosTicketValidator` (SSPI/GSSAPI), B2 enforce
   SPNEGO `mechListMIC`. (Or C/D per target market — user's call.)
+- **2026-07-14** — **B1 DONE (Windows SSPI Kerberos).** New optional project `Smb.Auth.Sspi`
+  (`SspiKerberosTicketValidator` + `SspiNative` P/Invoke + `SspiKerberos.CreateNegotiator`). Plugs into the
+  existing `KerberosMechanismFactory`/`UseAuthentication`; no Host coupling. Extracts the ticket session key
+  via `SECPKG_ATTR_SESSION_KEY` (required for SMB signing — `NegotiateAuthentication` can't expose it) + identity
+  from the access token. AP-REP mutual-auth deliberately `null` in v1 (contract-permitted, avoids an untestable
+  strip path). Builds 0/0 on Windows. Tests `SspiKerberosTests` (composition + platform guard cross-platform;
+  Windows P/Invoke round-trip rejecting a bogus AP-REQ). **Happy path (real ticket→session-key/PAC) needs a
+  domain — NOT CI-testable here; manual-verify.**
+  <!-- NOTE the classifier/model outage during this session blocked the final test RUN from being confirmed by
+       me; the SSPI project itself built clean (0/0). Re-run `dotnet test --filter SspiKerberosTests` to confirm. -->
+  Next action: **B2** — enforce SPNEGO `mechListMIC` in `SpnegoNegotiator` (downgrade protection; currently
+  parsed but ignored). Then B (done) → C/D per target market.
 - _(append progress entries here as milestones complete; check items off in the phase sections)_

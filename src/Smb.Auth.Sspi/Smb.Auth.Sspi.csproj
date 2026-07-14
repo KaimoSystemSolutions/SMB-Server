@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Turnkey Kerberos for Windows: an IKerberosTicketValidator backed by SSPI
+       (Negotiate/Kerberos package). Optional add-on — reference it only when you want
+       AD/Kerberos authentication. See docs/ENTERPRISE_HARDENING_ROADMAP.md (B1). -->
+  <PropertyGroup>
+    <RootNamespace>Smb.Auth.Sspi</RootNamespace>
+    <AssemblyName>Smb.Auth.Sspi</AssemblyName>
+    <Description>Windows SSPI (Kerberos/Negotiate) implementation of Smb.Auth's IKerberosTicketValidator: turnkey AD/Kerberos authentication for the Smb.* SMB server library. Windows-only.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Smb.Auth\Smb.Auth.csproj" />
+  </ItemGroup>
+</Project>

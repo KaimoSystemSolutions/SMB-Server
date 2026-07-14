@@ -4,6 +4,7 @@
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/Smb.Auth/Smb.Auth.csproj" />
+    <Project Path="src/Smb.Auth.Sspi/Smb.Auth.Sspi.csproj" />
     <Project Path="src/Smb.Crypto/Smb.Crypto.csproj" />
     <Project Path="src/Smb.FileSystem/Smb.FileSystem.csproj" />
     <Project Path="src/Smb.Host/Smb.Host.csproj" />
