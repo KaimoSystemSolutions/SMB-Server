@@ -197,7 +197,7 @@ internal sealed class SmbConnectionHandler
             // OnConnectionClosed releases opens (handles/locks/oplocks/share-modes, O5) and cancels pending
             // async ops — but keeps a session (and its pending LOCK/CHANGE_NOTIFY) alive when another
             // multichannel channel survives, rerouting their final response there (M6.3 failover).
-            _dispatcher.OnConnectionClosed(connection);
+            await _dispatcher.OnConnectionClosedAsync(connection).ConfigureAwait(false);
             _server.Connections.TryRemove(connection.ConnectionId, out _);
             _server.Options.Metrics.OnConnectionClosed();
             AuditConnection(SmbAuditEventType.ConnectionClosed, connection); // reads TransportAssertedIdentity

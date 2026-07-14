@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -143,6 +144,51 @@ public class ConcurrentMetadataDispatchTests
         Assert.Equal(NtStatus.FileClosed, Smb2Header.Read(secondClose).Status);
     }
 
+    // ─── A5: throughput regression guard ──────────────────────────────────
+
+    /// <summary>
+    /// Metadata-throughput micro-benchmark (docs/ENTERPRISE_HARDENING_ROADMAP.md, A5): against a backend
+    /// with per-op latency, a batch of independent CREATEs overlaps with the feature on but serializes on
+    /// the barrier with it off. Relative (same machine, same delay) so it is robust across CI hardware.
+    /// </summary>
+    [Trait("Category", "Performance")]
+    [Fact]
+    public async Task ConcurrentMetadata_OverlapsLatency_FasterThanSerialBaseline()
+    {
+        const int n = 20;
+        var delay = TimeSpan.FromMilliseconds(15);
+
+        // Serial baseline: feature off → each CREATE goes through the barrier, awaited one at a time.
+        (Smb2Dispatcher ds, SmbConnection cs, ulong sids, uint tids) = Setup(new DelayCreateStore(delay), concurrentMetadata: false);
+        var serial = Stopwatch.StartNew();
+        for (int i = 0; i < n; i++)
+        {
+            byte[] r = await ds.ProcessMessageAsync(cs, TestHelpers.BuildCreateRequest((ulong)(10 + i), sids, tids,
+                $"s{i}.txt", 0x1, (uint)CreateDisposition.OpenIf, (uint)CreateOptions.NonDirectoryFile));
+            Assert.Equal(NtStatus.Success, Smb2Header.Read(r).Status);
+        }
+        serial.Stop();
+
+        // Feature on: reserve all frames in arrival order, then run them all — CREATEs overlap.
+        (Smb2Dispatcher dc, SmbConnection cc, ulong sidc, uint tidc) = Setup(new DelayCreateStore(delay), concurrentMetadata: true);
+        var tasks = new List<Task<byte[]>>(n);
+        var concurrent = Stopwatch.StartNew();
+        for (int i = 0; i < n; i++)
+        {
+            Prepare(dc, cc, TestHelpers.BuildCreateRequest((ulong)(10 + i), sidc, tidc,
+                $"c{i}.txt", 0x1, (uint)CreateDisposition.OpenIf, (uint)CreateOptions.NonDirectoryFile), out var f);
+            tasks.Add(dc.ExecutePreparedFrameAsync(cc, f).AsTask());
+        }
+        byte[][] results = await Task.WhenAll(tasks);
+        concurrent.Stop();
+        Assert.All(results, r => Assert.Equal(NtStatus.Success, Smb2Header.Read(r).Status));
+
+        // With n independent ops overlapping, the concurrent run must be dramatically faster than the
+        // serial ~n*delay. Generous margin (factor 3) keeps it non-flaky on slow/loaded CI.
+        Assert.True(concurrent.Elapsed * 3 < serial.Elapsed,
+            $"concurrent metadata not faster: serial={serial.ElapsedMilliseconds}ms concurrent={concurrent.ElapsedMilliseconds}ms");
+    }
+
     // ─── End-to-end over the real host loop (TCP), feature on ─────────────
 
     [Fact]
@@ -263,6 +309,37 @@ public class ConcurrentMetadataDispatchTests
         ulong persistent = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(response.AsSpan(body + 64, 8));
         ulong vol = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(response.AsSpan(body + 72, 8));
         return (persistent, vol);
+    }
+
+    /// <summary>In-memory store whose CREATE takes a fixed latency (for the A5 overlap benchmark).</summary>
+    private sealed class DelayCreateStore(TimeSpan delay) : IFileStore
+    {
+        public async ValueTask<FileStoreResult<FileCreateResult>> CreateAsync(
+            string path, FileAccessIntent access, CreateDispositionIntent disposition,
+            bool directoryRequired, bool nonDirectoryRequired, CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            return FileStoreResult<FileCreateResult>.Ok(new FileCreateResult(new Handle(path), CreateOutcome.Opened));
+        }
+
+        public ValueTask<FileStoreResult<int>> ReadAsync(IFileHandle handle, long offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
+            => new(FileStoreResult<int>.Ok(0));
+        public ValueTask<FileStoreResult<int>> WriteAsync(IFileHandle handle, long offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => new(FileStoreResult<int>.Ok(data.Length));
+        public ValueTask<FileStoreResult<IReadOnlyList<FileEntryInfo>>> QueryDirectoryAsync(IFileHandle handle, string searchPattern, CancellationToken cancellationToken = default)
+            => new(FileStoreResult<IReadOnlyList<FileEntryInfo>>.Ok(Array.Empty<FileEntryInfo>()));
+        public ValueTask<NtStatus> SetEndOfFileAsync(IFileHandle handle, long length, CancellationToken cancellationToken = default) => new(NtStatus.Success);
+        public ValueTask<NtStatus> RenameAsync(IFileHandle handle, string newPath, bool replaceIfExists, CancellationToken cancellationToken = default) => new(NtStatus.Success);
+        public ValueTask<NtStatus> SetDeleteOnCloseAsync(IFileHandle handle, bool delete, CancellationToken cancellationToken = default) => new(NtStatus.Success);
+        public ValueTask<NtStatus> FlushAsync(IFileHandle handle, CancellationToken cancellationToken = default) => new(NtStatus.Success);
+
+        private sealed class Handle(string path) : IFileHandle
+        {
+            public string Path { get; } = path;
+            public bool IsDirectory => false;
+            public FileEntryInfo GetInfo() => new() { Name = Path, Attributes = SmbFileAttributes.Normal };
+            public void Dispose() { }
+        }
     }
 
     /// <summary>In-memory store whose WRITEs block until <see cref="ReleaseWrites"/>; opens any path.</summary>

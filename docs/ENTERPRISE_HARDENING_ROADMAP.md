@@ -126,19 +126,29 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
   shares all coexist then drain clean. The full dispatch-level parallel open/close stress test is
   deferred to **A2b** (needs the concurrent path wired).
 
-### A4 — Close the async contract (small, from review #2)
-- Convert the two remaining sync `Dispose()` teardown sites to `DisposeAsync()`
-  (`Smb2Dispatcher.FileCommands.cs:1503`, `:1694`).
-- Mark `IFileHandle.Dispose()` and `IFileHandle.GetInfo()` `[Obsolete]` with a message pointing to
-  the async variants (do **not** remove — sync backends via `SyncFileStore` still implement them).
-- **Files:** `src/Smb.FileSystem/IFileStore.cs`, `src/Smb.Server/Smb2Dispatcher.FileCommands.cs`.
-- **Tests:** existing suite must stay green; add an assertion that session teardown awaits
-  `DisposeAsync` on a backend whose `Dispose()` throws (proving the async path is taken).
+### A4 — Close the async contract (review #2) ✅ DONE (scoped)
+- **Primary teardown path is now async:** the connection-close path releases backend handles via
+  `IFileHandle.DisposeAsync` (`Smb2Dispatcher.OnConnectionClosedAsync`, called by the host), so an async
+  backend no longer sync-over-async-blocks a pool thread on disconnect. Implemented with a **detach/dispose
+  split** (`DetachSessionOpens` returns handles; sync vs async caller chooses disposal) so there is no
+  duplicated release logic and **no public-API break / no test churn** (sync `OnConnectionClosed` kept for
+  the periodic idle-sweep, LOGOFF and back-compat/tests).
+- **`[Obsolete]` deliberately NOT applied** (scope decision): `IFileHandle.Dispose()` comes from
+  `IDisposable` (can't be marked); marking `GetInfo()` obsolete would flag the `GetInfoAsync` default-method
+  bridge and every sync backend that legitimately implements it (with `TreatWarningsAsErrors`, that breaks
+  the build) — and sync backends *must* implement these, so "obsolete" is the wrong signal. The XML-doc
+  already states the async-first contract. The durable-scavenger's sync `Dispose` (`ReleaseDurable`) is
+  intentionally left sync — a rare, host-driven periodic sweep with a sync public signature.
+- **Files:** `src/Smb.Server/Smb2Dispatcher.FileCommands.cs`, `src/Smb.Host/SmbConnectionHandler.cs`.
+- **Tests:** `tests/Smb.Tests/AsyncTeardownTests.cs` (2, green) — a recording handle proves the async close
+  path calls `DisposeAsync` (not `Dispose`), and the sync path calls `Dispose`.
 
-### A5 — Benchmark / regression guard
-- A metadata-heavy micro-benchmark (many CREATE+CLOSE+QUERY on one connection) proving overlap vs.
-  the old serial baseline; keep it as a non-gating perf test.
-- **Files:** `tests/Smb.Tests/MetadataThroughputBenchmark.cs` (or a `benchmarks/` project).
+### A5 — Benchmark / regression guard ✅ DONE
+- Metadata-throughput micro-benchmark: against a backend with per-op latency, a batch of `n` independent
+  CREATEs overlaps with the feature on but serializes on the barrier with it off. Relative assertion
+  (same machine/delay, factor-3 margin) so it is non-flaky across CI hardware.
+- **Files:** `tests/Smb.Tests/ConcurrentMetadataDispatchTests.cs` →
+  `ConcurrentMetadata_OverlapsLatency_FasterThanSerialBaseline` (`[Trait("Category","Performance")]`).
 
 ---
 
@@ -255,4 +265,17 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
        requires MaxConcurrentFileOpsPerConnection > 1 (the concurrent path). -->
   Next action: **A4** (mark `IFileHandle.Dispose()`/`GetInfo()` `[Obsolete]`; the 2 sync teardown
   Dispose() sites were already converted earlier) then **A5** (metadata-throughput micro-benchmark).
+- **2026-07-14** — **A4 + A5 DONE → PHASE A COMPLETE.** Correction to the prior note: the sync teardown
+  `Dispose()` sites were NOT already converted. A4 done scoped: connection-close path made async
+  (`OnConnectionClosedAsync` via a detach/dispose split — no public-API break, no test churn); `[Obsolete]`
+  deliberately skipped (infeasible on `IDisposable.Dispose`; wrong signal for `GetInfo()` which sync
+  backends must implement + would break the `GetInfoAsync` DIM bridge under `TreatWarningsAsErrors`);
+  durable-scavenger sync `Dispose` left as-is (rare periodic sweep). `AsyncTeardownTests` (2) prove the
+  async path uses `DisposeAsync`. A5: `ConcurrentMetadata_OverlapsLatency_FasterThanSerialBaseline`
+  benchmark (factor-3 relative margin). **Full suite 492/492 green.**
+  **Phase A (A0–A5) is complete.** Headline result: metadata/delete throughput bottleneck fixed
+  (`ConcurrentMetadataOps`, default off) + async teardown; all inert/off by default = zero behavior change
+  until opted in.
+  Next action: **Phase B** — B1 shipped Kerberos `IKerberosTicketValidator` (SSPI/GSSAPI), B2 enforce
+  SPNEGO `mechListMIC`. (Or C/D per target market — user's call.)
 - _(append progress entries here as milestones complete; check items off in the phase sections)_

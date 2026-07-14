@@ -1444,26 +1444,58 @@ public sealed partial class Smb2Dispatcher
     /// byte-range locks, oplocks, share-mode reservations and the backend handle (persistent OS file
     /// handle, O5). Without this, an abrupt disconnect would leak handles and keep files "open".
     /// </summary>
+    /// <summary>
+    /// Async teardown (docs/ENTERPRISE_HARDENING_ROADMAP.md, A4): the primary per-connection close path
+    /// releases backend handles via <see cref="IFileHandle.DisposeAsync"/>, so an async backend never
+    /// sync-over-async-blocks a pool thread while a connection tears down. The host calls this; the
+    /// synchronous <see cref="OnConnectionClosed"/> remains for periodic sweeps and back-compat.
+    /// </summary>
+    public async ValueTask OnConnectionClosedAsync(SmbConnection connection)
+    {
+        foreach (SmbSession session in connection.Sessions.Values)
+            foreach (IFileHandle handle in DetachOnConnectionClose(connection, session))
+                await handle.DisposeAsync().ConfigureAwait(false);
+
+        CancelNonSurvivingPending(connection);
+    }
+
     public void OnConnectionClosed(SmbConnection connection)
     {
         foreach (SmbSession session in connection.Sessions.Values)
-        {
-            // Multichannel (§3.3.7.1 applies per session, not per channel): drop only the channel this
-            // connection provided. As long as another bound channel remains, the session and its opens
-            // survive so the client keeps working over the surviving connection(s). Only when the last
-            // channel goes are the opens released and the session removed. Sessions with no channel
-            // table (2.x) collapse to the previous single-connection behaviour.
-            session.Channels.TryRemove(connection.ConnectionId, out _);
-            if (!session.Channels.IsEmpty)
-                continue;
+            foreach (IFileHandle handle in DetachOnConnectionClose(connection, session))
+                handle.Dispose();
 
-            CloseSessionOpens(session);
-            _server.SessionGlobalList.TryRemove(session.SessionId, out _);
-        }
+        CancelNonSurvivingPending(connection);
+    }
 
-        // Pending async operations on this connection (blocking LOCK / CHANGE_NOTIFY): cancel only
-        // those whose session did NOT survive on another channel. The rest are left to complete and
-        // reroute their final response to a surviving channel (M6.3 failover, §3.3.5).
+    /// <summary>
+    /// Detaches every open of <paramref name="session"/> from server-side state when the connection's last
+    /// channel is gone, and returns the backend handles the caller must dispose (sync or async). Returns an
+    /// empty list — and does not touch the session — while another bound channel keeps it alive.
+    /// </summary>
+    private List<IFileHandle> DetachOnConnectionClose(SmbConnection connection, SmbSession session)
+    {
+        // Multichannel (§3.3.7.1 applies per session, not per channel): drop only the channel this
+        // connection provided. As long as another bound channel remains, the session and its opens
+        // survive so the client keeps working over the surviving connection(s). Only when the last
+        // channel goes are the opens released and the session removed. Sessions with no channel
+        // table (2.x) collapse to the previous single-connection behaviour.
+        session.Channels.TryRemove(connection.ConnectionId, out _);
+        if (!session.Channels.IsEmpty)
+            return [];
+
+        List<IFileHandle> handles = DetachSessionOpens(session);
+        _server.SessionGlobalList.TryRemove(session.SessionId, out _);
+        return handles;
+    }
+
+    /// <summary>
+    /// Pending async operations on this connection (blocking LOCK / CHANGE_NOTIFY): cancel only those whose
+    /// session did NOT survive on another channel. The rest are left to complete and reroute their final
+    /// response to a surviving channel (M6.3 failover, §3.3.5).
+    /// </summary>
+    private static void CancelNonSurvivingPending(SmbConnection connection)
+    {
         foreach (PendingAsyncRequest pending in connection.PendingRequests.Values)
         {
             SmbSession? owner = pending.Owner?.Session;
@@ -1474,8 +1506,15 @@ public sealed partial class Smb2Dispatcher
         }
     }
 
-    private void CloseSessionOpens(SmbSession session)
+    /// <summary>
+    /// Releases the server-side state of every open of <paramref name="session"/> (locks, oplocks,
+    /// leases, share-mode reservations) and re-registers durable opens in the durable store, then clears
+    /// the open table. Returns the non-durable backend handles for the caller to dispose (sync or async);
+    /// the disposal is deliberately separated so the close path can await <see cref="IFileHandle.DisposeAsync"/>.
+    /// </summary>
+    private List<IFileHandle> DetachSessionOpens(SmbSession session)
     {
+        var handles = new List<IFileHandle>();
         foreach (SmbOpen open in session.Opens.Values)
         {
             // [M4.1] A durable open is preserved across the transport drop: register it in the durable
@@ -1500,9 +1539,20 @@ public sealed partial class Smb2Dispatcher
             _server.Options.OplockManager.ReleaseOwner(open);
             _server.Options.LeaseManager.ReleaseOwner(open);
             if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
-            open.LocalOpen?.Dispose();
+            if (open.LocalOpen is { } handle) handles.Add(handle);
         }
         session.Opens.Clear();
+        return handles;
+    }
+
+    /// <summary>
+    /// Synchronous open release for the periodic sweeps (idle-session expiry) and LOGOFF, which are not on
+    /// the async connection-close path. Disposes handles synchronously via <see cref="IDisposable.Dispose"/>.
+    /// </summary>
+    private void CloseSessionOpens(SmbSession session)
+    {
+        foreach (IFileHandle handle in DetachSessionOpens(session))
+            handle.Dispose();
     }
 
     // --- Durable / persistent handles (Phase 4, M4.1) ---
