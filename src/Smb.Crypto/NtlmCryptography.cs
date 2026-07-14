@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -77,5 +78,62 @@ public static class NtlmCryptography
         authenticateWithZeroMic.CopyTo(data.AsSpan(negotiate.Length + challenge.Length));
         using var hmac = new HMACMD5(exportedSessionKey);
         return hmac.ComputeHash(data);
+    }
+
+    // MS-NLMP §3.4.5.2 / §3.4.5.3 key-derivation magic constants (the terminating NUL is part of the
+    // MD5 input). "client" = client-to-server keys; "server" = server-to-client keys.
+    private static readonly byte[] ClientSignMagic =
+        Encoding.ASCII.GetBytes("session key to client-to-server signing key magic constant\0");
+    private static readonly byte[] ServerSignMagic =
+        Encoding.ASCII.GetBytes("session key to server-to-client signing key magic constant\0");
+    private static readonly byte[] ClientSealMagic =
+        Encoding.ASCII.GetBytes("session key to client-to-server sealing key magic constant\0");
+    private static readonly byte[] ServerSealMagic =
+        Encoding.ASCII.GetBytes("session key to server-to-client sealing key magic constant\0");
+
+    /// <summary>SIGNKEY (MS-NLMP §3.4.5.2): <c>MD5( ExportedSessionKey ‖ magic )</c>, extended session
+    /// security. <paramref name="client"/> selects the client-to-server (true) or server-to-client key.</summary>
+    public static byte[] NtlmSignKey(byte[] exportedSessionKey, bool client)
+        => Md5Concat(exportedSessionKey, client ? ClientSignMagic : ServerSignMagic);
+
+    /// <summary>SEALKEY (MS-NLMP §3.4.5.3): <c>MD5( ExportedSessionKey ‖ magic )</c> for extended session
+    /// security with <c>NEGOTIATE_128</c> (the full 16-byte key feeds the MD5). This NTLM stack always
+    /// negotiates 128-bit + key exchange, so no key-length truncation applies.</summary>
+    public static byte[] NtlmSealKey(byte[] exportedSessionKey, bool client)
+        => Md5Concat(exportedSessionKey, client ? ClientSealMagic : ServerSealMagic);
+
+    private static byte[] Md5Concat(byte[] a, byte[] b)
+    {
+        var buf = new byte[a.Length + b.Length];
+        a.CopyTo(buf, 0);
+        b.CopyTo(buf, a.Length);
+        return MD5.HashData(buf);
+    }
+
+    /// <summary>
+    /// NTLMSSP GSS_getMIC signature for the <b>first</b> message on the context (SeqNum 0), as used for
+    /// the SPNEGO <c>mechListMIC</c> (RFC 4178 §5). Connection-oriented, extended session security with
+    /// key exchange (MS-NLMP §3.4.4.1): the 16-byte signature is
+    /// <c>Version(1) ‖ RC4(SealKey, HMAC_MD5(SignKey, LE32(0) ‖ message)[0..8]) ‖ LE32(0)</c>.
+    /// <para>Only SeqNum 0 is supported: RC4 is a stateful stream cipher, so a fresh handle is valid
+    /// only for the first signed message — which is exactly the mechListMIC case.</para>
+    /// </summary>
+    public static byte[] NtlmMechListMic(byte[] exportedSessionKey, bool client, ReadOnlySpan<byte> message)
+    {
+        byte[] signKey = NtlmSignKey(exportedSessionKey, client);
+        byte[] sealKey = NtlmSealKey(exportedSessionKey, client);
+
+        var data = new byte[4 + message.Length];       // LE32(SeqNum=0) ‖ message
+        message.CopyTo(data.AsSpan(4));
+        byte[] hmac;
+        using (var h = new HMACMD5(signKey)) hmac = h.ComputeHash(data);
+
+        byte[] sealed8 = Rc4.Transform(sealKey, hmac.AsSpan(0, 8)); // fresh handle → valid for SeqNum 0
+
+        var sig = new byte[16];
+        BinaryPrimitives.WriteUInt32LittleEndian(sig.AsSpan(0), 1);   // Version
+        sealed8.CopyTo(sig, 4);                                        // sealed checksum
+        BinaryPrimitives.WriteUInt32LittleEndian(sig.AsSpan(12), 0);  // SeqNum
+        return sig;
     }
 }

@@ -20,10 +20,18 @@ public sealed class SpnegoParseResult
     /// <summary>
     /// The SPNEGO <c>mechListMIC</c> ([3] of a NegTokenResp), if present. This is the client's
     /// GSS_getMIC over the <c>MechTypeList</c> it sent; verifying it detects a mechanism-list downgrade
-    /// (RFC 4178 §5). Currently surfaced for diagnostics/future enforcement only — see
-    /// docs/SECURITY_AUDIT.md finding O8.
+    /// (RFC 4178 §5). Enforced for NTLM when <see cref="SpnegoNegotiator.RequireMechListMic"/> is set
+    /// (checked against <see cref="MechListBytes"/>) — see docs/SECURITY_AUDIT.md finding O8.
     /// </summary>
     public byte[]? MechListMic { get; init; }
+
+    /// <summary>
+    /// The DER encoding of the <c>MechTypeList</c> SEQUENCE exactly as received (only for NegTokenInit).
+    /// This is the byte string the SPNEGO <c>mechListMIC</c> is computed over (RFC 4178 §5) — it is the
+    /// inner <c>SEQUENCE OF MechType</c> TLV (tag 0x30…), <b>without</b> the <c>[0]</c> context wrapper.
+    /// Captured verbatim so a downgrade (a mechanism stripped in transit) is detected byte-for-byte.
+    /// </summary>
+    public byte[]? MechListBytes { get; init; }
 
     /// <summary>True if the token was a NegTokenResp (follow-up token); otherwise NegTokenInit.</summary>
     public bool IsResponseToken { get; init; }
@@ -156,6 +164,21 @@ public static class SpnegoTokens
         return writer.Encode();
     }
 
+    /// <summary>
+    /// DER-encodes a <c>MechTypeList ::= SEQUENCE OF MechType</c> — the exact byte string the SPNEGO
+    /// <c>mechListMIC</c> is computed over (RFC 4178 §5). Matches the inner SEQUENCE that
+    /// <see cref="CreateNegTokenInit"/> emits and that <see cref="Parse"/> surfaces as
+    /// <see cref="SpnegoParseResult.MechListBytes"/>.
+    /// </summary>
+    public static byte[] EncodeMechList(IReadOnlyList<string> mechTypes)
+    {
+        var writer = new AsnWriter(AsnEncodingRules.DER);
+        using (writer.PushSequence())
+            foreach (string oid in mechTypes)
+                writer.WriteObjectIdentifier(oid);
+        return writer.Encode();
+    }
+
     private enum NegStateValue { }
 
     /// <summary>Encodes an ASCII string as a DER GeneralString TLV (tag 0x1B).</summary>
@@ -213,6 +236,7 @@ public static class SpnegoTokens
 
         var mechTypes = new List<string>();
         byte[]? mechToken = null;
+        byte[]? mechListBytes = null;
 
         while (negInit.HasData)
         {
@@ -226,7 +250,11 @@ public static class SpnegoTokens
             switch (fieldTag.TagValue)
             {
                 case 0: // mechTypes [0] MechTypeList
-                    AsnReader list = negInit.ReadSequence(ContextTag0).ReadSequence();
+                    // Capture the inner SEQUENCE TLV verbatim — this is exactly what the mechListMIC
+                    // signs (RFC 4178 §5), so it must be the on-wire bytes, not a re-encoding.
+                    ReadOnlyMemory<byte> listTlv = negInit.ReadSequence(ContextTag0).ReadEncodedValue();
+                    mechListBytes = listTlv.ToArray();
+                    AsnReader list = new AsnReader(listTlv, AsnEncodingRules.DER).ReadSequence();
                     while (list.HasData) mechTypes.Add(list.ReadObjectIdentifier());
                     break;
                 case 2: // mechToken [2] OCTET STRING
@@ -238,7 +266,13 @@ public static class SpnegoTokens
             }
         }
 
-        return new SpnegoParseResult { MechTypes = mechTypes, MechToken = mechToken, IsResponseToken = false };
+        return new SpnegoParseResult
+        {
+            MechTypes = mechTypes,
+            MechToken = mechToken,
+            MechListBytes = mechListBytes,
+            IsResponseToken = false,
+        };
     }
 
     private static SpnegoParseResult ParseNegTokenResp(AsnReader reader)
@@ -269,7 +303,7 @@ public static class SpnegoTokens
                 case 2: // responseToken [2] OCTET STRING
                     responseToken = resp.ReadSequence(ContextTag2).ReadOctetString();
                     break;
-                case 3: // mechListMIC [3] OCTET STRING — surfaced for O8 (downgrade detection), not yet enforced
+                case 3: // mechListMIC [3] OCTET STRING — enforced when SpnegoNegotiator.RequireMechListMic (O8)
                     mechListMic = resp.ReadSequence(ContextTag3).ReadOctetString();
                     break;
                 default:

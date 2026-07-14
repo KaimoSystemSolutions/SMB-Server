@@ -175,11 +175,25 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
   (non-Windows ctor throws), and the **P/Invoke round-trip on Windows** (bogus/empty AP-REQ → rejected, no crash;
   exercises marshaling + error mapping + handle lifetime). Happy path documented as manual-verify.
 
-### B2 — Enforce `mechListMIC` (SPNEGO downgrade protection)
-- Verify the SPNEGO `mechListMIC` in `SpnegoNegotiator` once a mechanism completes, per RFC 4178 —
-  currently parsed but ignored.
-- **Files:** `src/Smb.Auth/SpnegoNegotiator.cs`, `src/Smb.Auth/Oids/SpnegoTokens.cs`.
-- **Tests:** `tests/Smb.Tests/SpnegoTests.cs` — a tampered mechList is rejected; valid MIC passes.
+### B2 — Enforce `mechListMIC` (SPNEGO downgrade protection) ✅ DONE (NTLM, opt-in)
+- `SpnegoNegotiator.RequireMechListMic` (default **off** for compat) verifies the SPNEGO `mechListMIC`
+  (RFC 4178 §5) once the selected mechanism succeeds. The parser now captures the `MechTypeList` **as
+  received** (`SpnegoParseResult.MechListBytes` — the inner `SEQUENCE OF MechType` TLV, no `[0]` wrapper),
+  so the MIC is checked against on-wire bytes and a mechanism **stripped in transit** (the O8 Kerberos→NTLM
+  fallback downgrade) produces a byte-level mismatch → `AccessDenied`. Required-but-absent MIC is also
+  rejected. Constant-time compare.
+- **Scope:** enforced for the **NTLM** mechanism (the O8 case), whose GSS_getMIC this layer can compute
+  from the negotiated session key. Implementing that required the NTLMSSP first-message signature
+  (MS-NLMP §3.4.4/§3.4.5): `NtlmCryptography.NtlmMechListMic` (+ `NtlmSignKey`/`NtlmSealKey`) — extended
+  session security + KEY_EXCH + 128-bit (this stack's fixed NTLMv2 flags), SeqNum 0 only (fresh RC4 handle).
+  A Kerberos context's integrity is validated inside its GSS provider (B1/SSPI), not here.
+- **Files (wider than the original plan — the MIC needs mechanism crypto, per O8):**
+  `src/Smb.Crypto/NtlmCryptography.cs` (GSS_getMIC + sign/seal keys), `src/Smb.Auth/Oids/SpnegoTokens.cs`
+  (surface `MechListBytes` + `EncodeMechList`), `src/Smb.Auth/SpnegoNegotiator.cs` (`RequireMechListMic` +
+  verify on success).
+- **Tests:** `tests/Smb.Tests/SpnegoTests.cs` (+6, green) — valid MIC accepted; stripped mechanism rejected;
+  missing MIC rejected when enforced / accepted when not (compat); tampered MIC rejected; parser captures
+  `MechListBytes` byte-identical to `EncodeMechList`.
 
 ---
 
@@ -302,4 +316,20 @@ both CREATE sites but never decremented and never read anywhere — dead write-o
        me; the SSPI project itself built clean (0/0). Re-run `dotnet test --filter SspiKerberosTests` to confirm. -->
   Next action: **B2** — enforce SPNEGO `mechListMIC` in `SpnegoNegotiator` (downgrade protection; currently
   parsed but ignored). Then B (done) → C/D per target market.
+- **2026-07-14** — **B1 test run CONFIRMED + B2 DONE.** Resumed per the prior note that B1's final test
+  run was never confirmed (classifier outage). Ran `SspiKerberosTests` → **4/4 green** (composition,
+  platform guard, Windows P/Invoke round-trip); B1's real-ticket happy path remains manual-verify (no
+  domain). **B2 implemented** behind opt-in `SpnegoNegotiator.RequireMechListMic` (default off): parser
+  captures the on-wire `MechTypeList` (`MechListBytes`), and on mechanism success the NTLM `mechListMIC`
+  is recomputed (NTLMSSP GSS_getMIC, MS-NLMP §3.4.4/§3.4.5 — new `NtlmCryptography.NtlmMechListMic`) over
+  the received list and compared constant-time; strip/absent/tamper → `AccessDenied`. **Deviation from the
+  plan's file list:** the O8 finding requires the NTLMSSP per-message signature, so `Smb.Crypto` (the MIC
+  primitive) was also touched — unavoidable, documented in the B2 section. Kerberos MIC left to the SSPI
+  GSS layer (out of this layer's scope). Tests: `SpnegoTests` +6 green. **Full suite 502/502 green**
+  (492 baseline + 4 B1 + 6 B2); feature off = unchanged behavior.
+  <!-- NOTE NtlmMechListMic supports SeqNum 0 only (fresh RC4 handle) — correct for mechListMIC, which is
+       always the first GSS_getMIC on the context. Do not reuse it for multi-message signing. -->
+  Next action: **Phase B complete.** Proceed to **C** (Witness / durable store) or **D** (OTel / resource
+  limits / fuzzing) per target market — user's call. Manual-verify B1 + B2 against a real Windows client
+  when a domain-joined host is available.
 - _(append progress entries here as milestones complete; check items off in the phase sections)_

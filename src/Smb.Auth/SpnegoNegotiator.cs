@@ -1,5 +1,7 @@
+using System.Security.Cryptography;
 using Smb.Auth.Ntlm;
 using Smb.Auth.Oids;
+using Smb.Crypto;
 using Smb.Protocol.Enums;
 
 namespace Smb.Auth;
@@ -26,13 +28,25 @@ namespace Smb.Auth;
 /// SPNEGO wrapper) are detected and routed to the NTLM mechanism unwrapped, exactly as before.
 /// </para>
 /// <para>
-/// The SPNEGO <c>mechListMIC</c> is parsed but not enforced (downgrade protection is a per-mechanism
-/// concern — see the NTLM MIC hardening item O1). This matches the prior single-mechanism behavior.
+/// <b>Downgrade protection (RFC 4178 §5, MS-SPNG §3.3.5.1).</b> When <see cref="RequireMechListMic"/>
+/// is set, the client's <c>mechListMIC</c> is verified once the selected mechanism succeeds: the MIC is
+/// recomputed over the <c>MechTypeList</c> exactly as received and compared in constant time, so a MITM
+/// that strips the stronger mechanism (e.g. Kerberos) to force the NTLM fallback is detected. This is
+/// enforced for the <b>NTLM</b> mechanism (the O8 fallback-downgrade case), whose GSS_getMIC this layer
+/// can compute from the negotiated session key; a Kerberos context's own integrity is validated inside
+/// its GSS provider (B1/SSPI). Off by default for compatibility — Windows clients always send the MIC,
+/// so enable it only against clients known to comply. See docs/SECURITY_AUDIT.md finding O8.
 /// </para>
 /// </summary>
 public sealed class SpnegoNegotiator : ISpnegoNegotiator
 {
     private readonly IReadOnlyList<IGssMechanismFactory> _factories;
+
+    /// <summary>
+    /// When true, enforce the SPNEGO <c>mechListMIC</c> for the NTLM mechanism (downgrade protection,
+    /// RFC 4178 §5). Default false (compatibility). See the class remarks and audit finding O8.
+    /// </summary>
+    public bool RequireMechListMic { get; init; }
 
     public SpnegoNegotiator(params IGssMechanismFactory[] factories)
         : this((IReadOnlyList<IGssMechanismFactory>)factories) { }
@@ -53,17 +67,23 @@ public sealed class SpnegoNegotiator : ISpnegoNegotiator
         return SpnegoTokens.CreateNegTokenInit2(oids);
     }
 
-    public ISpnegoServerContext CreateServerContext() => new Context(_factories);
+    public ISpnegoServerContext CreateServerContext() => new Context(_factories, RequireMechListMic);
 
     private sealed class Context : ISpnegoServerContext
     {
         private readonly IReadOnlyList<IGssMechanismFactory> _factories;
+        private readonly bool _requireMechListMic;
         private IGssMechanism? _mech;
         private bool _raw;                // raw NTLMSSP: no SPNEGO wrapping on responses
         private bool _supportedMechEmitted;
         private string? _selectedOid;
+        private byte[]? _mechListBytes;   // MechTypeList as received (signed by the mechListMIC, RFC 4178 §5)
 
-        public Context(IReadOnlyList<IGssMechanismFactory> factories) => _factories = factories;
+        public Context(IReadOnlyList<IGssMechanismFactory> factories, bool requireMechListMic)
+        {
+            _factories = factories;
+            _requireMechListMic = requireMechListMic;
+        }
 
         public GssResult Accept(ReadOnlySpan<byte> token)
         {
@@ -85,10 +105,15 @@ public sealed class SpnegoNegotiator : ISpnegoNegotiator
             catch (Exception) { return GssResult.Failed(NtStatus.InvalidParameter); }
 
             if (_mech is null)
+            {
+                // Remember the mechList exactly as received so the mechListMIC (in a later NegTokenResp)
+                // is verified against the on-wire bytes — that is what makes a strip detectable.
+                _mechListBytes = parsed.MechListBytes;
                 return SelectAndAccept(parsed);
+            }
 
             // Follow-up NegTokenResp for the already-selected mechanism.
-            return Wrap(_mech.Accept(parsed.MechToken ?? []));
+            return Wrap(_mech.Accept(parsed.MechToken ?? []), parsed.MechListMic);
         }
 
         /// <summary>Picks a mechanism from the client's NegTokenInit and runs the first step.</summary>
@@ -103,7 +128,7 @@ public sealed class SpnegoNegotiator : ISpnegoNegotiator
                 {
                     _mech = first.Create();
                     _selectedOid = first.MechOid;
-                    return Wrap(_mech.Accept(parsed.MechToken ?? []));
+                    return Wrap(_mech.Accept(parsed.MechToken ?? []), parsed.MechListMic);
                 }
 
                 // Otherwise select the first mutually-supported mechanism and ask the client to resend
@@ -126,12 +151,12 @@ public sealed class SpnegoNegotiator : ISpnegoNegotiator
             {
                 _mech = _factories[0].Create();
                 _selectedOid = _factories[0].MechOid;
-                return Wrap(_mech.Accept(parsed.MechToken ?? []));
+                return Wrap(_mech.Accept(parsed.MechToken ?? []), parsed.MechListMic);
             }
             return Reject(NtStatus.InvalidParameter);
         }
 
-        private GssResult Wrap(GssResult inner)
+        private GssResult Wrap(GssResult inner, byte[]? mechListMic)
         {
             if (_raw) return inner;
 
@@ -145,6 +170,12 @@ public sealed class SpnegoNegotiator : ISpnegoNegotiator
 
             if (inner.IsSuccess)
             {
+                // RFC 4178 §5 downgrade protection: the mechanism succeeded, so now verify the client's
+                // mechListMIC over the mechList we actually received (before completing the exchange).
+                NtStatus mic = VerifyMechListMic(inner.SessionKey, mechListMic);
+                if (mic != NtStatus.Success)
+                    return Reject(mic);
+
                 byte[] wrapped = SpnegoTokens.CreateNegTokenResp(
                     SpnegoTokens.NegStateAcceptCompleted, supportedMech, inner.OutToken);
                 return GssResult.Succeeded(inner.SessionKey!, inner.Identity!, wrapped);
@@ -155,6 +186,28 @@ public sealed class SpnegoNegotiator : ISpnegoNegotiator
                 Status = inner.Status,
                 OutToken = SpnegoTokens.CreateNegTokenResp(SpnegoTokens.NegStateReject),
             };
+        }
+
+        /// <summary>
+        /// Verifies the SPNEGO <c>mechListMIC</c> (RFC 4178 §5) once the mechanism has succeeded. Only
+        /// enforced when <see cref="RequireMechListMic"/> is set and the negotiated mechanism is NTLM
+        /// (whose GSS_getMIC this layer can compute from the session key). A required-but-absent or a
+        /// mismatching MIC is a downgrade → <see cref="NtStatus.AccessDenied"/>.
+        /// </summary>
+        private NtStatus VerifyMechListMic(byte[]? sessionKey, byte[]? mechListMic)
+        {
+            if (!_requireMechListMic) return NtStatus.Success;         // opt-in only
+            if (_selectedOid != GssOids.Ntlm) return NtStatus.Success; // only NTLM verifiable here
+            if (_mechListBytes is null) return NtStatus.Success;       // no SPNEGO mechList to protect
+
+            if (mechListMic is null || sessionKey is null)
+                return NtStatus.AccessDenied;                          // required but absent → downgrade
+
+            byte[] expected = NtlmCryptography.NtlmMechListMic(sessionKey, client: true, _mechListBytes);
+            return expected.Length == mechListMic.Length
+                   && CryptographicOperations.FixedTimeEquals(expected, mechListMic)
+                ? NtStatus.Success
+                : NtStatus.AccessDenied;
         }
 
         private static GssResult Reject(NtStatus status) => new()
