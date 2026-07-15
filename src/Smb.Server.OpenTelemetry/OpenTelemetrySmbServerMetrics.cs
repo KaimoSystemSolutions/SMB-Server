@@ -37,6 +37,8 @@ public class OpenTelemetrySmbServerMetrics : SmbServerMetrics, IDisposable
     private readonly Counter<long> _bytesRead;
     private readonly Counter<long> _bytesWritten;
     private readonly Counter<long> _lockContention;
+    private readonly Counter<long> _oplockBreaksSent;
+    private readonly Counter<long> _oplockBreakTimeouts;
     private readonly Histogram<double> _requestDuration;
     private readonly Histogram<double> _commandDuration;
 
@@ -52,6 +54,8 @@ public class OpenTelemetrySmbServerMetrics : SmbServerMetrics, IDisposable
         _bytesRead = _meter.CreateCounter<long>("smb.bytes.read", unit: "By", description: "Bytes read from shares.");
         _bytesWritten = _meter.CreateCounter<long>("smb.bytes.written", unit: "By", description: "Bytes written to shares.");
         _lockContention = _meter.CreateCounter<long>("smb.lock.contention", unit: "{event}", description: "Byte-range lock / sharing conflicts observed.");
+        _oplockBreaksSent = _meter.CreateCounter<long>("smb.oplock.breaks_sent", unit: "{break}", description: "Oplock/lease breaks sent that require an acknowledgment.");
+        _oplockBreakTimeouts = _meter.CreateCounter<long>("smb.oplock.break_timeouts", unit: "{break}", description: "Breaks whose acknowledgment did not arrive within the break timeout.");
         _requestDuration = _meter.CreateHistogram<double>("smb.request.duration", unit: "ms", description: "Wall-clock time to process an inbound SMB2 message.");
         _commandDuration = _meter.CreateHistogram<double>("smb.command.duration", unit: "ms", description: "Wall-clock time to dispatch a single SMB2 command.");
 
@@ -60,6 +64,9 @@ public class OpenTelemetrySmbServerMetrics : SmbServerMetrics, IDisposable
         _meter.CreateObservableUpDownCounter("smb.sessions.active", () => ActiveSessions, unit: "{session}", description: "Currently authenticated sessions.");
         _meter.CreateObservableUpDownCounter("smb.tree_connects.active", () => ActiveTreeConnects, unit: "{tree}", description: "Currently connected trees.");
         _meter.CreateObservableUpDownCounter("smb.handles.open", () => OpenHandles, unit: "{handle}", description: "Currently open file handles.");
+        // [W1.3] The gauge W0.3 asked for: a break outstanding here is a CREATE parked behind it. A value
+        // that stays above zero is "the file sticks" made measurable.
+        _meter.CreateObservableUpDownCounter("smb.oplock.pending_breaks", () => PendingBreaks, unit: "{break}", description: "Breaks sent and not yet acknowledged.");
     }
 
     public override void OnConnectionAccepted()
@@ -84,6 +91,18 @@ public class OpenTelemetrySmbServerMetrics : SmbServerMetrics, IDisposable
     {
         base.OnLockContention();
         _lockContention.Add(1);
+    }
+
+    public override void OnOplockBreakSent()
+    {
+        base.OnOplockBreakSent();
+        _oplockBreaksSent.Add(1);
+    }
+
+    public override void OnOplockBreakResolved(bool timedOut)
+    {
+        base.OnOplockBreakResolved(timedOut);
+        if (timedOut) _oplockBreakTimeouts.Add(1);
     }
 
     public override void OnRequestCompleted(double milliseconds)

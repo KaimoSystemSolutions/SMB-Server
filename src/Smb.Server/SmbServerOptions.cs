@@ -194,6 +194,19 @@ public sealed class SmbServerOptions
     public IOplockManager OplockManager { get; set; } = new InMemoryOplockManager();
 
     /// <summary>
+    /// [W1] How long a CREATE waits for the holder's oplock/lease break acknowledgment before it is
+    /// answered anyway (break-before-grant, §3.3.5.9.8). A break that costs the holder write or handle
+    /// caching means the holder still has dirty data client-side; answering the conflicting CREATE before
+    /// the holder flushed is exactly the cache-coherency gap this timeout bounds. Default 35 s — the value
+    /// Windows uses; the wait normally ends in milliseconds, the timeout only covers a client that stops
+    /// acknowledging (it then loses coherency for itself instead of stalling the other client forever).
+    /// <para><b><see cref="TimeSpan.Zero"/> or less disables blocking break-before-grant</b>: the holder is
+    /// downgraded immediately and the conflicting CREATE answers without waiting (the pre-W1 behaviour).
+    /// Only sensible where no client caches, or as an escape hatch from a misbehaving client.</para>
+    /// </summary>
+    public TimeSpan OplockBreakTimeout { get; set; } = TimeSpan.FromSeconds(35);
+
+    /// <summary>
     /// Lease management (SMB 2.1+ leases, Context §15). Default <see cref="InMemoryLeaseManager"/>
     /// (process-local). Set to <see cref="NullLeaseManager"/> to disable leasing (CREATE then always
     /// grants <see cref="LeaseState.None"/> and clients fall back to classic oplocks), or hook in a

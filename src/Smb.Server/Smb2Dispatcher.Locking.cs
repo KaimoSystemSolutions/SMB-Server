@@ -143,10 +143,11 @@ public sealed partial class Smb2Dispatcher
         h.SessionId = session.SessionId;
         h.CreditRequestResponse = 0; // Credits were already granted with the interim response.
 
-        // The final response is signed (if the session signs), unlike the interim response.
-        ResponseSegment seg = outcome == LockOutcome.Granted
-            ? MaybeSigned(session, h, LockMessage.BuildResponseBody())
-            : ResponseSegment.Unsigned(h, ErrorResponse.BuildBody());
+        // The final response is signed (unlike the interim), and — since the F1 lesson — that includes the
+        // failing statuses: a client that gets an unsigned STATUS_LOCK_NOT_GRANTED on a signed session
+        // discards it (§3.2.5.1.3) and waits out its own timeout instead of seeing the refusal.
+        ResponseSegment seg = SignedLikeRequest(session, header, h,
+            outcome == LockOutcome.Granted ? LockMessage.BuildResponseBody() : ErrorResponse.BuildBody());
 
         // Failover (M6.3): if the originating channel dropped while the lock was blocked, deliver the
         // final response on a surviving channel of the session instead.

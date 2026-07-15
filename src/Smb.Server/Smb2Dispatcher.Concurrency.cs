@@ -138,11 +138,11 @@ public sealed partial class Smb2Dispatcher
             if (frame.Reservation is { } reservation)
             {
                 using var _ = await reservation.AcquireAsync(cancellationToken).ConfigureAwait(false);
-                response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true).ConfigureAwait(false);
+                response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true, standalone: true).ConfigureAwait(false);
             }
             else
             {
-                response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true).ConfigureAwait(false);
+                response = await DispatchOneAsync(connection, header, frame.Message, frame.Encrypted, preValidated: true, standalone: true).ConfigureAwait(false);
             }
             trace?.SetStatus(response is { } tr ? tr.Header.Status : NtStatus.Success);
         }

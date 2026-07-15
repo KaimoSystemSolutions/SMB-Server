@@ -62,7 +62,7 @@ public class OplockTests : IDisposable
     }
 
     [Fact]
-    public async Task SecondOpen_BreaksHolderToLevelII_AndDowngradesNewOpen()
+    public async Task SecondOpen_BreaksHolderToLevelII_AndNotifiesTheHolder()
     {
         var (d, conn, sid, tid) = Setup();
         var sent = new ConcurrentQueue<byte[]>();
@@ -73,9 +73,13 @@ public class OplockTests : IDisposable
         (ulong fp, ulong fv) = ExtractCreateFileId(first);
         Assert.Equal((byte)OplockLevel.Batch, GrantedOplock(first));
 
-        // Second open on the same file → holder breaks to Level II, new open receives Level II.
-        byte[] second = OpenFile(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch);
-        Assert.Equal((byte)OplockLevel.LevelII, GrantedOplock(second));
+        // Second open on the same file → the holder breaks to Level II. [W1] Since break-before-grant, a
+        // Batch holder must flush and acknowledge first, so this CREATE parks and its Level II grant
+        // arrives out-of-band once the holder answers (covered by BreakBeforeGrantTests). What this test
+        // is about is the notification the holder receives, so it only walks that far.
+        Assert.Empty(OpenFileRaw(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch));
+
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(await WaitForSend(sent)).Status);   // the parked CREATE's interim
 
         // The first holder receives an out-of-band OPLOCK_BREAK notification (MessageId 0xFFFF…F).
         byte[] notify = await WaitForSend(sent);
@@ -96,7 +100,7 @@ public class OplockTests : IDisposable
 
         byte[] first = OpenFile(d, conn, sid, tid, 10, oplock: (byte)OplockLevel.Batch);
         (ulong fp, ulong fv) = ExtractCreateFileId(first);
-        OpenFile(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch); // triggers the break
+        OpenFileRaw(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch); // triggers the break (and parks, W1)
 
         // Holder confirms downgrade to Level II → server responds with OPLOCK_BREAK response.
         byte[] ack = d.ProcessMessage(conn,
@@ -167,15 +171,23 @@ public class OplockTests : IDisposable
         return (dispatcher, conn, sessionId, treeId);
     }
 
+    /// <summary>A CREATE that is expected to answer in-band (no break to wait for).</summary>
     private static byte[] OpenFile(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong mid, byte oplock)
     {
-        byte[] create = d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
-            mid, sid, tid, "doc.txt", desiredAccess: 0x00000003 /* read+write */,
-            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile,
-            requestedOplockLevel: oplock));
+        byte[] create = OpenFileRaw(d, conn, sid, tid, mid, oplock);
         Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
         return create;
     }
+
+    /// <summary>
+    /// A CREATE whose response is returned as-is. [W1] An open that breaks another holder's Batch/Exclusive
+    /// oplock parks behind the acknowledgment and answers out-of-band, so its in-band response is empty.
+    /// </summary>
+    private static byte[] OpenFileRaw(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong mid, byte oplock)
+        => d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+            mid, sid, tid, "doc.txt", desiredAccess: 0x00000003 /* read+write */,
+            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile,
+            requestedOplockLevel: oplock));
 
     /// <summary>Reads the OplockLevel byte (offset +2 in body) — valid for both CREATE response and OPLOCK_BREAK.</summary>
     private static byte GrantedOplock(byte[] message) => message[Smb2Header.Size + 2];

@@ -14,10 +14,16 @@ namespace Smb.Server.Oplocks;
 /// down to <see cref="OplockLevel.LevelII"/> (read caching is preserved); the new open receives
 /// at most Level II itself.</item>
 /// </list>
-/// This covers the core mechanics (Grant → Break → Acknowledge → Release). Intentionally <i>not</i>
-/// modelled: breaking Level II to None on a writing second access, and waiting for the
-/// acknowledgment before the conflicting access proceeds — both are deferred to a later pass
-/// (see README roadmap).
+/// This covers the core mechanics (Grant → Break → Acknowledge → Release).
+/// <para>
+/// <b>Waiting for the acknowledgment is not this class's job</b> (and, since W1, happens): the dispatcher
+/// parks the conflicting CREATE behind every break this manager reports until the holder acknowledges or
+/// the break times out (<c>SmbServerOptions.OplockBreakTimeout</c>, §3.3.5.9.8). Note the split that
+/// implies: the state here is downgraded <i>eagerly</i>, when the break is decided — the wait is about the
+/// holder's client-side dirty data, not about this dictionary. A custom manager inherits that behaviour by
+/// simply reporting its breaks.
+/// </para>
+/// <para>Still intentionally not modelled: breaking Level II to None on a writing second access.</para>
 /// </summary>
 public sealed class InMemoryOplockManager : IOplockManager
 {
@@ -26,8 +32,9 @@ public sealed class InMemoryOplockManager : IOplockManager
 
     public OplockGrant RequestOplock(SmbOpen open, OplockLevel requested)
     {
-        // Only handle classic oplocks; a lease (0xFF) goes via CREATE contexts and is
-        // not yet implemented → no oplock.
+        // Only handle classic oplocks. A lease (0xFF) is requested through a CREATE context and served by
+        // ILeaseManager instead (see InMemoryLeaseManager) — the two are mutually exclusive per open, so
+        // there is no oplock to grant here.
         if (requested is not (OplockLevel.LevelII or OplockLevel.Exclusive or OplockLevel.Batch))
             return OplockGrant.None;
 

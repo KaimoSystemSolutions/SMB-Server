@@ -62,6 +62,15 @@ flawlessly"):
 |---|-------|--------|-----|
 | **F3** | `SET_INFO/FileBasicInformation` was **acknowledged with `NtStatus.Success` and dropped** (comment: "no hard setting needed for browsing/writing"). | Timestamps and DOS attributes were **not settable** over SMB — while reporting success. Every copy loses the original's timestamps; Explorer's "read-only/hidden" checkboxes did nothing. | New opt-in seam `IBasicInfoStore` (pattern of `ISparseFileStore`), implemented by `LocalFileStore`; backends without the seam keep the old accept-and-drop (otherwise every Windows copy would fail outright). `FILE_WRITE_ATTRIBUTES` is now enforced. |
 | **F4** | `LocalFileHandle.Build()` reported `Attributes` **hard-coded as `Normal`** (resp. `Directory`) instead of reading them. | QUERY_INFO on an open handle contradicted a directory listing of the same file: hidden/read-only looked "normal" in the properties dialog. | `LocalFileStore.MapAttributes` is now used by both paths. |
+| **F5** (found 2026-07-15 while implementing W1, **not** lab-measured) | **F1 all over again, on the out-of-band path.** `SendAsyncFinalAsync` (CHANGE_NOTIFY, witness) and `SendFinalLockResponseAsync` (blocking LOCK) sent their **error/cancelled finals unsigned** on a signed session — literally `status.IsSuccess() ? MaybeSigned(...) : ResponseSegment.Unsigned(...)`. | Same mechanism as F1 (§3.2.5.1.3: the client *discards* it rather than failing the call), one path over: a client that CANCELs a CHANGE_NOTIFY, or is refused a blocking LOCK, never sees the answer and waits out its own timeout. `SignIfRequestWasSigned` does not cover these — nothing assembles an out-of-band final centrally. | New `SignedLikeRequest` helper applies §3.3.4.1.1 (request signed ⇒ response signed) to every async final. |
+
+> **The generalisable lesson from F1 + F5 — this root cause has now bitten three times.** Every place that
+> builds a response **outside** a central choke point re-decides signing, and re-decides it wrong. First the
+> sequential `BuildError` paths, then `ExecutePreparedFrameAsync` (the gotcha that cost time twice on
+> 2026-07-15), now the two out-of-band finals. The **TOP-GOTCHA is not "there are two dispatch paths"** — it is
+> that there are *four* places a response reaches the wire, and only two of them pass through
+> `SignIfRequestWasSigned`. Anything new that sends a response must state which one it uses. W1's parked CREATE
+> deliberately reuses `SendAsyncFinalAsync` for exactly this reason.
 
 ---
 
@@ -118,77 +127,101 @@ code is changed. Without this step you fix blind.
 
 ## Phase W1 — Break-before-grant: coherent oplock/lease semantics
 
-**Status: OPEN. Now the most plausible remaining candidate for "the file sticks" cases**, once F1/F2 removed
-the two hard freezes. Goal: the conflicting access **waits** for the break ack (or a timeout) before it
-proceeds — that is the Windows-conformant behaviour (§3.3.5.9.8) and closes cache-coherency gap #2 as well as
-the missing break clock #3.
+**Status: W1.1–W1.4 DONE (2026-07-15). W1.5 (lab verification) open.** Once F1/F2 removed the two hard
+freezes, this was the most plausible remaining candidate for "the file sticks". The conflicting access now
+**waits** for the break ack (or a timeout) before it proceeds — the Windows-conformant behaviour
+(§3.3.5.9.8), closing cache-coherency gap #2 and the missing break clock #3.
 
-### The constraint that decides this design — read first
+### ⚠️ The design constraint below was analysed correctly and concluded wrongly — read this first
 
-**A CREATE parked waiting for a break ack deadlocks with the ack that would release it**, unless the ack is
-taken off the barrier. Verified in the code:
+The section that used to stand here declared **W1.0 (take the break ack off the barrier) a hard prerequisite**,
+because *"a CREATE parked waiting for a break ack deadlocks with the ack that would release it"*. Every
+individual fact in that analysis is true. The conclusion is not, and **W1.0 was not implemented — it is not
+needed.** Why:
 
-- The host read loop runs a barrier frame only after `await DrainInflightAsync()` — it waits for **all**
-  running concurrent frames (`SmbConnectionHandler.cs:169-171`).
-- `OPLOCK_BREAK` (which carries both the oplock ack and, routed by StructureSize, the lease ack) is **not**
-  in the concurrent classifier (`Smb2Dispatcher.Concurrency.cs`, `TryClassifyConcurrent` → `default: return false`)
-  ⇒ it is a barrier frame.
-- CREATE **is** concurrent-eligible ("runs free") and would therefore be in `_inflight` while parked.
+- The deadlock only exists if the parked CREATE's **frame** stays in `_inflight` while it waits, i.e. if the
+  handler `await`s the ack inline. That was an unstated assumption.
+- **W1.1 itself prescribed the opposite** ("STATUS_PENDING interim **exactly as CHANGE_NOTIFY does**").
+  CHANGE_NOTIFY does not park its frame: it registers the wait, answers with an interim, and the frame
+  completes. The two halves of the plan contradicted each other, and the half that was written down as the
+  blocker won the reader's attention.
+- **Park the response, not the frame** and the deadlock dissolves: the CREATE frame returns as soon as the
+  interim and the notification are out, so it has already left `_inflight` when the ack arrives — the barrier
+  drains an empty-of-this-CREATE list and the ack gets through. The concurrency classifier is untouched.
 
-So: parked CREATE ∈ `_inflight` → ack arrives → barrier drains `_inflight` → waits for the CREATE → which
-waits for the ack. **Deadlock until the break timeout fires.** Naively implementing W1.1 produces exactly this,
-and the symptom would be a *new* ~35 s freeze that looks like the old one.
+**The inline-await design would in fact have had a *second*, worse deadlock that the analysis did not
+cover:** with `ConcurrentMetadataOps=false` — **still the default** (W2.1) — CREATE is a *barrier*, so the
+read loop sits inside `await ProcessMessageAsync(create)` (`SmbConnectionHandler.cs:171-172`) and never reads
+the ack frame **at all**, off-barrier classification or not. W1.0 would have bought a deadlock fix that only
+worked with a flag that is off by default. The chosen design works with the flag on **and** off.
 
-**⇒ W1.0 is a hard prerequisite for W1.1.** Do not reorder.
+**Lesson, and it is the same one F1/F2 taught:** the prose that names itself the blocker gets believed. This
+one survived a full planning pass because it was specific, code-referenced and confidently worded — all of
+which it was, while resting on an assumption nobody stated. Re-derive the constraint from the design you are
+actually about to write, not from the design the plan assumed.
 
-### W1.0 — Take the break ack off the barrier (prerequisite)
-- Classify `OPLOCK_BREAK` as concurrent-eligible. It is *acknowledgment-like*, not lifecycle: it mutates
-  oplock/lease manager state (already lock-protected, in-memory, atomic per A3), allocates nothing that a
-  later frame references, and tears nothing down. The oplock ack is keyed by FileId, the lease ack is FileId-less
-  and keyed by LeaseKey — so the lease ack takes **no** per-open scope reservation (there is no open to key it
-  to), the oplock ack may take a shared one.
-- **Files:** `Smb2Dispatcher.Concurrency.cs` (`TryClassifyConcurrent` + class doc), `Smb2Dispatcher.Oplock.cs`
-  (ack routing).
-- **Test:** a parked CREATE (W1.1) is released by an ack that arrives on the same connection — the test that
-  proves the absence of the deadlock. Add it *with* W1.1; W1.0 alone is not observable.
-- **Note:** if the classification turns out to be unsafe, the fallback is to keep the ack on the barrier and
-  have `DrainInflightAsync` skip frames parked on a break (an explicit "parked" flag on the inflight entry).
-  That is more code and more invariants — prefer the classification.
+### W1.0 — Take the break ack off the barrier ⬜ NOT NEEDED (see above)
+Not implemented, deliberately, and there is no reason to revisit it: `OPLOCK_BREAK` stays a barrier frame.
+Keep it that way — the ack mutates manager state and making it concurrent buys nothing now that no frame
+parks.
 
-### W1.1 — Blocking break in the CREATE path
-- When a CREATE triggers a break, park the triggering op **pending** (STATUS_PENDING interim exactly as
-  CHANGE_NOTIFY does — reuse `InterimResponse`/`PendingAsyncRequest`/`SendAsyncFinalAsync`/`NotifyOnce` from
-  `Smb2Dispatcher.Notification.cs`) until the holder acks or the break timeout fires; only then send the CREATE
-  response.
-- **Not every break waits.** Per §2.2.23/§2.2.25 the ack-required bit decides: a break **to** LEVEL_II/READ
-  that the holder need not acknowledge (nothing to flush) completes immediately; a break that takes WRITE or
-  HANDLE caching away (dirty data / open handles to close) sets ack-required and must be waited on. Model this
-  on the flag the manager already computes, not on a blanket "always wait" — waiting where Windows does not
-  expect it is a new stall.
-- **The interim must go out before the break notification is sent**, otherwise the client can ack a break for a
-  request it has not yet seen a response for. Order: park → interim → send break → await.
-- **Files:** `Smb2Dispatcher.FileCommands.cs` (CREATE conflict path), `.Oplock.cs`, `.Lease.cs`.
-- **Tests:** CREATE-behind-break parks → ack → CREATE completes; a parallel READ by the second opener sees
-  consistent data only after the ack; a break that does not require an ack does **not** park.
+### W1.1 — Blocking break in the CREATE path ✅ DONE
+- A CREATE that triggers an ack-required break parks: **interim → notification → wait → final out-of-band**
+  (`ParkCreateBehindBreakAsync` / `CompleteParkedCreateAsync` in `Smb2Dispatcher.FileCommands.cs`).
+- **Deviation from the CHANGE_NOTIFY pattern, forced by W1.1's own ordering rule:** the interim is written
+  *inside* the handler (awaited `SendOutOfBandAsync`) and the frame answers with **nothing** (`null`), instead
+  of returning the interim for the caller to write. Returning it would leave "interim before notification" to
+  a race between two tasks — the handler returns, and only then does the caller assemble and write, while the
+  break send is already in flight. `HandleCreateAsync` therefore returns `ResponseSegment?`.
+- **The response body is built after the wait, not before.** That is the whole point: the file the holder
+  flushes into is the file whose size/timestamps the response reports. `BuildCreateBodyAsync` is a local
+  function so both paths share it.
+- **Not every break waits** (as planned): lease → ack required iff Write or Handle caching is lost; classic
+  oplock → iff the holder's level *was* Exclusive/Batch (a LEVEL_II holder never acks a LEVEL_II→None break,
+  §3.3.4.6 — waiting for that ack would stall until the timeout for nothing). The oplock from-level is read
+  from `open.OplockLevel` **before** the mirror is overwritten: the mirror is what the *client* was granted,
+  which is what decides whether the client will ack at all.
+- **Single source of truth:** `LeaseAckRequired` now feeds **both** the wire flag in `SendLeaseBreakAsync`
+  **and** the wait decision, so "we told the client to ack" and "we are waiting for an ack" cannot drift apart.
+- **New carve-out — a compound CREATE does not park.** A compound chain assembles one response; an element
+  answering out-of-band later would let its followers (QUERY_INFO/CLOSE) reply ahead of it. Windows sends
+  CREATE+QUERY_INFO+CLOSE for metadata probes, and those opens do not cache, so no coherency is lost. Needed a
+  `standalone` flag threaded through `DispatchOneAsync`; it is *exact*, not a heuristic
+  (`offset == 0 && NextCommand == 0 && !RelatedOperations`).
+- **A parked CREATE is deliberately not cancellable.** §3.3.5.16 lets the server ignore a cancel it cannot
+  service, and here cancelling would be actively harmful: the open already exists, so a client that never
+  learns its FileId could never close it. The timeout bounds the wait instead.
+- **Files:** `Smb2Dispatcher.FileCommands.cs`, `.Oplock.cs`, `.Lease.cs`, `.cs` (standalone flag + signing),
+  `.Concurrency.cs` (passes `standalone: true` — the concurrent path is single-frame by construction).
 
-### W1.2 — Break timeout + force downgrade
-- One clock per sent break (`TimeProvider`, like the durable scavenger). No ack within the timeout (Windows
-  uses ~35 s) → force-downgrade the holder, avoid a manager leak, release the parked CREATE.
-- A late ack after the timeout must be ignored cleanly (`NotifyOnce` pattern — it exists for exactly this).
-- **Files:** new break tracker in `Smb.Server/Oplocks`/`Leases`.
-- **Tests:** timeout without ack → force downgrade + CREATE completes (drive `TimeProvider`, no real waiting —
-  the suite must stay fast and non-flaky); a late ack afterwards is a clean no-op.
+### W1.2 — Break timeout + force downgrade ✅ DONE (the "force downgrade" half turned out to be a no-op)
+- New `SmbServerOptions.OplockBreakTimeout`, default **35 s** (the Windows value). One `ITimer` per break off
+  the server's `TimeProvider`, in the new `BreakWaitTracker` (`src/Smb.Server/Oplocks/BreakWaitTracker.cs`).
+- **There is no force-downgrade to do, and no manager leak to avoid** — the plan assumed a lazier manager than
+  this codebase has. `InMemoryOplockManager.RequestOplock` / `InMemoryLeaseManager.RequestLease` downgrade
+  their state **eagerly**, when the break is *decided*. The wait is purely about the holder's client-side dirty
+  data, so a timeout has nothing left to force: it just releases the waiter. The manager stays the single
+  authority over caching state; a second downgrade here would be a competing one.
+- A late ack is a clean no-op (the tracker entry is gone) **and is still answered normally** — the ack is a
+  valid frame regardless of whether anyone was waiting for it.
+- **⬜ Consumer-visible:** `OplockBreakTimeout = TimeSpan.Zero` (or less) disables blocking break-before-grant
+  and restores the pre-W1 behaviour. Documented as the escape hatch for a misbehaving client.
 
-### W1.3 — Observability
-- Emit `smb.oplock.pending_breaks` and the break wait time through the existing OTel bridge (the W0.3 attribute
-  that was never implemented). Without it, "the file sticks" stays unmeasurable in production — which is the
-  whole reason this phase exists.
+### W1.3 — Observability ✅ DONE
+- `SmbServerMetrics`: `PendingBreaks` (gauge), `OplockBreaksSent`, `OplockBreakTimeouts` (+ `MetricsSnapshot`).
+  OTel bridge: **`smb.oplock.pending_breaks`** (the W0.3 attribute that was never implemented),
+  `smb.oplock.breaks_sent`, `smb.oplock.break_timeouts`.
+- `OplockBreakTimeouts > 0` is the production signal behind "the file sticks": clients holding caching
+  guarantees they no longer honour. It was previously unmeasurable, which is why the phase existed.
+- Break *wait time* is not emitted separately — the parked CREATE's own `smb.command.duration` already carries
+  it (the span covers the whole parked op), so a second histogram would measure the same thing twice.
 
-### W1.4 — Doc correction
-- Bring the outdated "lease not implemented" comment in `InMemoryOplockManager` (baseline finding #7) and the
-  "deferred" paragraphs in `.Oplock.cs`/`.Lease.cs` in line with the new behaviour.
+### W1.4 — Doc correction ✅ DONE
+Baseline finding #7 (`InMemoryOplockManager`'s "a lease … is not yet implemented") and the "deferred to a
+later pass" paragraphs in `.Oplock.cs` / `.Lease.cs` / both managers now describe the implemented behaviour,
+including the split that matters: **the manager decides breaks, the dispatcher waits for them.**
 
-### W1.5 — Verify against the real client
+### W1.5 — Verify against the real client ⬜ OPEN
 - Lab case: hold a file open in one process with a lease, open it conflicting from a second — the second open
   must not return before the break is resolved, and must not take ~35 s either (that would mean the ack is not
   arriving/not being matched — the F2 failure mode, one level up).
@@ -643,4 +676,74 @@ touches the policy and stays synchronous.
     (already documented on the option).
   - **Nothing implemented for W1/W3 in this entry** — plan only. Next action: **W1.0 + W1.1 together** (W1.0
     alone is not observable), then W1.2.
+- **2026-07-15** — **W1.1–W1.4 IMPLEMENTED (break-before-grant). The plan's own blocker, W1.0, turned out to
+  be unnecessary — and the design it prescribed instead had a second, worse deadlock.**
+  - **The W1.0 correction is the headline.** The analysis ("parked CREATE ∈ `_inflight` → ack barrier drains
+    `_inflight` → deadlock") is factually right but rests on an unstated assumption: that the CREATE `await`s
+    the ack **inline**, keeping its frame in flight. W1.1 in the same document prescribed the opposite
+    ("interim **exactly as CHANGE_NOTIFY does**" — which does *not* park its frame). **Park the response, not
+    the frame:** the CREATE returns as soon as interim + notification are out, so it has left `_inflight`
+    before the ack arrives; the barrier drains fine; the classifier is untouched. `OPLOCK_BREAK` stays a
+    barrier frame. **And the prescribed design was worse than "just more code":** with
+    `ConcurrentMetadataOps=false` (**still the default**) CREATE *is* the barrier, so the read loop would sit
+    inside `await ProcessMessageAsync(create)` and never read the ack **regardless** of how OPLOCK_BREAK is
+    classified — W1.0 would have fixed a deadlock only for the non-default flag setting. The implemented
+    design works with the flag on and off; `AcknowledgmentOnTheSameConnection_ReleasesParkedCreate_WithoutDeadlock`
+    is the proof. **Meta-lesson (same shape as F1/F2):** the paragraph that declares itself the blocker gets
+    believed — it was specific, code-referenced and confidently worded, and still wrong. Re-derive the
+    constraint from the design you are about to write.
+  - **Deviation from the CHANGE_NOTIFY pattern, forced by W1.1's own ordering rule** ("interim before
+    notification", §2.2.24): the interim is written **inside** the handler (awaited `SendOutOfBandAsync`) and
+    the frame answers `null`. Returning the interim as the frame's response would leave the ordering to a race
+    — the handler returns, *then* the caller assembles and writes, while the break send is already in flight
+    and a fast holder could ack, releasing the final before the client has seen the AsyncId it is tagged with.
+    `HandleCreateAsync` is now `ValueTask<ResponseSegment?>`.
+  - **New carve-out: a compound CREATE never parks.** One assembled response per chain ⇒ an element answering
+    out-of-band later would let CREATE+QUERY_INFO+CLOSE reply out of order. Those probe opens do not cache, so
+    no coherency is lost. Threaded a `standalone` flag through `DispatchOneAsync`; exact, not heuristic
+    (`offset == 0 && NextCommand == 0 && !RelatedOperations`). The concurrent path is standalone by
+    construction (`TryBeginConcurrentFrame` rejects compounds).
+  - **W1.2's "force downgrade + avoid a manager leak" was a no-op against this codebase** — the plan assumed a
+    lazier manager. Both default managers downgrade **eagerly** when they *decide* the break, so a timeout has
+    no state left to force and there is no leak: it only releases the waiter. New
+    `SmbServerOptions.OplockBreakTimeout` (default 35 s, the Windows value), `BreakWaitTracker` with one
+    `ITimer` per break off the server `TimeProvider`. **Consumer-visible:** `TimeSpan.Zero` disables blocking
+    break-before-grant (pre-W1 behaviour) — the escape hatch for a misbehaving client.
+  - **F5 found while wiring this up — F1's root cause, third instance.** `SendAsyncFinalAsync` /
+    `SendFinalLockResponseAsync` sent **error finals unsigned** on a signed session ⇒ a Windows client
+    discards a cancelled CHANGE_NOTIFY / refused blocking LOCK and waits out its own timeout. Fixed
+    (`SignedLikeRequest`). **The TOP-GOTCHA needs restating:** it is not "there are two dispatch paths" — there
+    are **four places a response reaches the wire, and only two pass through `SignIfRequestWasSigned`**. See
+    the F5 row in the freeze-cause table.
+  - **Ack-required is now single-sourced.** `LeaseAckRequired` feeds both the wire flag and the wait decision
+    (they could previously have drifted). Classic oplocks: ack required iff the holder's level *was*
+    Exclusive/Batch — read from `open.OplockLevel` **before** the mirror is overwritten, because the mirror is
+    what the *client* was granted and that is what decides whether it acks at all (§3.3.4.6: a LEVEL_II holder
+    never acks a LEVEL_II→None break). Directory-lease breaks (`BreakParentDirectoryLease`) are deliberately
+    **never** waited on: they invalidate a listing of a *different* file than the one being created (§3.3.4.18).
+  - **A parked CREATE is deliberately not cancellable** (§3.3.5.16 permits ignoring an unserviceable cancel):
+    the open already exists, so a client that never learns its FileId could never close it. The timeout bounds
+    the wait.
+  - **4 existing tests encoded the pre-W1 behaviour** and were updated (OplockTests ×2, LeaseDispatcherTests
+    ×2) — same story the roadmap already recorded for F1/F2: written against the implementation, not the spec.
+    They now assert the notification wire shape and let `BreakBeforeGrantTests` own the park/ack round trip.
+  - **Test gotcha (real, cost a design decision):** the repo's existing `ManualTimeProvider`
+    (DurableHandleTests/TimeoutTests) overrides **only `GetUtcNow`** — it does **not** drive
+    `TimeProvider.CreateTimer`, so a break timer armed through it would sit on the *real* clock (a 35 s sleep,
+    or a flake). `BreakBeforeGrantTests` carries a fake that drives timers too.
+  - **Verification status — honest:** `BreakBeforeGrantTests` (7 new) ran **green in 960 ms** (no real waits).
+    **The full suite was NOT re-run after the 4 legacy tests were updated**: a **Visual Studio uninstall
+    started on this machine mid-session** (MsiInstaller, 22:05–22:07) and removed .NET 10 *and* emptied the
+    .NET 9 runtime folders (`C:\Program Files\dotnet\shared\Microsoft.NETCore.App\9.0.2` and `9.0.8` are now 0
+    items; `host\fxr` has no 9.x). Only SDK 8.0.406 is left, which cannot target net9 ⇒ nothing in this repo
+    builds until .NET 9 is reinstalled. **Before committing: reinstall the .NET 9 SDK/runtime and re-run
+    `dotnet test tests/Smb.Tests`.** Expected 595 + 7 new = **602**, minus nothing (the 4 updated tests keep
+    their names except two renames: `SecondOpen_BreaksHolderToLevelII_AndNotifiesTheHolder`,
+    `SecondDistinctLeaseKey_BreaksHolderToRead_AndNotifiesTheHolder`).
+  - **Next action: W1.5** — verify against the real client in the W0.1 lab (hold a file open with a lease,
+    open it conflicting from a second process: the second open must not return before the break resolves, and
+    must not take ~35 s either — a 35 s wait means the ack is not arriving/not being matched, the F2 failure
+    mode one level up). Then **W3** (CHANGE_NOTIFY buffering gap + W3.2 `STATUS_NOTIFY_CLEANUP` leak) and the
+    **W2.1 default flip**, which is now more attractive than before: the W1 design deliberately does not
+    depend on it.
 - _(append progress here, tick off items in the phases)_

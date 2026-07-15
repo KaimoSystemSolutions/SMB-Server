@@ -30,11 +30,14 @@ public class SmbServerMetrics
     private long _bytesRead;
     private long _bytesWritten;
     private long _lockContention;
+    private long _oplockBreaksSent;
+    private long _oplockBreakTimeouts;
 
     private long _activeConnections;
     private long _activeSessions;
     private long _activeTreeConnects;
     private long _openHandles;
+    private long _pendingBreaks;
 
     private readonly ConcurrentDictionary<string, long[]> _perShareBytes = new(StringComparer.OrdinalIgnoreCase);
     private readonly LatencyHistogram _latency = new();
@@ -48,11 +51,24 @@ public class SmbServerMetrics
     public long BytesWritten => Interlocked.Read(ref _bytesWritten);
     public long LockContentionCount => Interlocked.Read(ref _lockContention);
 
+    /// <summary>[W1.3] Oplock/lease breaks sent that required an acknowledgment, since start.</summary>
+    public long OplockBreaksSent => Interlocked.Read(ref _oplockBreaksSent);
+
+    /// <summary>
+    /// [W1.3] Breaks whose acknowledgment never arrived within <c>SmbServerOptions.OplockBreakTimeout</c>,
+    /// since start. Non-zero means clients are holding caching guarantees they no longer honour — the
+    /// signal behind "the file sticks" reports, which are otherwise unmeasurable in production.
+    /// </summary>
+    public long OplockBreakTimeouts => Interlocked.Read(ref _oplockBreakTimeouts);
+
     // --- gauges ---
     public long ActiveConnections => Interlocked.Read(ref _activeConnections);
     public long ActiveSessions => Interlocked.Read(ref _activeSessions);
     public long ActiveTreeConnects => Interlocked.Read(ref _activeTreeConnects);
     public long OpenHandles => Interlocked.Read(ref _openHandles);
+
+    /// <summary>[W1.3] Breaks currently sent and unacknowledged (each one is a CREATE waiting, or a holder gone quiet).</summary>
+    public long PendingBreaks => Interlocked.Read(ref _pendingBreaks);
 
     // --- mutation (called by the server internals; harmless if a consumer calls them) ---
     public virtual void OnConnectionAccepted() { Interlocked.Increment(ref _connectionsAccepted); Interlocked.Increment(ref _activeConnections); }
@@ -65,6 +81,23 @@ public class SmbServerMetrics
     public virtual void OnHandleOpened() => Interlocked.Increment(ref _openHandles);
     public virtual void OnHandleClosed() => Interlocked.Decrement(ref _openHandles);
     public virtual void OnLockContention() => Interlocked.Increment(ref _lockContention);
+
+    /// <summary>[W1.3] An oplock/lease break requiring an acknowledgment was sent to its holder.</summary>
+    public virtual void OnOplockBreakSent()
+    {
+        Interlocked.Increment(ref _oplockBreaksSent);
+        Interlocked.Increment(ref _pendingBreaks);
+    }
+
+    /// <summary>
+    /// [W1.3] A sent break stopped being outstanding — either the holder acknowledged, or
+    /// <paramref name="timedOut"/> and the server gave up waiting.
+    /// </summary>
+    public virtual void OnOplockBreakResolved(bool timedOut)
+    {
+        Interlocked.Decrement(ref _pendingBreaks);
+        if (timedOut) Interlocked.Increment(ref _oplockBreakTimeouts);
+    }
 
     public virtual void OnRequestCompleted(double milliseconds)
     {
@@ -118,6 +151,9 @@ public class SmbServerMetrics
             BytesRead = BytesRead,
             BytesWritten = BytesWritten,
             LockContentionCount = LockContentionCount,
+            OplockBreaksSent = OplockBreaksSent,
+            OplockBreakTimeouts = OplockBreakTimeouts,
+            PendingBreaks = PendingBreaks,
             RequestLatencyP50Ms = p50,
             RequestLatencyP95Ms = p95,
             RequestLatencyP99Ms = p99,
@@ -140,6 +176,9 @@ public sealed record MetricsSnapshot
     public long BytesRead { get; init; }
     public long BytesWritten { get; init; }
     public long LockContentionCount { get; init; }
+    public long OplockBreaksSent { get; init; }
+    public long OplockBreakTimeouts { get; init; }
+    public long PendingBreaks { get; init; }
     public double RequestLatencyP50Ms { get; init; }
     public double RequestLatencyP95Ms { get; init; }
     public double RequestLatencyP99Ms { get; init; }

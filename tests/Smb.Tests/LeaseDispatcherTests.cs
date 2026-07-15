@@ -50,7 +50,7 @@ public class LeaseDispatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task SecondDistinctLeaseKey_BreaksHolderToRead_AndDowngradesNewOpen()
+    public async Task SecondDistinctLeaseKey_BreaksHolderToRead_AndNotifiesTheHolder()
     {
         var (d, conn, sid, tid) = Setup();
         var sent = new ConcurrentQueue<byte[]>();
@@ -62,9 +62,12 @@ public class LeaseDispatcherTests : IDisposable
         byte[] first = OpenWithLease(d, conn, sid, tid, 10, k1, LeaseState.ReadWriteHandle);
         Assert.Equal(LeaseState.ReadWriteHandle, GrantedLeaseState(first));
 
-        // Second open, distinct key, same file → holder breaks to Read, new open receives Read.
-        byte[] second = OpenWithLease(d, conn, sid, tid, 11, k2, LeaseState.ReadWriteHandle);
-        Assert.Equal(LeaseState.Read, GrantedLeaseState(second));
+        // Second open, distinct key, same file → the holder breaks to Read. [W1] Losing W/H means the
+        // holder must flush and acknowledge first, so this CREATE parks and its Read grant arrives
+        // out-of-band (covered by BreakBeforeGrantTests). This test is about the holder's notification.
+        Assert.Empty(OpenWithLeaseRaw(d, conn, sid, tid, 11, k2, LeaseState.ReadWriteHandle));
+
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(await WaitForSend(sent)).Status);   // the parked CREATE's interim
 
         // The first holder receives an out-of-band LEASE_BREAK notification (MessageId 0xFFFF…F).
         byte[] notify = await WaitForSend(sent);
@@ -86,7 +89,7 @@ public class LeaseDispatcherTests : IDisposable
 
         byte[] k1 = Key(0x01), k2 = Key(0x02);
         OpenWithLease(d, conn, sid, tid, 10, k1, LeaseState.ReadWriteHandle);
-        OpenWithLease(d, conn, sid, tid, 11, k2, LeaseState.ReadWriteHandle); // triggers the break
+        OpenWithLeaseRaw(d, conn, sid, tid, 11, k2, LeaseState.ReadWriteHandle); // triggers the break (and parks, W1)
 
         // Holder confirms downgrade to Read → server responds with a LEASE_BREAK response (§2.2.25.2).
         byte[] ack = d.ProcessMessage(conn, TestHelpers.BuildLeaseBreakAck(12, sid, tid, k1, LeaseState.Read));
@@ -155,17 +158,26 @@ public class LeaseDispatcherTests : IDisposable
         return (dispatcher, conn, sessionId, treeId);
     }
 
+    /// <summary>A lease CREATE that is expected to answer in-band (no break to wait for).</summary>
     private static byte[] OpenWithLease(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid,
         ulong mid, byte[] leaseKey, LeaseState requested)
     {
-        byte[] create = d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+        byte[] create = OpenWithLeaseRaw(d, conn, sid, tid, mid, leaseKey, requested);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        return create;
+    }
+
+    /// <summary>
+    /// A lease CREATE whose response is returned as-is. [W1] An open that costs another lease its
+    /// write/handle caching parks behind the acknowledgment and answers out-of-band → empty in-band response.
+    /// </summary>
+    private static byte[] OpenWithLeaseRaw(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid,
+        ulong mid, byte[] leaseKey, LeaseState requested)
+        => d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
             mid, sid, tid, "doc.txt", desiredAccess: 0x00000003 /* read+write */,
             disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile,
             requestedOplockLevel: LeaseOplock,
             createContexts: TestHelpers.BuildLeaseV1Context(leaseKey, requested)));
-        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
-        return create;
-    }
 
     private static byte[] Key(byte value)
     {

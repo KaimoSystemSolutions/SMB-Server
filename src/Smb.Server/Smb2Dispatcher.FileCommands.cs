@@ -54,7 +54,12 @@ public sealed partial class Smb2Dispatcher
     private bool TryGetOpen(SmbSession session, ulong persistent, ulong volatileId, out SmbOpen open)
         => session.Opens.TryGetValue((persistent, volatileId), out open!);
 
-    private async ValueTask<ResponseSegment> HandleCreateAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted)
+    /// <summary>
+    /// CREATE (§3.3.5.9). <paramref name="standalone"/> = the request is a whole message on its own, which
+    /// is the precondition for parking it behind an oplock/lease break acknowledgment (W1.1, see the tail
+    /// of this method).
+    /// </summary>
+    private async ValueTask<ResponseSegment?> HandleCreateAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted, bool standalone)
     {
         if (!TryGetValidSession(connection, header.SessionId, out SmbSession session))
             return BuildError(header, NtStatus.UserSessionDeleted);
@@ -224,6 +229,10 @@ public sealed partial class Smb2Dispatcher
         OplockLevel grantedOplock;
         var responseCtxList = new List<CreateContext>();
 
+        // [W1.1] The breaks this open forces on other holders are *armed* here (registered with the break
+        // tracker, holder state mirrored) but sent further down — after this CREATE's interim, if it parks.
+        ArmedBreaks armed = ArmedBreaks.None;
+
         CreateContext? leaseContext = CreateContextList.Find(request.Contexts, CreateContextNames.Lease);
         if (leaseContext is not null)
         {
@@ -234,7 +243,7 @@ public sealed partial class Smb2Dispatcher
             LeaseGrant leaseGrant = _server.Options.LeaseManager.RequestLease(open, leaseReq);
             open.LeaseState = leaseGrant.GrantedState;
             open.LeaseEpoch = leaseGrant.Epoch;
-            DispatchLeaseBreaks(leaseGrant.Breaks);
+            armed = ArmLeaseBreaks(leaseGrant.Breaks, track: true);
 
             grantedOplock = OplockLevel.Lease;
             responseCtxList.Add(new CreateContext
@@ -249,7 +258,7 @@ public sealed partial class Smb2Dispatcher
             // any breaks due to other holders, who are notified out-of-band.
             OplockGrant grant = _server.Options.OplockManager.RequestOplock(open, request.RequestedOplockLevel);
             grantedOplock = grant.GrantedLevel;
-            DispatchOplockBreaks(grant.Breaks);
+            armed = ArmOplockBreaks(grant.Breaks, track: true);
         }
         open.OplockLevel = grantedOplock;
 
@@ -303,24 +312,136 @@ public sealed partial class Smb2Dispatcher
         Audit(SmbAuditEventType.FileOpened, SmbLogLevel.Information, connection,
             user: DescribeIdentity(session.Identity), share: tree.Share.Name, path: request.Name);
 
-        byte[]? responseContexts = responseCtxList.Count > 0 ? CreateContextList.Serialize(responseCtxList) : null;
-        FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
-        var response = new CreateResponse
-        {
-            OplockLevel = grantedOplock,
-            CreateAction = (CreateAction)(uint)outcome,
-            CreationTime = info.CreationTime,
-            LastAccessTime = info.LastAccessTime,
-            LastWriteTime = info.LastWriteTime,
-            ChangeTime = info.ChangeTime,
-            AllocationSize = info.AllocationSize,
-            EndOfFile = info.EndOfFile,
-            FileAttributes = (uint)info.Attributes,
-            PersistentFileId = open.PersistentFileId,
-            VolatileFileId = open.VolatileFileId,
-        };
+        // [W1.1] Break-before-grant (§3.3.5.9.8). If this open cost another holder its write/handle caching,
+        // that holder still has dirty data client-side. Withhold the response — and with it the FileId the
+        // client needs to read anything at all — until the holder has acknowledged (or the break timed out,
+        // W1.2). This is also why the body is built *after* the wait: the file the holder flushes into is
+        // the file whose size/timestamps this response reports.
+        if (armed.Wait is { } breakWait && standalone)
+            return await ParkCreateBehindBreakAsync(
+                connection, header, session, open, armed, breakWait, BuildCreateBodyAsync).ConfigureAwait(false);
 
-        return MaybeSigned(session, RespHeader(header, session), response.ToBody(responseContexts));
+        // Nothing to wait for (no break, none needing an acknowledgment, blocking disabled, or a compound
+        // element that cannot answer out-of-band): send the notifications and answer straight away.
+        _ = SendArmedBreaksAsync(armed);
+        return MaybeSigned(session, RespHeader(header, session), await BuildCreateBodyAsync().ConfigureAwait(false));
+
+        async ValueTask<byte[]> BuildCreateBodyAsync()
+        {
+            byte[]? responseContexts = responseCtxList.Count > 0 ? CreateContextList.Serialize(responseCtxList) : null;
+            FileEntryInfo info = await handle.GetInfoAsync().ConfigureAwait(false);
+            var response = new CreateResponse
+            {
+                OplockLevel = grantedOplock,
+                CreateAction = (CreateAction)(uint)outcome,
+                CreationTime = info.CreationTime,
+                LastAccessTime = info.LastAccessTime,
+                LastWriteTime = info.LastWriteTime,
+                ChangeTime = info.ChangeTime,
+                AllocationSize = info.AllocationSize,
+                EndOfFile = info.EndOfFile,
+                FileAttributes = (uint)info.Attributes,
+                PersistentFileId = open.PersistentFileId,
+                VolatileFileId = open.VolatileFileId,
+            };
+            return response.ToBody(responseContexts);
+        }
+    }
+
+    /// <summary>
+    /// [W1.1/W1.2] Parks a CREATE that broke another holder's caching until the holder acknowledges or the
+    /// break times out, then answers out-of-band with an ASYNC final (§3.3.4.2) — the CHANGE_NOTIFY
+    /// mechanism, with one deliberate difference: the interim is written <i>here</i> rather than returned to
+    /// the caller. The order interim → notification → wait is load-bearing (§2.2.24): send the notification
+    /// first and a fast holder could acknowledge, releasing the final, before the client has even seen the
+    /// AsyncId that final is tagged with. Returning the interim as the frame's response would leave that
+    /// order to a race between two tasks, so this path writes it itself and the frame answers with nothing.
+    /// <para>
+    /// <b>Why this does not deadlock the connection</b> (the trap W1.0 was written for): the frame does not
+    /// stay in flight while parked. It returns as soon as the interim and the notification are out, so the
+    /// host's read loop is free to read the acknowledgment — whether OPLOCK_BREAK arrives as a barrier frame
+    /// (it drains an in-flight list this CREATE has already left) or, with ConcurrentMetadataOps off, while
+    /// the read loop would otherwise still be sitting inside this very CREATE. Parking the frame instead of
+    /// the response is what would have needed the acknowledgment taken off the barrier.
+    /// </para>
+    /// </summary>
+    private async ValueTask<ResponseSegment?> ParkCreateBehindBreakAsync(
+        SmbConnection connection, Smb2Header header, SmbSession session, SmbOpen open,
+        ArmedBreaks armed, Task<BreakOutcome[]> breakWait, Func<ValueTask<byte[]>> buildBody)
+    {
+        // Resource protection as CHANGE_NOTIFY/LOCK do it: a parked CREATE holds a PendingRequest. At the
+        // cap, answer synchronously rather than reject — the client gets a correct handle, only without the
+        // coherency wait, which is strictly better than STATUS_INSUFFICIENT_RESOURCES on a valid open.
+        if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
+        {
+            _ = SendArmedBreaksAsync(armed);   // the holder must still learn about the break
+            return MaybeSigned(session, RespHeader(header, session), await buildBody().ConfigureAwait(false));
+        }
+
+        ulong asyncId = connection.AllocateAsyncId();
+        var pending = new PendingAsyncRequest { MessageId = header.MessageId, AsyncId = asyncId, Owner = open };
+        connection.PendingRequests[header.MessageId] = pending;
+        bool encrypt = ResponseNeedsEncryption(session, open);
+
+        await SendOutOfBandAsync(session, connection, InterimResponse(header, session, asyncId), encrypt).ConfigureAwait(false);
+        await SendArmedBreaksAsync(armed).ConfigureAwait(false);
+
+        _ = CompleteParkedCreateAsync(connection, header, session, asyncId, pending, breakWait, buildBody, encrypt);
+        return null;   // the final response follows out-of-band
+    }
+
+    /// <summary>
+    /// [W1.1] Waits out the break and sends the parked CREATE's final response. The wait always ends —
+    /// acknowledged or timed out (W1.2) — so this cannot become the very freeze W1 exists to remove.
+    /// <para>
+    /// <b>A parked CREATE is deliberately not cancellable.</b> Its <see cref="PendingAsyncRequest.Token"/>
+    /// exists for the accounting and so a CANCEL finds *something*, but the token is not honoured:
+    /// §3.3.5.16 lets the server ignore a cancel it cannot service, and here cancelling would be actively
+    /// harmful — the open already exists, so a client that never learns its FileId could never close it.
+    /// The timeout bounds the wait instead.
+    /// </para>
+    /// <para>
+    /// <b>The ambient <c>SmbCaller</c> survives into here</b>, which <c>buildBody</c> needs for a per-user
+    /// backend: this task is started inside the CREATE's async flow, so it captures the ExecutionContext
+    /// while the caller is still set. <c>DispatchOneAsync</c>'s <c>finally</c> clearing it afterwards does not
+    /// reach this branch (an <c>AsyncLocal</c> write does not flow to an already-started child). Detaching
+    /// this task any later — e.g. from the tracker's timer callback — would lose the identity.
+    /// </para>
+    /// </summary>
+    private async Task CompleteParkedCreateAsync(
+        SmbConnection connection, Smb2Header header, SmbSession session, ulong asyncId,
+        PendingAsyncRequest pending, Task<BreakOutcome[]> breakWait, Func<ValueTask<byte[]>> buildBody, bool encrypt)
+    {
+        try
+        {
+            BreakOutcome[] outcomes = await breakWait.ConfigureAwait(false);
+
+            // Connection teardown may have completed this request already (CancelNonSurvivingPending
+            // removes it); then the open is gone too and there is nothing left to answer.
+            if (!connection.PendingRequests.TryRemove(pending.MessageId, out _))
+                return;
+
+            if (Array.IndexOf(outcomes, BreakOutcome.TimedOut) >= 0)
+                _log?.Invoke($"[oplock] break not acknowledged within {_server.Options.OplockBreakTimeout}; " +
+                             $"proceeding with CREATE mid={header.MessageId} (coherency degraded for the holder)");
+
+            await SendAsyncFinalAsync(connection, header, session, asyncId, NtStatus.Success,
+                await buildBody().ConfigureAwait(false), encrypt).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // This runs detached: an escaping exception would be an unobserved task exception *and* would
+            // leave the client waiting out its own timeout for a response that never comes. Answer with the
+            // mapped status instead — the same safety net DispatchOneAsync gives every in-band handler.
+            connection.PendingRequests.TryRemove(pending.MessageId, out _);
+            _log?.Invoke($"[error] parked CREATE mid={header.MessageId} → {ex.GetType().Name}: {ex.Message}");
+            try
+            {
+                await SendAsyncFinalAsync(connection, header, session, asyncId, MapException(ex),
+                    ErrorResponse.BuildBody(), encrypt).ConfigureAwait(false);
+            }
+            catch { /* channel gone — nothing left to tell anyone */ }
+        }
     }
 
     private async ValueTask<ResponseSegment> HandlePipeCreateAsync(SmbConnection connection, Smb2Header header,

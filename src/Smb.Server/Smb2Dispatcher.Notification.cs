@@ -131,10 +131,13 @@ public sealed partial class Smb2Dispatcher
         h.SessionId = session.SessionId;
         h.CreditRequestResponse = 0; // Credits were granted with the interim response.
 
-        // Success/info is signed (if the session signs); errors remain unsigned — as usual.
-        ResponseSegment seg = status.IsSuccess()
-            ? MaybeSigned(session, h, body)
-            : ResponseSegment.Unsigned(h, body);
+        // §3.3.4.1.1: the response to a signed request is signed — including error statuses. This path used
+        // to leave errors unsigned, which is exactly the F1 failure mode one path over: a Windows client
+        // *discards* a response whose signature does not verify on a signed session (§3.2.5.1.3) instead of
+        // failing the call, so an unsigned STATUS_CANCELLED left the client waiting out its own timeout for a
+        // CHANGE_NOTIFY it had itself cancelled. The in-band paths get this from SignIfRequestWasSigned;
+        // out-of-band finals have to do it here, because nothing assembles them centrally.
+        ResponseSegment seg = SignedLikeRequest(session, request, h, body);
 
         // Failover (M6.3): deliver on a surviving channel if the originating one dropped.
         await SendOutOfBandAsync(session, connection, seg, encrypt).ConfigureAwait(false);

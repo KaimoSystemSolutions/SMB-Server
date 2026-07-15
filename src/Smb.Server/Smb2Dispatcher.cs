@@ -31,10 +31,21 @@ public sealed partial class Smb2Dispatcher
 
     private readonly Action<string>? _log;
 
+    /// <summary>
+    /// [W1] Tracks sent oplock/lease breaks so a conflicting CREATE can wait for the holder's
+    /// acknowledgment (break-before-grant, §3.3.5.9.8). <c>null</c> when
+    /// <see cref="SmbServerOptions.OplockBreakTimeout"/> is not positive — the documented opt-out, in which
+    /// case nothing is registered and no CREATE ever parks.
+    /// </summary>
+    private readonly Oplocks.BreakWaitTracker? _breaks;
+
     public Smb2Dispatcher(SmbServerState server, Action<string>? logger = null)
     {
         _server = server;
         _log = logger;
+        _breaks = server.Options.OplockBreakTimeout > TimeSpan.Zero
+            ? new Oplocks.BreakWaitTracker(server.Options.TimeProvider, server.Options.OplockBreakTimeout, server.Options.Metrics)
+            : null;
     }
 
     /// <summary>
@@ -156,7 +167,14 @@ public sealed partial class Smb2Dispatcher
             ResponseSegment? response;
             try
             {
-                response = await DispatchOneAsync(connection, header, segment, transportEncrypted).ConfigureAwait(false);
+                // [W1.1] "Standalone" = a single, non-compound frame. Only such a CREATE may park behind a
+                // break ack: inside a compound chain the elements share one assembled response, so an
+                // element that answers out-of-band later would let its followers (QUERY_INFO/CLOSE) reply
+                // ahead of it. The first element of a chain has NextCommand != 0, every later one sits at
+                // offset != 0 — so this is exact, not a heuristic.
+                bool standalone = offset == 0 && header.NextCommand == 0
+                                  && !header.Flags.HasFlag(Smb2HeaderFlags.RelatedOperations);
+                response = await DispatchOneAsync(connection, header, segment, transportEncrypted, standalone: standalone).ConfigureAwait(false);
                 trace?.SetStatus(response is { } tr ? tr.Header.Status : NtStatus.Success);
             }
             finally
@@ -180,8 +198,11 @@ public sealed partial class Smb2Dispatcher
     /// Processes a single segment. <paramref name="frameEncrypted"/> is passed as a parameter
     /// (not an instance field), so frames on the same connection can be processed concurrently
     /// without corrupting each other's encryption state.
+    /// <para><paramref name="standalone"/> says this segment is a whole message on its own (not part of a
+    /// compound chain), which is what lets CREATE answer asynchronously behind a break acknowledgment
+    /// (W1.1). It defaults to <c>false</c>: a caller that does not know keeps the synchronous behaviour.</para>
     /// </summary>
-    private async ValueTask<ResponseSegment?> DispatchOneAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted, bool preValidated = false)
+    private async ValueTask<ResponseSegment?> DispatchOneAsync(SmbConnection connection, Smb2Header header, ReadOnlyMemory<byte> segment, bool frameEncrypted, bool preValidated = false, bool standalone = false)
     {
         try
         {
@@ -214,7 +235,7 @@ public sealed partial class Smb2Dispatcher
                 SmbCommand.TreeDisconnect => HandleTreeDisconnect(connection, header, segment.Span, frameEncrypted),
                 SmbCommand.Logoff => HandleLogoff(connection, header, segment.Span, frameEncrypted),
                 SmbCommand.Echo => HandleEcho(connection, header, segment.Span, frameEncrypted),
-                SmbCommand.Create => await HandleCreateAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
+                SmbCommand.Create => await HandleCreateAsync(connection, header, segment, frameEncrypted, standalone).ConfigureAwait(false),
                 SmbCommand.Close => await HandleCloseAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
                 SmbCommand.Read => await HandleReadAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
                 SmbCommand.Write => await HandleWriteAsync(connection, header, segment, frameEncrypted).ConfigureAwait(false),
@@ -1047,6 +1068,17 @@ public sealed partial class Smb2Dispatcher
         if (!TryGetValidSession(connection, request.SessionId, out SmbSession session)) return response;
         return ResponseSegment.Signed(response.Header, response.Body, session);
     }
+
+    /// <summary>
+    /// §3.3.4.1.1 for an <b>out-of-band</b> final response (blocking LOCK / CHANGE_NOTIFY / a CREATE parked
+    /// behind a break): sign it when the session signs <i>or</i> when the original request was signed. The
+    /// in-band equivalent is <see cref="SignIfRequestWasSigned"/>, which the response assembler applies to
+    /// everything the read loop returns; a final sent later has no such choke point, so it asks here.
+    /// </summary>
+    private static ResponseSegment SignedLikeRequest(SmbSession session, Smb2Header request, Smb2Header response, byte[] body)
+        => session.SigningRequired || request.Flags.HasFlag(Smb2HeaderFlags.Signed)
+            ? ResponseSegment.Signed(response, body, session)
+            : ResponseSegment.Unsigned(response, body);
 
     private ResponseSegment MaybeSigned(SmbSession session, Smb2Header header, byte[] body)
         => session.SigningRequired

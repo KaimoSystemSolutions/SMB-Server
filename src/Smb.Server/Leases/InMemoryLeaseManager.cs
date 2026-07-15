@@ -20,8 +20,15 @@ namespace Smb.Server.Leases;
 /// <b>Directory leases (M1.3):</b> a lease whose open is a directory is tracked as a directory lease.
 /// <see cref="BreakDirectoryLease"/> downgrades such a lease (dropping Handle caching, keeping at most
 /// shared Read) when a child is added/removed/renamed inside the directory, so the client re-reads its
-/// cached enumeration. Not yet modelled (deferred to later passes / Phase 4): waiting for the break
-/// acknowledgment before the conflicting access proceeds.
+/// cached enumeration.
+/// </para>
+/// <para>
+/// <b>Waiting for the acknowledgment is the dispatcher's job</b> and, since W1, happens: a CREATE that
+/// forces one of the breaks reported by <see cref="RequestLease"/> is parked until the holder acknowledges
+/// or the break times out (§3.3.5.9.8). The state here is downgraded eagerly when the break is decided —
+/// the wait is about the holder's client-side dirty data, not about this dictionary. Breaks from
+/// <see cref="BreakDirectoryLease"/> are the exception and are never waited on: they invalidate a cached
+/// listing of a different file than the one being created (§3.3.4.18).
 /// </para>
 /// </summary>
 public sealed class InMemoryLeaseManager : ILeaseManager
@@ -50,7 +57,8 @@ public sealed class InMemoryLeaseManager : ILeaseManager
             bool hasOtherKey = HasOtherKey(keysOnFile, key);
 
             // A distinct second key joining the file forces write/handle caching of the other
-            // leases down to shared Read caching (§3.3.5.9.8, conservative).
+            // leases down to shared Read caching (§3.3.5.9.8, conservative). The dispatcher parks the
+            // triggering CREATE behind these breaks — losing Write/Handle means the holder must flush first.
             var breaks = new List<LeaseBreak>();
             if (hasOtherKey)
             {
