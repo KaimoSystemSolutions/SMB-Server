@@ -14,9 +14,9 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/KaimoSystemSolutions/SMB-Server</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>Small Update - Hardened implementation, because of some performance issues.</PackageReleaseNotes>
+    <PackageReleaseNotes>Mid Update - Implemented specific windows compatibility. Freeze should be resolved.</PackageReleaseNotes>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
-    <Version>2.0.1</Version>
+    <Version>2.1.0</Version>
     <Description>A SMB 2/3 server library</Description>
 
     <!-- Single-package build: embed all referenced Smb.* DLLs into this one package
