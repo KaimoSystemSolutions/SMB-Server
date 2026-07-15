@@ -233,6 +233,21 @@ public sealed class SmbServerBuilder
     }
 
     /// <summary>
+    /// [W6.4] Hooks in <b>async</b> (I/O-bound) authorization via lambda — for DB/LDAP-backed rights.
+    /// <paramref name="authorizeConnect"/> is awaited at TREE_CONNECT (roadmap W6.2/W6.3), so with
+    /// <see cref="SmbServerOptions.ConcurrentMetadataOps"/> on a slow lookup neither blocks a thread nor
+    /// freezes the connection. Keep <paramref name="isVisible"/> cheap — share enumeration is still a
+    /// synchronous path (roadmap W6.2b) and blocks on it. See <see cref="AsyncDelegateSharePolicy"/>.
+    /// </summary>
+    public SmbServerBuilder UseShareAuthorizationAsync(
+        Func<ShareAccessContext, ValueTask<ShareAccessResult>> authorizeConnect,
+        Func<ShareAccessContext, ValueTask<bool>>? isVisible = null)
+    {
+        _options.ShareAccessPolicy = new AsyncDelegateSharePolicy(authorizeConnect, isVisible);
+        return this;
+    }
+
+    /// <summary>
     /// Sets the byte-range lock management (SMB2 LOCK, Context §15). Default is process-local
     /// (<see cref="InMemoryLockManager"/>); a custom <see cref="ILockManager"/> implementation
     /// can delegate locking to the OS or a cluster, for example.

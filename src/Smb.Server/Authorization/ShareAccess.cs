@@ -109,3 +109,39 @@ public sealed class DelegateSharePolicy : IShareAccessPolicy
     public bool IsVisible(ShareAccessContext context) => _isVisible(context);
     public ShareAccessResult AuthorizeConnect(ShareAccessContext context) => _authorize(context);
 }
+
+/// <summary>
+/// [W6.4] Async delegate-based policy — register I/O-bound authorization (DB/LDAP) via lambda without writing
+/// a class. The <b>async</b> members (<see cref="AuthorizeConnectAsync"/>/<see cref="IsVisibleAsync"/>) run the
+/// delegates directly and are what the TREE_CONNECT hot path awaits (roadmap W6.2/W6.3), so an awaited lookup
+/// never blocks a thread and — with <see cref="SmbServerOptions.ConcurrentMetadataOps"/> on — never freezes the
+/// connection. The synchronous interface members remain because share <i>enumeration</i>
+/// (<c>GetVisibleShares</c>) is still a synchronous path (roadmap W6.2b); there they block on the async
+/// delegate, so keep an <c>isVisible</c> lookup cheap (or accept the block until W6.2b lands).
+/// <code>
+/// builder.UseShareAuthorizationAsync(
+///     authorizeConnect: async ctx => await _acl.CanConnectAsync(ctx.Identity, ctx.ShareName)
+///                                    ? ShareAccessResult.Grant() : ShareAccessResult.Deny());
+/// </code>
+/// </summary>
+public sealed class AsyncDelegateSharePolicy : IShareAccessPolicy
+{
+    private readonly Func<ShareAccessContext, ValueTask<ShareAccessResult>> _authorize;
+    private readonly Func<ShareAccessContext, ValueTask<bool>> _isVisible;
+
+    public AsyncDelegateSharePolicy(
+        Func<ShareAccessContext, ValueTask<ShareAccessResult>> authorizeConnect,
+        Func<ShareAccessContext, ValueTask<bool>>? isVisible = null)
+    {
+        _authorize = authorizeConnect ?? throw new ArgumentNullException(nameof(authorizeConnect));
+        _isVisible = isVisible ?? (_ => new ValueTask<bool>(true));
+    }
+
+    public ValueTask<ShareAccessResult> AuthorizeConnectAsync(ShareAccessContext context) => _authorize(context);
+    public ValueTask<bool> IsVisibleAsync(ShareAccessContext context) => _isVisible(context);
+
+    // Synchronous fallbacks for the still-synchronous paths (enumeration, W6.2b). The awaited hot path
+    // (TREE_CONNECT) uses the async members above; these block on the delegate — see the type remarks.
+    public ShareAccessResult AuthorizeConnect(ShareAccessContext context) => _authorize(context).AsTask().GetAwaiter().GetResult();
+    public bool IsVisible(ShareAccessContext context) => _isVisible(context).AsTask().GetAwaiter().GetResult();
+}

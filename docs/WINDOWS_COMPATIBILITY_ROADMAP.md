@@ -258,13 +258,21 @@ anderen Trees einzufrieren.
   `SlowAsyncAuthorizeConnect_ConcurrentMetadataOps_DoesNotFreezeOtherShareIo` (Flag on → READ kommt trotz
   hängendem async-Connect durch).
 
-### W6.4 — Builder-Ergonomie
-- `UseShareAuthorizationAsync(authorizeConnectAsync, isVisibleAsync?)`-Lambda-Overload; `DelegateSharePolicy`
-  um async-Delegates erweitern (sync-Ctor bleibt).
+### W6.4 — Builder-Ergonomie ✅ DONE
+- Neue `AsyncDelegateSharePolicy` (`Authorization/ShareAccess.cs`): async `AuthorizeConnectAsync`/`IsVisibleAsync`
+  aus Lambdas; sync-Interface-Member als Fallback (blocken auf dem Delegate — nur für den noch-synchronen
+  Enumerationspfad, W6.2b). Builder-Overload `SmbServerBuilder.UseShareAuthorizationAsync(authorizeConnect,
+  isVisible?)` spiegelbildlich zur sync-Variante. `DelegateSharePolicy` (sync) unverändert.
+- **Tests:** `ShareAccessPolicyAsyncTests` +2 (async-Pfad führt Delegate aus; sync-Fallback liefert dieselbe
+  Entscheidung / Default-Sichtbarkeit true).
 
-### W6.5 — Doku/Journal + Regel aktualisieren
-- W2.2-Design-Regel ergänzen: mit W6 ist I/O-gebundene Connect-Auth ohne Caching-Zwang möglich; Caching bleibt
-  die pragmatische Sofortlösung bis W6.3 steht.
+### W6.5 — Doku/Regel aktualisiert ✅ DONE (siehe unten)
+- **Aktualisierte Design-Regel:** I/O-gebundene **Connect**-Auth gehört in `AuthorizeConnectAsync` (Lambda via
+  `UseShareAuthorizationAsync` oder eigene Policy) und sollte **awaiten statt synchron blockieren**; mit
+  `ConcurrentMetadataOps=true` friert sie dann keine unabhängige I/O mehr ein (W6.3). Caching bleibt sinnvoll,
+  ist aber kein Freeze-Zwang mehr. **Per-Datei**-Rechte weiter in `IFileStore.CreateAsync` (vom selben Flag
+  abgedeckt). **Noch offen:** Share-**Enumeration** (`IsVisible`) ist synchron (W6.2b) — eine I/O-gebundene
+  Sichtbarkeitsprüfung blockiert dort noch (selten: Netzwerk-Browse).
 
 ---
 
@@ -352,4 +360,14 @@ anderen Trees einzufrieren.
   (Flag off friert / Flag on behoben, gleiche async-Policy → isoliert off-barrier als Fix). **Suite Smb.Tests
   552 → 554 grün, keine Regressionen.** Nächste Aktion: **W6.4** (Builder-Ergonomie:
   `UseShareAuthorizationAsync` + async-`DelegateSharePolicy`).
+- **2026-07-14** — **W6.4 + W6.5 DONE → Phase W6 rund (bis auf W6.2b).** `AsyncDelegateSharePolicy` +
+  `UseShareAuthorizationAsync(...)`-Builder-Overload (async-Auth per Lambda; sync-Fallback für den
+  noch-synchronen Enumerationspfad). Tests `ShareAccessPolicyAsyncTests` +2. **Suite Smb.Tests 554 → 556 grün.**
+  Kurz gestolpert: `<paramref>` im Typ-`<summary>` → CS1734 (paramref nur für Methoden/Ctor-Params gültig),
+  auf `<c>isVisible</c>` geändert. **Phase W6 Zusammenfassung:** async-Autorisierungs-Seam (W6.1), Dispatcher
+  awaitet ihn (W6.2), TREE_CONNECT off-barrier (W6.3 = Connect-Freeze-Fix), Builder-Ergonomie (W6.4),
+  Regel/Doku (W6.5). **Offen bleibt W6.2b** (Enumeration `IsVisible` async — synchroner srvsvc-RPC-Pfad,
+  selteneres Browsing-Szenario, bewusst zurückgestellt). Gesamt-Freeze-Status für dieses Deployment: Backend-/
+  Per-Datei-Latenz (W2, `ConcurrentMetadataOps`) **und** I/O-gebundene Connect-Auth (W6) sind mit einem Flag +
+  async-Policy abgedeckt.
 - _(hier Fortschritt anhängen, Items in den Phasen abhaken)_

@@ -58,6 +58,36 @@ public class ShareAccessPolicyAsyncTests
         Assert.True(policy.AsyncPathTaken);
     }
 
+    [Fact]
+    public async Task AsyncDelegatePolicy_RunsDelegateOnAsyncPath()
+    {
+        IShareAccessPolicy policy = new AsyncDelegateSharePolicy(
+            authorizeConnect: async ctx =>
+            {
+                await Task.Yield();
+                return ctx.ShareName == "Secret" ? ShareAccessResult.Deny() : ShareAccessResult.Grant(SmbAccessMask.ReadOnly);
+            },
+            isVisible: async ctx => { await Task.Yield(); return ctx.ShareName != "Secret"; });
+
+        Assert.True(await policy.IsVisibleAsync(Context("Files")));
+        Assert.False(await policy.IsVisibleAsync(Context("Secret")));
+        Assert.False((await policy.AuthorizeConnectAsync(Context("Secret"))).Allowed);
+        Assert.Equal(SmbAccessMask.ReadOnly, (await policy.AuthorizeConnectAsync(Context("Files"))).MaximalAccess);
+    }
+
+    [Fact]
+    public async Task AsyncDelegatePolicy_SyncFallback_BlocksAndReturnsSameDecision()
+    {
+        // The sync interface members (used by the still-synchronous enumeration path, W6.2b) must surface the
+        // same decision as the async delegate — they block on it.
+        IShareAccessPolicy policy = new AsyncDelegateSharePolicy(
+            authorizeConnect: async ctx => { await Task.Yield(); return ShareAccessResult.Deny(); });
+
+        Assert.False(policy.AuthorizeConnect(Context()).Allowed); // sync fallback
+        Assert.True(policy.IsVisible(Context()));                 // default isVisible → true
+        Assert.True(await policy.IsVisibleAsync(Context()));      // async default matches
+    }
+
     /// <summary>Overrides only the async method; the sync one is the mandated interface member (never hit here).</summary>
     private sealed class AsyncOnlyPolicy : IShareAccessPolicy
     {
