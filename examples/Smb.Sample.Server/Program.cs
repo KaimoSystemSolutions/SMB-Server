@@ -37,7 +37,7 @@ using Smb.Server.Sharing;
 const string Domain = "WORKGROUP";
 const string User = "demo";
 const string Password = "demo123";        // Demo credentials
-const int Port = 4445;
+const int Port = 445;
 const string DemoUserSid = "S-1-5-21-100-200-300-1001";
 
 // --- Folders backing the demo shares (created next to the binary) -------------

@@ -165,7 +165,7 @@ public sealed partial class Smb2Dispatcher
             }
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");
 
-            if (response is { } seg) segments.Add(seg);
+            if (response is { } seg) segments.Add(SignIfRequestWasSigned(connection, header, seg));
 
             if (header.NextCommand == 0) break;
             offset += segmentLength;
@@ -1022,6 +1022,30 @@ public sealed partial class Smb2Dispatcher
         SmbSigningAlgorithmId alg = Smb2Signer.ResolveAlgorithm(connection.Dialect, connection.SigningAlgorithmId);
         bool isCancel = header.Command == SmbCommand.Cancel;
         return Smb2Signer.Verify(alg, session.SigningKeyFor(connection), segment, header.MessageId, isServer: false, isCancel);
+    }
+
+    /// <summary>
+    /// §3.3.4.1.1: the response to a signed request must itself be signed. The per-command handlers decide
+    /// signing via <see cref="MaybeSigned"/>, but every <c>BuildError</c> path has no session in hand
+    /// and would emit an <i>unsigned</i> error. A Windows client discards a response that fails signature
+    /// verification instead of failing the call (§3.2.5.1.3), so the operation hangs until the client's own
+    /// timeout — an Explorer freeze on any op that returns a non-success status. Signing here, centrally,
+    /// covers every handler and every error path. Requests that arrived unsigned (or whose session is gone,
+    /// e.g. STATUS_USER_SESSION_DELETED — nothing left to sign with) are returned untouched.
+    /// </summary>
+    private ResponseSegment SignIfRequestWasSigned(SmbConnection connection, Smb2Header request, ResponseSegment response)
+    {
+        if (response.Sign) return response;
+        if (!request.Flags.HasFlag(Smb2HeaderFlags.Signed)) return response;
+
+        // Leave the STATUS_PENDING interim of an async operation alone: InterimResponse emits it unsigned on
+        // purpose (§3.3.4.1.1) and the final response, sent out-of-band later, carries the signature. This
+        // hook exists for the error paths; it must not quietly redefine that decision as a side effect.
+        if (response.Header.Status == NtStatus.Pending && response.Header.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand))
+            return response;
+
+        if (!TryGetValidSession(connection, request.SessionId, out SmbSession session)) return response;
+        return ResponseSegment.Signed(response.Header, response.Body, session);
     }
 
     private ResponseSegment MaybeSigned(SmbSession session, Smb2Header header, byte[] body)

@@ -152,7 +152,9 @@ public sealed partial class Smb2Dispatcher
         }
 
         _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");
-        return response is { } seg ? AssembleResponse(connection, [seg]) : [];
+        return response is { } seg
+            ? AssembleResponse(connection, [SignIfRequestWasSigned(connection, header, seg)])
+            : [];
     }
 
     /// <summary>

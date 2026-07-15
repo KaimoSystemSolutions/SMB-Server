@@ -106,6 +106,44 @@ public class ChangeNotifyTests : IDisposable
         Assert.Equal(NtStatus.Cancelled, fh.Status);
     }
 
+    /// <summary>
+    /// The shape a real Windows client actually sends to cancel a parked CHANGE_NOTIFY: SMB2_FLAGS_ASYNC_COMMAND
+    /// with the AsyncId from the interim response, and a MessageId field that is <b>not</b> the notify's
+    /// MessageId. §3.3.5.16 says to match on AsyncId whenever that flag is set; matching on MessageId instead
+    /// missed it entirely, the notify was never completed, and the client blocked for its own ~65 s timeout —
+    /// observed as Explorer freezing when a folder window on the share was closed. The sync-CANCEL case above
+    /// passed throughout, because it cancels by the MessageId the old lookup happened to use.
+    /// </summary>
+    [Fact]
+    public async Task AsyncCancel_ByAsyncId_AbortsPendingChangeNotify_WithStatusCancelled()
+    {
+        var (d, conn, sid, tid) = Setup(withWatcher: true);
+        (ulong p, ulong v) = OpenEntry(d, conn, sid, tid, 4, "watched", isDir: true);
+
+        var sent = new System.Collections.Concurrent.ConcurrentQueue<byte[]>();
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
+
+        byte[] interim = d.ProcessMessage(conn,
+            TestHelpers.BuildChangeNotifyRequest(5, sid, tid, p, v, FilterFileName));
+        Smb2Header ih = Smb2Header.Read(interim);
+        Assert.Equal(NtStatus.Pending, ih.Status);
+
+        var cancelHeader = new Smb2Header
+        {
+            Command = SmbCommand.Cancel,
+            MessageId = 99,                          // deliberately NOT the CHANGE_NOTIFY's MessageId
+            SessionId = sid,
+            Flags = Smb2HeaderFlags.AsyncCommand,
+            AsyncId = ih.AsyncId,                    // the only thing that identifies the target
+        };
+        byte[] cancelBody = new byte[4];
+        BinaryPrimitives.WriteUInt16LittleEndian(cancelBody, 4);
+        Assert.Empty(d.ProcessMessage(conn, TestHelpers.Concat(cancelHeader.ToArray(), cancelBody)));
+
+        Smb2Header fh = Smb2Header.Read(await WaitForSend(sent));
+        Assert.Equal(NtStatus.Cancelled, fh.Status);
+    }
+
     // --- Setup ---
 
     private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(bool withWatcher)

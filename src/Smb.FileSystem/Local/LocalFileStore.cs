@@ -1,6 +1,7 @@
 using Microsoft.Win32.SafeHandles;
 using Smb.FileSystem.Security;
 using Smb.Protocol.Enums;
+using Smb.Protocol.Messages;
 using Smb.Protocol.Security;
 
 namespace Smb.FileSystem.Local;
@@ -11,7 +12,7 @@ namespace Smb.FileSystem.Local;
 /// root directory (no <c>..</c> escape, Context §13.4). Read/Write/List/Stat.
 /// Synchronously attached via <see cref="SyncFileStore"/>.
 /// </summary>
-public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtendedAttributeStore
+public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtendedAttributeStore, IBasicInfoStore
 {
     private readonly string _root;
     private readonly string _realRoot;
@@ -333,6 +334,61 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
         }
         catch (IOException) { return NtStatus.AccessDenied; }
     }
+
+    /// <summary>
+    /// [IBasicInfoStore] Applies SET_INFO/FileBasicInformation to the real file: the timestamps a copy stamps
+    /// onto its destination, and the DOS attributes behind Explorer's read-only/hidden checkboxes.
+    /// <para>
+    /// Applied to the path rather than the open handle: the handle exists, but .NET exposes no
+    /// SetFileTime/SetFileAttributes on <see cref="FileStream"/>, and the store opens with FileShare.ReadWrite
+    /// so a second, short-lived handle on the same path is not a conflict. ChangeTime has no OS-level setter
+    /// on either platform — the filesystem owns it — so it is accepted and left to the filesystem.
+    /// </para>
+    /// </summary>
+    public ValueTask<NtStatus> SetBasicInfoAsync(
+        IFileHandle handle, FileBasicInfoUpdate update, CancellationToken cancellationToken = default)
+    {
+        if (_readOnly) return new(NtStatus.AccessDenied);
+        // A named stream shares the base file's timestamps and attributes.
+        string path = handle is NamedStreamHandle ns ? ns.BaseFullPath : ((LocalFileHandle)handle).FullPath;
+
+        try
+        {
+            bool isDir = Directory.Exists(path);
+            if (update.CreationTime is { } created)
+                SetTime(path, isDir, File.SetCreationTimeUtc, Directory.SetCreationTimeUtc, created);
+            if (update.LastAccessTime is { } accessed)
+                SetTime(path, isDir, File.SetLastAccessTimeUtc, Directory.SetLastAccessTimeUtc, accessed);
+            if (update.LastWriteTime is { } written)
+                SetTime(path, isDir, File.SetLastWriteTimeUtc, Directory.SetLastWriteTimeUtc, written);
+
+            // A directory's FILE_ATTRIBUTE_DIRECTORY is owned by the filesystem; masking it off would be an
+            // attempt to turn the directory into a file. Keep only the bits a client may actually set.
+            if (update.Attributes is { } attrs)
+                File.SetAttributes(path, (FileAttributes)(attrs & SettableAttributes));
+
+            return new(NtStatus.Success);
+        }
+        catch (UnauthorizedAccessException) { return new(NtStatus.AccessDenied); }
+        catch (ArgumentOutOfRangeException) { return new(NtStatus.InvalidParameter); } // FILETIME out of range
+        catch (IOException) { return new(NtStatus.AccessDenied); }
+
+        static void SetTime(string path, bool isDir, Action<string, DateTime> setFile,
+            Action<string, DateTime> setDir, long fileTime)
+        {
+            DateTime value = DateTime.FromFileTimeUtc(fileTime);
+            if (isDir) setDir(path, value); else setFile(path, value);
+        }
+    }
+
+    /// <summary>
+    /// The FILE_ATTRIBUTE_* bits a client may set via FileBasicInformation. DIRECTORY/REPARSE_POINT and the
+    /// other filesystem-owned bits are dropped rather than rejected — Windows sends back the full mask it read
+    /// from a QUERY_INFO, so treating those bits as an error would fail ordinary round trips.
+    /// </summary>
+    private const uint SettableAttributes =
+        0x1 /* ReadOnly */ | 0x2 /* Hidden */ | 0x4 /* System */ | 0x20 /* Archive */ |
+        0x80 /* Normal */ | 0x100 /* Temporary */ | 0x2000 /* NotContentIndexed */;
 
     protected override NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
     {
@@ -674,7 +730,9 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
         };
     }
 
-    private static SmbFileAttributes MapAttributes(FileAttributes a)
+    /// <summary>Maps real filesystem attributes to their SMB bits. Shared with <see cref="LocalFileHandle"/>,
+    /// so a stat of an open handle reports the same attributes as a directory listing of the same file.</summary>
+    internal static SmbFileAttributes MapAttributes(FileAttributes a)
     {
         SmbFileAttributes r = 0;
         if ((a & FileAttributes.Directory) != 0) r |= SmbFileAttributes.Directory;
@@ -846,7 +904,11 @@ internal sealed class LocalFileHandle : IFileHandle
     private FileEntryInfo Build(FileSystemInfo info, long size, bool isDir) => new()
     {
         Name = System.IO.Path.GetFileName(FullPath),
-        Attributes = isDir ? SmbFileAttributes.Directory : SmbFileAttributes.Normal,
+        // The file's real attributes, not a constant. Reporting Normal here made a QUERY_INFO on an open
+        // handle disagree with a directory listing of the same file (which has always mapped them): a hidden
+        // or read-only file looked Normal in its Properties dialog, and a SET of those bits read back as if
+        // it had been ignored.
+        Attributes = LocalFileStore.MapAttributes(info.Attributes),
         EndOfFile = size,
         AllocationSize = isDir ? 0 : (size + 4095) / 4096 * 4096,
         CreationTime = Safe(info.CreationTimeUtc),

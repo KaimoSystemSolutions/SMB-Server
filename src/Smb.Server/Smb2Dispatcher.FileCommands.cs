@@ -1153,13 +1153,14 @@ public sealed partial class Smb2Dispatcher
             return await HandleSetEaAsync(session, header, store, open, req).ConfigureAwait(false);
 
         // [M3.3] Enforce the handle's granted access for state-changing SET_INFO classes: truncation is a
-        // write, delete-disposition and rename both require DELETE. Other classes (times/attributes) are
-        // accepted no-ops and are not gated here.
+        // write, delete-disposition and rename both require DELETE, and times/attributes require
+        // FILE_WRITE_ATTRIBUTES now that they are actually applied to the backend.
         uint requiredAccess = infoClass switch
         {
             FileInformationClass.FileEndOfFileInformation => AccessMask.FileWriteData,
             FileInformationClass.FileDispositionInformation => AccessMask.Delete,
             FileInformationClass.FileRenameInformation => AccessMask.Delete,
+            FileInformationClass.FileBasicInformation => AccessMask.FileWriteAttributes,
             _ => 0u,
         };
         if (requiredAccess != 0 && (open.GrantedAccess & requiredAccess) == 0)
@@ -1178,8 +1179,9 @@ public sealed partial class Smb2Dispatcher
             FileInformationClass.FileDispositionInformation =>
                 await store.SetDeleteOnCloseAsync(open.LocalOpen, req.Buffer.Length > 0 && req.Buffer[0] != 0).ConfigureAwait(false),
             FileInformationClass.FileRenameInformation => await DoRenameAsync(store, open.LocalOpen, req.Buffer).ConfigureAwait(false),
-            // Times/attributes/allocation are accepted (no hard setting needed for browsing/writing).
-            FileInformationClass.FileBasicInformation => NtStatus.Success,
+            FileInformationClass.FileBasicInformation =>
+                await DoSetBasicInfoAsync(store, open.LocalOpen, req.Buffer).ConfigureAwait(false),
+            // Allocation size is a hint about reserved space, not observable content — accepted as a no-op.
             FileInformationClass.FileAllocationInformation => NtStatus.Success,
             FileInformationClass.FilePositionInformation => NtStatus.Success,
             _ => NtStatus.InvalidInfoClass,
@@ -1208,6 +1210,17 @@ public sealed partial class Smb2Dispatcher
         (bool replace, string newPath) = SetInfoMessage.ParseRename(buffer);
         return store.RenameAsync(handle, newPath, replace);
     }
+
+    /// <summary>
+    /// SET_INFO/FileBasicInformation (MS-FSCC §2.4.7): timestamps + DOS attributes. Applied by backends that
+    /// implement <see cref="IBasicInfoStore"/>; for the rest this stays the historical accept-and-drop, which
+    /// keeps ordinary Windows operations working (every file copy stamps its destination's times at the end)
+    /// at the cost of wrong metadata — see the remarks on <see cref="IBasicInfoStore"/>.
+    /// </summary>
+    private static ValueTask<NtStatus> DoSetBasicInfoAsync(IFileStore store, IFileHandle handle, byte[] buffer)
+        => store is IBasicInfoStore basicInfo
+            ? basicInfo.SetBasicInfoAsync(handle, SetInfoMessage.ParseBasicInfo(buffer))
+            : new ValueTask<NtStatus>(NtStatus.Success);
 
     /// <summary>
     /// QUERY_INFO with InfoType Security (§2.2.37 / MS-DTYP §2.4.6): returns the open's security

@@ -69,10 +69,32 @@ public sealed partial class Smb2Dispatcher
     private ResponseSegment? HandleCancel(SmbConnection connection, Smb2Header header, ReadOnlySpan<byte> segment)
     {
         CancelMessage.ParseRequest(segment, Smb2Header.Size);
-        // CANCEL references the pending operation via MessageId and carries no response itself
-        // (§3.3.5.16). The cancelled operation sends STATUS_CANCELLED on its own.
-        if (connection.PendingRequests.TryGetValue(header.MessageId, out PendingAsyncRequest? pending))
-            pending.Cancel();
+
+        // §3.3.5.16: how the target is identified depends on SMB2_FLAGS_ASYNC_COMMAND. An async CANCEL — the
+        // only kind that can cancel an operation we already parked with a STATUS_PENDING interim — names its
+        // target by AsyncId; only a sync CANCEL names it by MessageId. Matching on MessageId alone missed
+        // every async CANCEL (Windows does not put the original MessageId in that field), so the pending
+        // operation was never completed. For a CHANGE_NOTIFY parked on a directory handle that is a real
+        // freeze: the client waits out its own ~65 s timeout, which is what closing an Explorer window on the
+        // share cost. CANCEL carries no response either way — the cancelled op sends STATUS_CANCELLED itself.
+        PendingAsyncRequest? pending = header.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand)
+            ? FindPendingByAsyncId(connection, header.AsyncId)
+            : connection.PendingRequests.TryGetValue(header.MessageId, out PendingAsyncRequest? byMid) ? byMid : null;
+
+        pending?.Cancel();
+        return null;
+    }
+
+    /// <summary>
+    /// Finds a parked operation by the AsyncId handed out with its interim response. PendingRequests is keyed
+    /// by MessageId (that is what CLOSE/teardown look up), so an async CANCEL scans instead — the collection
+    /// holds only a connection's in-flight async ops, bounded by <see cref="SmbServerOptions.MaxOutstandingRequests"/>.
+    /// </summary>
+    private static PendingAsyncRequest? FindPendingByAsyncId(SmbConnection connection, ulong asyncId)
+    {
+        foreach (PendingAsyncRequest pending in connection.PendingRequests.Values)
+            if (pending.AsyncId == asyncId)
+                return pending;
         return null;
     }
 
