@@ -43,7 +43,11 @@ public sealed class SmbServerState
     /// <summary>
     /// Returns the shares visible to <paramref name="identity"/> according to
     /// <see cref="SmbServerOptions.ShareAccessPolicy"/> (access-based enumeration, Context §12).
-    /// This is the source for a future <c>srvsvc</c> NetShareEnum handler over IPC$.
+    /// <para>
+    /// Synchronous variant — kept for callers/policies that are synchronous. The server's own
+    /// <c>srvsvc</c> enumeration path uses <see cref="GetVisibleSharesAsync"/> since W6.2b, so an
+    /// I/O-bound policy is awaited rather than blocked.
+    /// </para>
     /// </summary>
     public IReadOnlyList<IShare> GetVisibleShares(SecurityIdentity identity, SmbConnection? connection = null)
     {
@@ -52,6 +56,25 @@ public sealed class SmbServerState
         {
             var ctx = new ShareAccessContext { Identity = identity, Share = share, Connection = connection };
             if (Options.ShareAccessPolicy.IsVisible(ctx))
+                result.Add(share);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// [W6.2b] Async counterpart of <see cref="GetVisibleShares"/>: consults
+    /// <see cref="IShareAccessPolicy.IsVisibleAsync"/> so an I/O-bound visibility check (DB/LDAP) is awaited
+    /// instead of blocking a thread. Shares are evaluated in <see cref="Shares"/> order, so the resulting
+    /// list is identical to the synchronous variant for any synchronous policy (whose async default simply
+    /// delegates) — this milestone is behaviour-neutral for existing policies.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<IShare>> GetVisibleSharesAsync(SecurityIdentity identity, SmbConnection? connection = null)
+    {
+        var result = new List<IShare>();
+        foreach (IShare share in Shares.All)
+        {
+            var ctx = new ShareAccessContext { Identity = identity, Share = share, Connection = connection };
+            if (await Options.ShareAccessPolicy.IsVisibleAsync(ctx).ConfigureAwait(false))
                 result.Add(share);
         }
         return result;

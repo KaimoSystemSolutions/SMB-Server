@@ -65,7 +65,7 @@ public sealed partial class Smb2Dispatcher
 
         // Named-pipe share (IPC$): open a DCERPC pipe instead of using the file backend.
         if (tree.Share.Type == ShareType.Pipe)
-            return HandlePipeCreate(connection, header, session, tree, segment.Span);
+            return await HandlePipeCreateAsync(connection, header, session, tree, segment).ConfigureAwait(false);
 
         if (tree.Share.FileStore is not { } store)
             return BuildError(header, NtStatus.NotSupported);
@@ -323,13 +323,15 @@ public sealed partial class Smb2Dispatcher
         return MaybeSigned(session, RespHeader(header, session), response.ToBody(responseContexts));
     }
 
-    private ResponseSegment HandlePipeCreate(SmbConnection connection, Smb2Header header,
-        SmbSession session, SmbTreeConnect tree, ReadOnlySpan<byte> segment)
+    private async ValueTask<ResponseSegment> HandlePipeCreateAsync(SmbConnection connection, Smb2Header header,
+        SmbSession session, SmbTreeConnect tree, ReadOnlyMemory<byte> segment)
     {
-        CreateRequest request = CreateRequest.Parse(segment, Smb2Header.Size);
+        // Parse off the span before the await below (a ReadOnlySpan cannot cross an await point);
+        // CreateRequest is a class, so `request` itself survives it.
+        CreateRequest request = CreateRequest.Parse(segment.Span, Smb2Header.Size);
         string pipeName = request.Name.TrimStart('\\');
 
-        IRpcEndpoint? endpoint = OpenRpcEndpoint(connection, session, pipeName);
+        IRpcEndpoint? endpoint = await OpenRpcEndpointAsync(connection, session, pipeName).ConfigureAwait(false);
         if (endpoint is null)
             return BuildError(header, NtStatus.ObjectNameNotFound); // unknown pipe
 
@@ -362,14 +364,20 @@ public sealed partial class Smb2Dispatcher
     /// <summary>
     /// Resolves a well-known IPC$ named pipe to its DCERPC endpoint, or null if the pipe is unknown.
     /// <c>srvsvc</c> serves share enumeration; <c>witness</c> serves the MS-SWN witness service (C1).
+    /// <para>
+    /// [W6.2b] Async because the visible-share snapshot consults the authorization policy
+    /// (<c>IShareAccessPolicy.IsVisibleAsync</c>), which may be I/O-bound. Note the policy is consulted
+    /// here — when the pipe is <i>opened</i> — and the resulting list is baked into the endpoint; the DCERPC
+    /// request path (NetrShareEnum) itself never touches the policy and stays synchronous.
+    /// </para>
     /// </summary>
-    private IRpcEndpoint? OpenRpcEndpoint(SmbConnection connection, SmbSession session, string pipeName)
+    private async ValueTask<IRpcEndpoint?> OpenRpcEndpointAsync(SmbConnection connection, SmbSession session, string pipeName)
     {
         if (pipeName.Equals("srvsvc", StringComparison.OrdinalIgnoreCase))
         {
             // Visible shares (filtered by the authorization policy) as the enumeration source.
             var entries = new List<ShareEntry>();
-            foreach (IShare share in _server.GetVisibleShares(session.Identity ?? AnonymousIdentity, connection))
+            foreach (IShare share in await _server.GetVisibleSharesAsync(session.Identity ?? AnonymousIdentity, connection).ConfigureAwait(false))
                 entries.Add(new ShareEntry(share.Name, SrvsvcEndpoint.MapStype(share.Type), share.Remark));
             return new SrvsvcEndpoint(entries);
         }

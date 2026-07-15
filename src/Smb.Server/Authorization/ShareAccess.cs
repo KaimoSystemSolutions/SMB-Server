@@ -113,11 +113,12 @@ public sealed class DelegateSharePolicy : IShareAccessPolicy
 /// <summary>
 /// [W6.4] Async delegate-based policy — register I/O-bound authorization (DB/LDAP) via lambda without writing
 /// a class. The <b>async</b> members (<see cref="AuthorizeConnectAsync"/>/<see cref="IsVisibleAsync"/>) run the
-/// delegates directly and are what the TREE_CONNECT hot path awaits (roadmap W6.2/W6.3), so an awaited lookup
-/// never blocks a thread and — with <see cref="SmbServerOptions.ConcurrentMetadataOps"/> on — never freezes the
-/// connection. The synchronous interface members remain because share <i>enumeration</i>
-/// (<c>GetVisibleShares</c>) is still a synchronous path (roadmap W6.2b); there they block on the async
-/// delegate, so keep an <c>isVisible</c> lookup cheap (or accept the block until W6.2b lands).
+/// delegates directly and are what the server awaits on both policy paths: TREE_CONNECT (roadmap W6.2/W6.3) and
+/// share enumeration (W6.2b). So an awaited lookup never blocks a thread and — with
+/// <see cref="SmbServerOptions.ConcurrentMetadataOps"/> on — never freezes the connection. The synchronous
+/// interface members are retained only for external callers of the sync API (e.g.
+/// <c>SmbServerState.GetVisibleShares</c>); they block on the async delegate and are not used by the server's
+/// own request paths.
 /// <code>
 /// builder.UseShareAuthorizationAsync(
 ///     authorizeConnect: async ctx => await _acl.CanConnectAsync(ctx.Identity, ctx.ShareName)

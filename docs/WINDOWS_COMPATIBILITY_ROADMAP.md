@@ -231,11 +231,7 @@ anderen Trees einzufrieren.
   statt `ReadOnlySpan`, Span-Parsing vor dem `await`); Dispatch-Switch awaitet es. `AuthorizeConnectAsync` wird
   awaited → kein sync-over-async-Thread-Block mehr. Default-Policy delegiert auf sync → Verhalten unverändert.
   (Verbindungs-Freeze noch **nicht** behoben — das ist W6.3.)
-- **Zurückgestellt (bewusst):** Share-Enumeration (`IShareAccessPolicy.IsVisible` via
-  `SmbServerState.GetVisibleShares`, aufgerufen aus dem **synchronen** srvsvc-RPC-Pfad
-  `Smb2Dispatcher.FileCommands.cs:372`) bleibt vorerst synchron — das ist ein separater, invasiverer Umbau
-  durch den RPC/NDR-Stack und ein deutlich selteneren Pfad (Netzwerk-Browse) als TREE_CONNECT. Eigener
-  Milestone bei Bedarf (W6.2b).
+- **Nachgezogen in W6.2b ✅ (siehe unten):** die Share-Enumeration ist inzwischen ebenfalls async.
 - **Dateien:** `src/Smb.Server/Smb2Dispatcher.cs` (HandleTreeConnectAsync + Dispatch-Arm).
 - **Tests:** `AsyncSeam_IsUsedAtTreeConnect_AsyncDenyRejects` (WindowsFreezeReproTests) — Policy erlaubt sync,
   verweigert async → TREE_CONNECT wird `ACCESS_DENIED` ⇒ beweist, dass der async-Seam entscheidet.
@@ -266,13 +262,28 @@ anderen Trees einzufrieren.
 - **Tests:** `ShareAccessPolicyAsyncTests` +2 (async-Pfad führt Delegate aus; sync-Fallback liefert dieselbe
   Entscheidung / Default-Sichtbarkeit true).
 
-### W6.5 — Doku/Regel aktualisiert ✅ DONE (siehe unten)
-- **Aktualisierte Design-Regel:** I/O-gebundene **Connect**-Auth gehört in `AuthorizeConnectAsync` (Lambda via
-  `UseShareAuthorizationAsync` oder eigene Policy) und sollte **awaiten statt synchron blockieren**; mit
-  `ConcurrentMetadataOps=true` friert sie dann keine unabhängige I/O mehr ein (W6.3). Caching bleibt sinnvoll,
-  ist aber kein Freeze-Zwang mehr. **Per-Datei**-Rechte weiter in `IFileStore.CreateAsync` (vom selben Flag
-  abgedeckt). **Noch offen:** Share-**Enumeration** (`IsVisible`) ist synchron (W6.2b) — eine I/O-gebundene
-  Sichtbarkeitsprüfung blockiert dort noch (selten: Netzwerk-Browse).
+### W6.2b — Share-Enumeration async ✅ DONE
+Weniger invasiv als befürchtet: die Policy wird **beim Öffnen der Pipe** konsultiert (`OpenRpcEndpoint`), nicht
+im RPC-Request-Handling — die Share-Liste wird einmal ermittelt und in den `SrvsvcEndpoint` gebacken. Der
+DCERPC/NDR-Stack berührt die Policy **nie** und bleibt unverändert synchron.
+- `SmbServerState.GetVisibleSharesAsync` (neu, nutzt `IsVisibleAsync`); die **synchrone** `GetVisibleShares`
+  bleibt unverändert erhalten (public API + Bestandstest) → kein Breaking Change.
+- `OpenRpcEndpoint` → `OpenRpcEndpointAsync`; `HandlePipeCreate` → `HandlePipeCreateAsync`
+  (`ReadOnlyMemory` statt `ReadOnlySpan`, Parsing vor dem `await`; `CreateRequest` ist eine `class`), Aufrufer
+  im bereits async `HandleCreateAsync` awaitet.
+- **Verhaltensneutral:** für jede sync-Policy delegiert `IsVisibleAsync` auf `IsVisible`, Shares werden in
+  `Shares`-Reihenfolge geprüft ⇒ identische Liste wie zuvor.
+- **Tests:** `RpcShareEnumTests.ShareEnumeration_AppliesPolicy_ThroughAsyncPath` (Theory) — sync-Policy filtert
+  exakt wie vorher (Neutralitäts-Beweis) **und** async-Policy filtert (neue Fähigkeit); der Bestands-E2E-Test
+  `EndToEnd_ShareEnumeration_OverIpcPipe_ListsShares` läuft unverändert durch den neuen Pfad.
+
+### W6.5 — Doku/Regel aktualisiert ✅ DONE
+- **Finale Design-Regel:** I/O-gebundene Auth gehört in die **async** Policy-Member (`AuthorizeConnectAsync` /
+  `IsVisibleAsync`; Lambda via `UseShareAuthorizationAsync` oder eigene Policy) und sollte **awaiten statt
+  synchron blockieren**; mit `ConcurrentMetadataOps=true` friert sie dann keine unabhängige I/O mehr ein (W6.3).
+  Caching bleibt sinnvoll, ist aber kein Freeze-Zwang mehr. **Per-Datei**-Rechte weiter in
+  `IFileStore.CreateAsync` (vom selben Flag abgedeckt). **Beide** Policy-Pfade des Servers (TREE_CONNECT +
+  Enumeration) sind jetzt async — die sync-Member bleiben nur für externe Aufrufer der sync-API.
 
 ---
 
@@ -370,4 +381,19 @@ anderen Trees einzufrieren.
   selteneres Browsing-Szenario, bewusst zurückgestellt). Gesamt-Freeze-Status für dieses Deployment: Backend-/
   Per-Datei-Latenz (W2, `ConcurrentMetadataOps`) **und** I/O-gebundene Connect-Auth (W6) sind mit einem Flag +
   async-Policy abgedeckt.
+- **2026-07-14** — **W6.2b DONE → PHASE W6 KOMPLETT.** Enumeration async nachgezogen, Bedingung „muss genauso
+  funktionieren" eingehalten und **belegt**. Befund beim Einstieg: der Umbau war weit weniger invasiv als
+  geplant — die Policy wird beim **Pipe-Open** (`OpenRpcEndpoint`) konsultiert, nicht im RPC-Handling; die
+  Liste wird in den `SrvsvcEndpoint` gebacken, der DCERPC/NDR-Stack bleibt unangetastet synchron. Umgesetzt:
+  `GetVisibleSharesAsync` (neu; sync `GetVisibleShares` bleibt → kein Breaking Change, Bestandstest grün),
+  `OpenRpcEndpointAsync`, `HandlePipeCreateAsync` (ReadOnlyMemory, Parse vor await), Aufrufer im async
+  `HandleCreateAsync` awaitet. **Neutralitätsbeweis:** neuer Theory-Test
+  `ShareEnumeration_AppliesPolicy_ThroughAsyncPath` — sync-Policy filtert identisch wie vorher, async-Policy
+  filtert ebenfalls; der Bestands-E2E-Enum-Test läuft unverändert durch den neuen Pfad. Veraltete Doku-Stellen
+  („Enumeration ist noch synchron") in `AsyncDelegateSharePolicy` + `UseShareAuthorizationAsync` korrigiert.
+  Gotcha: `<see cref>` auf einen Typ aus nicht importiertem Namespace → CS1574, `<c>` genutzt. **Suite
+  Smb.Tests 556 → 558 grün.** **Phase W6 vollständig (W6.1–W6.5 + W6.2b):** beide Policy-Pfade des Servers
+  (TREE_CONNECT + Enumeration) sind async, TREE_CONNECT läuft off-barrier, Lambda-Ergonomie steht.
+  Nächste sinnvolle Aktion: **W2.1** (Flag + async-Policy gegen echtes Windows validieren, W0.1-Labor) oder
+  **W1** (blocking break-before-grant) — User's call.
 - _(hier Fortschritt anhängen, Items in den Phasen abhaken)_

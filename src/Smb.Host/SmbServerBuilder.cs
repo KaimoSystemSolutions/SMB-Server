@@ -234,10 +234,10 @@ public sealed class SmbServerBuilder
 
     /// <summary>
     /// [W6.4] Hooks in <b>async</b> (I/O-bound) authorization via lambda — for DB/LDAP-backed rights.
-    /// <paramref name="authorizeConnect"/> is awaited at TREE_CONNECT (roadmap W6.2/W6.3), so with
+    /// <paramref name="authorizeConnect"/> is awaited at TREE_CONNECT (roadmap W6.2/W6.3) and
+    /// <paramref name="isVisible"/> is awaited during share enumeration (W6.2b), so with
     /// <see cref="SmbServerOptions.ConcurrentMetadataOps"/> on a slow lookup neither blocks a thread nor
-    /// freezes the connection. Keep <paramref name="isVisible"/> cheap — share enumeration is still a
-    /// synchronous path (roadmap W6.2b) and blocks on it. See <see cref="AsyncDelegateSharePolicy"/>.
+    /// freezes the connection. See <see cref="AsyncDelegateSharePolicy"/>.
     /// </summary>
     public SmbServerBuilder UseShareAuthorizationAsync(
         Func<ShareAccessContext, ValueTask<ShareAccessResult>> authorizeConnect,

@@ -6,6 +6,7 @@ using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
 using Smb.Server;
+using Smb.Server.Authorization;
 using Smb.Server.Rpc;
 using Smb.Server.State;
 using Xunit;
@@ -119,6 +120,68 @@ public class RpcShareEnumTests
         Assert.Equal((byte)DcerpcPduType.Response, output[2]);
         Assert.True(Contains(output, Encoding.Unicode.GetBytes("Files")), "Share 'Files' muss in der Enumeration erscheinen.");
         Assert.True(Contains(output, Encoding.Unicode.GetBytes("IPC$")), "Share 'IPC$' muss in der Enumeration erscheinen.");
+    }
+
+    /// <summary>
+    /// [W6.2b] Share enumeration consults the authorization policy through the now-async path
+    /// (CREATE \PIPE\srvsvc → OpenRpcEndpointAsync → GetVisibleSharesAsync → IShareAccessPolicy.IsVisibleAsync).
+    /// A <b>synchronous</b> policy must filter exactly as it did before the async conversion (its async default
+    /// simply delegates ⇒ behaviour-neutral); an <b>async</b> (I/O-bound) policy must filter too — the new
+    /// capability. Both cases: the hidden share must not appear in the NetrShareEnum response.
+    /// </summary>
+    [Theory]
+    [InlineData(false)] // synchronous policy — proves W6.2b is behaviour-neutral for existing policies
+    [InlineData(true)]  // async policy — the newly supported I/O-bound case
+    public async Task ShareEnumeration_AppliesPolicy_ThroughAsyncPath(bool asyncPolicy)
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+            ShareAccessPolicy = asyncPolicy
+                ? new AsyncDelegateSharePolicy(
+                    authorizeConnect: _ => new ValueTask<ShareAccessResult>(ShareAccessResult.Grant()),
+                    isVisible: async ctx => { await Task.Yield(); return ctx.ShareName != "Secret"; })
+                : new DelegateSharePolicy(
+                    authorize: _ => ShareAccessResult.Grant(),
+                    isVisible: ctx => ctx.ShareName != "Secret"),
+        };
+        options.Shares.Add(Share.CreateIpc());
+        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, Remark = "Daten" });
+        options.Shares.Add(new Share { Name = "Secret", Type = ShareType.Disk, Remark = "Geheim" });
+
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        var client = new NtlmClient("DOM", "alice", "pw");
+        byte[] r1 = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
+        ulong sessionId = Smb2Header.Read(r1).SessionId;
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(2, sessionId, client.BuildAuthenticate(ReadSecurityBuffer(r1))));
+
+        uint treeId = Smb2Header.Read(await dispatcher.ProcessMessageAsync(conn,
+            TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\server\IPC$"))).TreeId;
+
+        // CREATE \PIPE\srvsvc — this is where the (async) policy snapshot is taken.
+        byte[] create = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildCreateRequest(
+            4, sessionId, treeId, "srvsvc", desiredAccess: 0x0012019F,
+            disposition: (uint)CreateDisposition.Open, options: 0));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        (ulong p, ulong v) = ReadCreateFileId(create);
+
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildIoctlRequest(
+            5, sessionId, treeId, p, v, IoctlMessage.FsctlPipeTransceive, BindPdu(1)));
+        byte[] enumResp = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildIoctlRequest(
+            6, sessionId, treeId, p, v, IoctlMessage.FsctlPipeTransceive, RequestPdu(2, 15)));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(enumResp).Status);
+
+        byte[] output = ReadIoctlOutput(enumResp);
+        Assert.Equal((byte)DcerpcPduType.Response, output[2]);
+        Assert.True(Contains(output, Encoding.Unicode.GetBytes("Files")), "Sichtbarer Share muss enumeriert werden.");
+        Assert.True(Contains(output, Encoding.Unicode.GetBytes("IPC$")), "IPC$ muss enumeriert werden.");
+        Assert.False(Contains(output, Encoding.Unicode.GetBytes("Secret")), "Policy-gefilterter Share darf nicht enumeriert werden.");
     }
 
     private static byte[] ReadSecurityBuffer(byte[] resp)
