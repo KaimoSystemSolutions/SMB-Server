@@ -22,9 +22,11 @@ namespace Smb.Server;
 /// (<see cref="ReserveScope"/>) and granted per FIFO + shared/exclusive rules when the executing task runs
 /// (<see cref="ExecutePreparedFrameAsync"/>). READ/WRITE/QUERY_INFO are shared (parallel on one Open);
 /// CLOSE/SET_INFO/FLUSH/QUERY_DIRECTORY are exclusive (a CLOSE waits for inflight I/O of the same Open, and
-/// QUERY_DIRECTORY is exclusive because it mutates the open's paging cursor). CREATE runs free (its FileId
-/// does not exist yet). Lifecycle/compound commands are still handled strictly sequentially by the host,
-/// which first drains all running frames (barrier) so session/tree/open lifecycle stays ordered.
+/// QUERY_DIRECTORY is exclusive because it mutates the open's paging cursor). CREATE and TREE_CONNECT run free
+/// (both are *creation-like*: they mint a new FileId/TreeId that no in-flight frame can reference yet — see
+/// W6.3). *Teardown* lifecycle and compound commands (LOGOFF/TREE_DISCONNECT/SESSION_SETUP/NEGOTIATE/CANCEL)
+/// are still handled strictly sequentially by the host, which first drains all running frames (barrier) so
+/// session/tree/open teardown stays ordered.
 /// </para>
 /// </summary>
 public sealed partial class Smb2Dispatcher
@@ -191,6 +193,21 @@ public sealed partial class Smb2Dispatcher
             case SmbCommand.Create:
                 // CREATE runs free: its FileId does not exist yet, so no other frame can reference the Open,
                 // and every store it touches (share-mode, backend FS, Opens, lease/oplock) is atomic (A3).
+                return metadataConcurrency;
+
+            case SmbCommand.TreeConnect:
+                // [W6.3] TREE_CONNECT runs free like CREATE — it is *creation-like*, not teardown. It allocates
+                // a fresh TreeId via Interlocked (SmbConnection.AllocateTreeId) that no in-flight frame can
+                // reference yet (a client cannot issue an op on a TreeId it has not been given — same
+                // request/response dependency as CREATE), and session.TreeConnects is a ConcurrentDictionary.
+                // Moving it off the read-loop barrier lets a slow *async* authorization policy
+                // (IShareAccessPolicy.AuthorizeConnectAsync, W6.1/W6.2) run without freezing unrelated I/O on
+                // other trees. Ordering holds: SESSION_SETUP stays a barrier and completes (in arrival order)
+                // before any following TREE_CONNECT is read, so a tree can't be connected on a not-yet-valid
+                // session. Teardown lifecycle (LOGOFF/TREE_DISCONNECT/SESSION_SETUP/NEGOTIATE/CANCEL) stays a
+                // barrier and drains in-flight TREE_CONNECTs first. NOTE: this unfreezes only a genuinely async
+                // policy — a policy that blocks synchronously stalls the read loop in the frame's synchronous
+                // prefix regardless (same property as any sync-blocking backend op on the concurrent path).
                 return metadataConcurrency;
 
             default:

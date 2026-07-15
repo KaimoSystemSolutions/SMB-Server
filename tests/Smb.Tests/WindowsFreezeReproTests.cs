@@ -200,6 +200,80 @@ public class WindowsFreezeReproTests
         await server.StopAsync();
     }
 
+    /// <summary>
+    /// docs/WINDOWS_COMPATIBILITY_ROADMAP.md W6.3 — <b>the connect-time freeze fix, proven</b>. Same async,
+    /// I/O-bound policy in both tests; only <see cref="SmbServerOptions.ConcurrentMetadataOps"/> differs, so
+    /// moving TREE_CONNECT off the read-loop barrier is isolated as the fix.
+    /// <list type="bullet">
+    /// <item><b>Flag off:</b> TREE_CONNECT is a barrier; the read loop awaits it before reading the next frame
+    /// → an unrelated READ on an already-connected share freezes even though the policy is async.</item>
+    /// <item><b>Flag on:</b> TREE_CONNECT runs free; the read loop keeps going while the policy awaits → the
+    /// READ completes.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task SlowAsyncAuthorizeConnect_DefaultBarrier_StillFreezesOtherShareIo()
+    {
+        var policy = new AsyncGatedConnectPolicy(slowShare: "Slow");
+        await using SmbServer server = await StartAuthServerAsync(policy, concurrentMetadata: false);
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, server.Endpoint.Port);
+            await using NetworkStream stream = client.GetStream();
+            (ulong sid, uint filesTid) = await HandshakeAsync(stream);
+            (ulong fp, ulong fv) = await OpenFastFileAsync(stream, sid, filesTid);
+
+            await SendAsync(stream, TestHelpers.BuildTreeConnectRequest(MidSlowCreate, sid, @"\\s\Slow"));
+            await SendAsync(stream, TestHelpers.BuildReadRequest(MidRead, sid, filesTid, fp, fv, length: 4, offset: 0));
+
+            // Flag off → TREE_CONNECT is on the barrier → the read loop is parked on it → READ frozen.
+            byte[]? early = await TryReceiveAsync(stream, TimeSpan.FromSeconds(2));
+            Assert.Null(early);
+
+            policy.Release();
+            byte[] a = await ReceiveAsync(stream);
+            byte[] b = await ReceiveAsync(stream);
+            var mids = new[] { Smb2Header.Read(a).MessageId, Smb2Header.Read(b).MessageId };
+            Assert.Contains(MidSlowCreate, mids);
+            Assert.Contains(MidRead, mids);
+
+            await server.StopAsync();
+        }
+        finally { policy.Release(); }
+    }
+
+    [Fact]
+    public async Task SlowAsyncAuthorizeConnect_ConcurrentMetadataOps_DoesNotFreezeOtherShareIo()
+    {
+        var policy = new AsyncGatedConnectPolicy(slowShare: "Slow");
+        await using SmbServer server = await StartAuthServerAsync(policy, concurrentMetadata: true); // W6.3
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, server.Endpoint.Port);
+            await using NetworkStream stream = client.GetStream();
+            (ulong sid, uint filesTid) = await HandshakeAsync(stream);
+            (ulong fp, ulong fv) = await OpenFastFileAsync(stream, sid, filesTid);
+
+            await SendAsync(stream, TestHelpers.BuildTreeConnectRequest(MidSlowCreate, sid, @"\\s\Slow"));
+            await SendAsync(stream, TestHelpers.BuildReadRequest(MidRead, sid, filesTid, fp, fv, length: 4, offset: 0));
+
+            // Flag on → TREE_CONNECT runs free → the READ (mid 6) answers while the Slow connect (mid 5) awaits.
+            byte[] first = await ReceiveAsync(stream, TimeSpan.FromSeconds(10));
+            Smb2Header firstHeader = Smb2Header.Read(first);
+            Assert.Equal(MidRead, firstHeader.MessageId);
+            Assert.Equal(NtStatus.Success, firstHeader.Status);
+
+            policy.Release();
+            byte[] second = await ReceiveAsync(stream, TimeSpan.FromSeconds(10));
+            Assert.Equal(MidSlowCreate, Smb2Header.Read(second).MessageId);
+
+            await server.StopAsync();
+        }
+        finally { policy.Release(); }
+    }
+
     // ─── Host / handshake helpers ─────────────────────────────────────────
 
     private static async Task<SmbServer> StartAuthServerAsync(IShareAccessPolicy policy, bool concurrentMetadata)
@@ -323,6 +397,28 @@ public class WindowsFreezeReproTests
         {
             await Task.Yield();
             return ShareAccessResult.Deny();
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="GatedConnectPolicy"/> but blocks the <b>async</b> seam (awaits a task) for one named
+    /// share — models a genuinely I/O-bound rights lookup that yields the thread instead of blocking it.
+    /// Used to prove the W6.3 freeze fix.
+    /// </summary>
+    private sealed class AsyncGatedConnectPolicy(string slowShare) : IShareAccessPolicy
+    {
+        private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Release() => _gate.TrySetResult();
+
+        public bool IsVisible(ShareAccessContext context) => true;
+        public ShareAccessResult AuthorizeConnect(ShareAccessContext context) => ShareAccessResult.Grant();
+
+        public async ValueTask<ShareAccessResult> AuthorizeConnectAsync(ShareAccessContext context)
+        {
+            if (string.Equals(context.ShareName, slowShare, StringComparison.OrdinalIgnoreCase))
+                await _gate.Task.ConfigureAwait(false); // awaited (not blocked) — the point of W6.1/W6.2
+            return ShareAccessResult.Grant();
         }
     }
 

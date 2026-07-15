@@ -240,14 +240,23 @@ anderen Trees einzufrieren.
 - **Tests:** `AsyncSeam_IsUsedAtTreeConnect_AsyncDenyRejects` (WindowsFreezeReproTests) — Policy erlaubt sync,
   verweigert async → TREE_CONNECT wird `ACCESS_DENIED` ⇒ beweist, dass der async-Seam entscheidet.
 
-### W6.3 — TREE_CONNECT aus dem Read-Loop-Barrier lösen (der eigentliche Freeze-Fix)
-- TREE_CONNECT als concurrent-eligible klassifizieren (läuft **frei** wie CREATE: keine nachfolgende Op
-  referenziert die noch nicht vergebene TreeId; `session.TreeConnects` ist `ConcurrentDictionary`, TreeId via
-  `Interlocked`). Lifecycle (LOGOFF/Teardown) bleibt Barrier und drained inflight TREE_CONNECTs zuerst.
-- **Dateien:** `src/Smb.Server/Smb2Dispatcher.Concurrency.cs` (Klassifizierer), Host.
-- **Tests:** langsame **async** Policy friert unabhängige I/O **nicht mehr** ein — die Umkehrung des
-  W2.2-Grenzfalltests (`SlowAuthorizeConnect_FreezesOtherShareIo…` → jetzt: READ kommt trotz hängendem
-  async-Connect durch).
+### W6.3 — TREE_CONNECT aus dem Read-Loop-Barrier lösen (der eigentliche Freeze-Fix) ✅ DONE
+- TREE_CONNECT als concurrent-eligible klassifiziert (läuft **frei** wie CREATE, gated auf
+  `ConcurrentMetadataOps`): creation-like, keine nachfolgende Op referenziert die noch nicht vergebene TreeId
+  (`AllocateTreeId` via `Interlocked`), `session.TreeConnects` ist `ConcurrentDictionary`. **Teardown**-Lifecycle
+  (LOGOFF/TREE_DISCONNECT/SESSION_SETUP/NEGOTIATE/CANCEL) bleibt Barrier und drained inflight TREE_CONNECTs
+  zuerst; Ordering hält, weil SESSION_SETUP (Barrier) in Ankunftsreihenfolge vor einem folgenden TREE_CONNECT
+  vollständig durchläuft.
+- **Verifizierte Nuance (im Klassifizierer + Test dokumentiert):** off-barrier behebt den Freeze **nur mit einer
+  echt-asynchronen Policy**. Eine sync-blockierende Policy stallt den Read-Loop-Thread schon im synchronen
+  Präfix des Concurrent-Frames (bevor das `await` suspendiert) — friert also weiter ein (belegt durch den
+  unveränderten W2.2-Test mit sync-Policy + Flag on). Der Fix braucht **beide** Teile: async-Seam (W6.1/W6.2)
+  **und** off-barrier (W6.3).
+- **Dateien:** `src/Smb.Server/Smb2Dispatcher.Concurrency.cs` (Klassifizierer-`case TreeConnect` + Klassen-Doku).
+- **Tests (Paar, isoliert off-barrier als Fix — gleiche async-Policy, nur Flag unterschiedlich):**
+  `SlowAsyncAuthorizeConnect_DefaultBarrier_StillFreezesOtherShareIo` (Flag off → READ friert) und
+  `SlowAsyncAuthorizeConnect_ConcurrentMetadataOps_DoesNotFreezeOtherShareIo` (Flag on → READ kommt trotz
+  hängendem async-Connect durch).
 
 ### W6.4 — Builder-Ergonomie
 - `UseShareAuthorizationAsync(authorizeConnectAsync, isVisibleAsync?)`-Lambda-Overload; `DelegateSharePolicy`
@@ -332,4 +341,15 @@ anderen Trees einzufrieren.
   Nächste Aktion **W6.3**: TREE_CONNECT als concurrent-eligible klassifizieren („runs free" wie CREATE), damit
   eine langsame (async) Policy unabhängige I/O nicht mehr einfriert — der eigentliche Fix; dazu die Umkehrung
   des W2.2-Grenzfalltests.
+- **2026-07-14** — **W6.3 DONE → Connect-Freeze behoben.** TREE_CONNECT als concurrent-eligible klassifiziert
+  (`Smb2Dispatcher.Concurrency.cs`, `case TreeConnect: return metadataConcurrency;`), „runs free" wie CREATE;
+  Invarianten am Code verifiziert (`AllocateTreeId` Interlocked, `TreeConnects` ConcurrentDictionary, Ordering
+  via SESSION_SETUP-Barrier). Klassen-Doku: TREE_CONNECT von „Lifecycle-Barrier" zu „creation-like runs free"
+  umgestellt; nur Teardown-Lifecycle bleibt Barrier. **Wichtige verifizierte Nuance:** off-barrier hilft nur
+  einer echt-asynchronen Policy — eine sync-blockierende Policy stallt den Read-Loop schon im synchronen Präfix
+  des Concurrent-Frames (der W2.2-Test mit sync-Policy + Flag on friert deshalb weiterhin, unverändert grün).
+  Fix = async-Seam (W6.1/W6.2) **und** off-barrier (W6.3) zusammen. Testpaar `SlowAsyncAuthorizeConnect_*`
+  (Flag off friert / Flag on behoben, gleiche async-Policy → isoliert off-barrier als Fix). **Suite Smb.Tests
+  552 → 554 grün, keine Regressionen.** Nächste Aktion: **W6.4** (Builder-Ergonomie:
+  `UseShareAuthorizationAsync` + async-`DelegateSharePolicy`).
 - _(hier Fortschritt anhängen, Items in den Phasen abhaken)_
