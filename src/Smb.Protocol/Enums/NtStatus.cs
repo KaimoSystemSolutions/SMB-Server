@@ -47,6 +47,8 @@ public enum NtStatus : uint
     InsufficientResources = 0xC000009A,
     BadNetworkName = 0xC00000BE,
     Cancelled = 0xC0000120,
+    /// <summary>The file cannot be deleted, e.g. it carries FILE_ATTRIBUTE_READONLY (MS-FSA §2.1.5.14.3).</summary>
+    CannotDelete = 0xC0000121,
     FileClosed = 0xC0000128,
     DiskFull = 0xC000007F,
     DirectoryNotEmpty = 0xC0000101,

@@ -184,6 +184,176 @@ public class RpcShareEnumTests
         Assert.False(Contains(output, Encoding.Unicode.GetBytes("Secret")), "A policy-filtered share must not be enumerated.");
     }
 
+    /// <summary>
+    /// A named-pipe handle must answer QUERY_INFO, not report the handle closed.
+    /// <para>
+    /// The Windows client opens <c>\PIPE\srvsvc</c> and then asks it for FileStandardInformation <i>before</i>
+    /// sending the DCERPC bind. STATUS_FILE_CLOSED there makes the client abandon the RPC and retry the
+    /// CREATE/QUERY_INFO pair a few times, so the symptom surfaces not as a failed query but as
+    /// RPC_S_CALL_FAILED (1727) out of <c>net view</c>, and as "the remote procedure call failed" in
+    /// Explorer — with the server's shares unlistable.
+    /// </para>
+    /// <para>
+    /// A pipe has no backing file, so every field here is synthesized rather than stat'd; the values asserted
+    /// are the ones Windows reports for its own pipes.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task PipeHandle_QueryStandardInformation_IsAnsweredNotReportedClosed()
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+        };
+        options.Shares.Add(Share.CreateIpc());
+
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        var client = new NtlmClient("DOM", "alice", "pw");
+        byte[] r1 = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
+        ulong sessionId = Smb2Header.Read(r1).SessionId;
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(2, sessionId, client.BuildAuthenticate(ReadSecurityBuffer(r1))));
+
+        uint treeId = Smb2Header.Read(await dispatcher.ProcessMessageAsync(conn,
+            TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\server\IPC$"))).TreeId;
+
+        byte[] create = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildCreateRequest(
+            4, sessionId, treeId, "srvsvc", desiredAccess: 0x0012019F,
+            disposition: (uint)CreateDisposition.Open, options: 0));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        (ulong p, ulong v) = ReadCreateFileId(create);
+
+        byte[] resp = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildQueryInfoRequest(
+            5, sessionId, treeId, p, v,
+            infoType: (byte)InfoType.File,
+            fileInfoClass: (byte)FileInformationClass.FileStandardInformation,
+            outputBufferLength: 4096));
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(resp).Status);
+
+        // FILE_STANDARD_INFORMATION (MS-FSCC §2.4.41): a pipe is a zero-length, single-link non-directory.
+        ReadOnlySpan<byte> info = ReadQueryInfoOutput(resp);
+        Assert.Equal(24, info.Length);
+        Assert.Equal(4096, BinaryPrimitives.ReadInt64LittleEndian(info[..8]));       // AllocationSize
+        Assert.Equal(0, BinaryPrimitives.ReadInt64LittleEndian(info.Slice(8, 8)));   // EndOfFile
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(info.Slice(16, 4)));// NumberOfLinks
+        Assert.Equal(0, info[20]);                                                   // DeletePending
+        Assert.Equal(0, info[21]);                                                   // Directory
+    }
+
+    /// <summary>
+    /// The pipe's synthesized answer covers InfoType FILE only. A class it cannot describe must be declined as
+    /// STATUS_INVALID_INFO_CLASS — the handle is open and valid, so STATUS_FILE_CLOSED would be a lie about
+    /// the handle rather than about the query, and would send the client into the same retry loop.
+    /// </summary>
+    [Fact]
+    public async Task PipeHandle_QueryUnsupportedInfoClass_IsInvalidInfoClass()
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+        };
+        options.Shares.Add(Share.CreateIpc());
+
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        var client = new NtlmClient("DOM", "alice", "pw");
+        byte[] r1 = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
+        ulong sessionId = Smb2Header.Read(r1).SessionId;
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(2, sessionId, client.BuildAuthenticate(ReadSecurityBuffer(r1))));
+
+        uint treeId = Smb2Header.Read(await dispatcher.ProcessMessageAsync(conn,
+            TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\server\IPC$"))).TreeId;
+
+        byte[] create = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildCreateRequest(
+            4, sessionId, treeId, "srvsvc", desiredAccess: 0x0012019F,
+            disposition: (uint)CreateDisposition.Open, options: 0));
+        (ulong p, ulong v) = ReadCreateFileId(create);
+
+        byte[] resp = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildQueryInfoRequest(
+            5, sessionId, treeId, p, v,
+            infoType: (byte)InfoType.FileSystem,
+            fileInfoClass: (byte)FsInformationClass.FileFsSizeInformation,
+            outputBufferLength: 4096));
+
+        Assert.Equal(NtStatus.InvalidInfoClass, Smb2Header.Read(resp).Status);
+    }
+
+    /// <summary>
+    /// The other two commands whose handle lookup demands a backing file (<c>|| open.LocalOpen is null</c> ⇒
+    /// STATUS_FILE_CLOSED) — the shape that broke QUERY_INFO on a pipe. Read on its own that lookup looks like
+    /// the same bug waiting to happen, but it is unreachable for a pipe: both handlers resolve the tree's file
+    /// store first, and an IPC$ tree has none, so both decline with STATUS_NOT_SUPPORTED before the handle is
+    /// ever looked up.
+    /// <para>
+    /// This pins that reasoning rather than the fix that reasoning made unnecessary. If the store lookup is
+    /// ever reordered after the handle lookup, these two start telling clients a live pipe handle is closed —
+    /// and this case fails instead of a user finding out.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task PipeHandle_SetInfoAndQueryDirectory_AreDeclinedBeforeTheHandleLookup()
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+        };
+        options.Shares.Add(Share.CreateIpc());
+
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        var client = new NtlmClient("DOM", "alice", "pw");
+        byte[] r1 = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
+        ulong sessionId = Smb2Header.Read(r1).SessionId;
+        await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSessionSetupRequest(2, sessionId, client.BuildAuthenticate(ReadSecurityBuffer(r1))));
+
+        uint treeId = Smb2Header.Read(await dispatcher.ProcessMessageAsync(conn,
+            TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\server\IPC$"))).TreeId;
+
+        byte[] create = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildCreateRequest(
+            4, sessionId, treeId, "srvsvc", desiredAccess: 0x0012019F,
+            disposition: (uint)CreateDisposition.Open, options: 0));
+        (ulong p, ulong v) = ReadCreateFileId(create);
+
+        // SET_INFO: a pipe has no size to set — declined for the IPC$ tree, not by calling the handle closed.
+        byte[] setInfo = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildSetInfoRequest(
+            5, sessionId, treeId, p, v,
+            infoType: (byte)InfoType.File,
+            fileInfoClass: (byte)FileInformationClass.FileEndOfFileInformation,
+            buffer: new byte[8]));
+        Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(setInfo).Status);
+
+        // QUERY_DIRECTORY: a pipe is not a directory — same guard, same reason.
+        byte[] queryDir = await dispatcher.ProcessMessageAsync(conn, TestHelpers.BuildQueryDirectoryRequest(
+            6, sessionId, treeId, p, v,
+            infoClass: (byte)FileInformationClass.FileBothDirectoryInformation,
+            pattern: "*", outputBufferLength: 4096));
+        Assert.Equal(NtStatus.NotSupported, Smb2Header.Read(queryDir).Status);
+    }
+
+    private static byte[] ReadQueryInfoOutput(byte[] resp)
+    {
+        const int body = Smb2Header.Size;
+        int off = BinaryPrimitives.ReadUInt16LittleEndian(resp.AsSpan(body + 2, 2));
+        int len = (int)BinaryPrimitives.ReadUInt32LittleEndian(resp.AsSpan(body + 4, 4));
+        return resp.AsSpan(off, len).ToArray();
+    }
+
     private static byte[] ReadSecurityBuffer(byte[] resp)
     {
         const int body = Smb2Header.Size;

@@ -44,7 +44,7 @@ public sealed class WindowsSmbLabCollection : ICollectionFixture<WindowsSmbLab>
     public const string Name = "windows-smb-lab";
 }
 
-public sealed class WindowsSmbLab : IAsyncLifetime
+public sealed class WindowsSmbLab : IAsyncLifetime, IWindowsInteropLab
 {
     public const int SmbPort = 445;
     public const string Host = "127.0.0.1";
@@ -76,6 +76,13 @@ public sealed class WindowsSmbLab : IAsyncLifetime
 
     public static string Unc(string share) => $@"\\{Host}\{share}";
 
+    // ── IWindowsInteropLab (what the shared battery needs) ────────────────
+    public string WritableShareUnc => Unc(FilesShare);
+    public string ReadOnlyShareUnc => Unc(ReadOnlyShare);
+    public string ReadOnlyProbeFile => "readable.txt";
+    public string ReadOnlyProbeContent => "read only content";
+    public IReadOnlyCollection<string> VisibleShares => [FilesShare, ReadOnlyShare, SlowShare];
+
     /// <summary>Skips the calling test unless the lab is up. Only the environment may skip.</summary>
     public void Require() => Skip.If(SkipReason is not null, SkipReason);
 
@@ -102,6 +109,8 @@ public sealed class WindowsSmbLab : IAsyncLifetime
 
     private readonly string _runTag = Guid.NewGuid().ToString("N")[..8];
 
+    private bool _gateHeld;
+
     public async Task InitializeAsync()
     {
         if (!OperatingSystem.IsWindows())
@@ -110,6 +119,25 @@ public sealed class WindowsSmbLab : IAsyncLifetime
             return;
         }
 
+        // Serialise against the other lab: only one server can own 127.0.0.1:445 at a time.
+        await Port445Gate.AcquireAsync();
+        _gateHeld = true;
+        try
+        {
+            await StartServerAndConnectAsync();
+        }
+        catch
+        {
+            // xUnit does not call DisposeAsync when InitializeAsync throws — release here or the other
+            // lab's collection waits out the gate's full timeout on a run that is already red.
+            Port445Gate.Release();
+            _gateHeld = false;
+            throw;
+        }
+    }
+
+    private async Task StartServerAndConnectAsync()
+    {
         if (BindError() is { } err)
         {
             SkipReason = $"port {SmbPort} not bindable ({err}) — Windows' own SMB server holds it exclusively. " +
@@ -145,58 +173,31 @@ public sealed class WindowsSmbLab : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        Gate?.Release();
-        if (_server is not null)
+        try
         {
-            foreach (string share in new[] { FilesShare, ReadOnlyShare, SlowShare })
-                RunNet(out _, "use", Unc(share), "/delete", "/y");
-            await _server.DisposeAsync();
+            Gate?.Release();
+            if (_server is not null)
+            {
+                foreach (string share in new[] { FilesShare, ReadOnlyShare, SlowShare })
+                    NetUse.Run(out _, "use", Unc(share), "/delete", "/y");
+                await _server.DisposeAsync();
+            }
+            foreach (string dir in new[] { FilesRoot, ReadOnlyRoot, SlowRoot })
+                if (!string.IsNullOrEmpty(dir))
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
         }
-        foreach (string dir in new[] { FilesRoot, ReadOnlyRoot, SlowRoot })
-            if (!string.IsNullOrEmpty(dir))
-                try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+        finally
+        {
+            if (_gateHeld) Port445Gate.Release();
+        }
     }
 
     /// <summary>
-    /// Authenticates against the server with explicit NTLM credentials (deviceless <c>net use</c>). A failed
-    /// login is a real interop bug, so it fails the lab rather than skipping — with one exception:
-    /// ERROR_BAD_NET_NAME (67) is retried.
-    /// <para>
-    /// That 67 is the cached-connection transient described on the type: a lab in a <i>previous</i>
-    /// <c>dotnet test</c> process served this same address, and the client can still be holding its connection
-    /// to that now-dead server. It is uncommon (most runs attach on the first attempt, in ~200 ms) and it does
-    /// clear, but not on a timescale worth asserting — one observed episode outlasted five one-second retries,
-    /// and the next run attached immediately. So the window is generous rather than tuned; a run that pays it
-    /// is rare enough not to matter, and the alternative is a spurious red. Only 67 is retried — every other
-    /// failure is reported at once.
-    /// </para>
+    /// Authenticates via <see cref="NetUse.ConnectWithRetry"/>. A failed login is a real interop result:
+    /// throwing from InitializeAsync fails every test in the collection rather than silently skipping.
     /// </summary>
-    private void Connect()
-    {
-        string unc = Unc(FilesShare);
-        var sw = Stopwatch.StartNew();
-        for (int attempt = 1; ; attempt++)
-        {
-            RunNet(out _, "use", unc, "/delete", "/y");            // drop a stale mapping from an earlier run
-            int exit = RunNet(out string log, "use", unc, Password, $"/user:{Domain}\\{User}");
-            _log.Enqueue($"[lab] net use attempt {attempt} @ {sw.ElapsedMilliseconds}ms → exit {exit}: {log.Trim().ReplaceLineEndings(" ")}");
-            if (exit == 0) return;
-
-            // "System error 67 has occurred." / "Systemfehler 67 aufgetreten." — matched with the surrounding
-            // spaces so this stays locale-independent without matching a stray 67 inside a path or byte count.
-            bool staleCachedConnection = log.Contains(" 67 ");
-            if (staleCachedConnection && attempt < 15)
-            {
-                Thread.Sleep(TimeSpan.FromSeconds(1));
-                continue;
-            }
-            // The lab itself is broken. Throwing from InitializeAsync fails every test in the collection,
-            // which is what we want: a login failure is a real interop result and must never be a silent skip.
-            throw new InvalidOperationException(
-                $"NTLM login of {Domain}\\{User} against {unc} failed (net use exit {exit}, attempt {attempt}): " +
-                $"{log.Trim()}{Environment.NewLine}Server log:{Environment.NewLine}{RecentLog()}");
-        }
-    }
+    private void Connect() =>
+        NetUse.ConnectWithRetry(Unc(FilesShare), Domain, User, Password, _log.Enqueue, RecentLog);
 
     private static SocketError? BindError()
     {
@@ -220,21 +221,8 @@ public sealed class WindowsSmbLab : IAsyncLifetime
         return dir;
     }
 
-    internal static int RunNet(out string output, params string[] args)
-    {
-        var psi = new ProcessStartInfo("net")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        foreach (string a in args) psi.ArgumentList.Add(a);
-        using Process p = Process.Start(psi)!;
-        output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-        p.WaitForExit(30_000);
-        return p.ExitCode;
-    }
+    /// <summary>Kept as a thin alias — tests and battery call through here; the implementation is shared.</summary>
+    internal static int RunNet(out string output, params string[] args) => NetUse.Run(out output, args);
 }
 
 /// <summary>

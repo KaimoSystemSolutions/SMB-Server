@@ -27,5 +27,9 @@
     <ProjectReference Include="..\..\src\Smb.Server\Smb.Server.csproj" />
     <ProjectReference Include="..\..\src\Smb.Server.OpenTelemetry\Smb.Server.OpenTelemetry.csproj" />
     <ProjectReference Include="..\..\src\Smb.Host\Smb.Host.csproj" />
+    <!-- Build-order only: SampleServerLab launches the example server as an external process, so the exe
+         must exist whenever the tests are built. No assembly reference — the example stays a black box. -->
+    <ProjectReference Include="..\..\examples\Smb.Sample.Server\Smb.Sample.Server.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

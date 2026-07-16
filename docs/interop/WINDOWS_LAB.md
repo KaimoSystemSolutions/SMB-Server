@@ -5,6 +5,27 @@
 > access** — including from ordinary .NET code — travels through exactly that client, the same code path
 > Explorer, `robocopy` and Office use. Real Windows interop therefore runs as a plain `dotnet test`.
 
+## Two labs, one battery
+
+The operations under test live in one reusable base class, `tests/Smb.Tests/WindowsInteropBattery.cs`,
+and run against **two** server configurations:
+
+| Lab | Fixture | Server | Configuration |
+|---|---|---|---|
+| Minimal | `WindowsSmbLab` | in-process | bare defaults + `ConcurrentMetadataOps`; includes the gated backend for the freeze case |
+| Example | `SampleServerLab` | **the shipped example binary** (`examples/Smb.Sample.Server`) as an external process | every knob on: compression, quota, multichannel, DFS, versioned shares, custom lock manager, … |
+
+`WindowsClientInteropTests` runs the battery against the minimal lab, `SampleServerInteropTests` against
+the example — plus example-only cases (negotiated compression both directions via `robocopy /compress`,
+versioned shares, the DFS root). A case that passes minimal but fails example isolates a bug to the
+feature surface; the LZ77 wire-format regression (Explorer: "unexpected network error" on any folder with
+enough entries) was found exactly this way. The two labs serialise on `127.0.0.1:445` via `Port445Gate` —
+xUnit runs the collections one after the other.
+
+Complementary and much cheaper than the wire tests: `WindowsCodecCrossValidationTests` cross-validates
+the LZ77/LZNT1 codecs against `ntdll!RtlCompressBuffer`/`RtlDecompressBufferEx` — the exact code the
+Windows SMB drivers use — in both directions, with no server, port or admin shell involved.
+
 ## One-time preparation
 
 Windows' **own** SMB server occupies port 445 (`srv2.sys`, process ID 4). It has to go before our server can
@@ -45,15 +66,20 @@ gone. On a developer machine that is usually irrelevant and reversible at any ti
 
 ```bash
 cd SmbServer
-dotnet test tests/Smb.Tests/Smb.Tests.csproj --filter "FullyQualifiedName~WindowsClientInteropTests"
+# both labs (minimal + example server) and the ntdll codec cross-validation:
+dotnet test tests/Smb.Tests/Smb.Tests.csproj \
+  --filter "FullyQualifiedName~WindowsClientInteropTests|FullyQualifiedName~SampleServerInteropTests|FullyQualifiedName~WindowsCodecCrossValidationTests"
 ```
 
-`tests/Smb.Tests/WindowsSmbLab.cs` starts one server on `127.0.0.1:445` for the whole test collection, logs in
-over `net use` with NTLM test credentials, and `WindowsClientInteropTests.cs` then exercises the operations
-Explorer actually issues over real UNC paths: read/write/overwrite/append/set-length/offset I/O, a 4 MiB
-LARGE_MTU round trip, rename/delete/directories, enumeration (including 500-entry paging, wildcards, Unicode),
-timestamps and attributes, volume free space, error statuses, sharing violations, parallel readers, byte-range
-locks, flush, copy, CHANGE_NOTIFY — plus the freeze case (a stuck metadata op must not block an unrelated read).
+Each lab starts one server on `127.0.0.1:445` for its whole test collection, logs in over `net use` with
+NTLM test credentials, and the battery then exercises the operations Explorer actually issues over real UNC
+paths: read/write/overwrite/append/set-length/offset I/O, a 4 MiB LARGE_MTU round trip,
+rename/delete/directories, enumeration (including 500-entry paging, wildcards, Unicode), timestamps and
+attributes, volume free space (interleaved with root enumeration), error statuses, sharing violations,
+parallel readers, byte-range locks, flush, copy, robocopy trees, `File.Replace` save flows, alternate data
+streams (Zone.Identifier), security-descriptor queries, read-only delete semantics, case-insensitive
+lookups, share-root operations, CHANGE_NOTIFY — plus the freeze case (a stuck metadata op must not block an
+unrelated read).
 
 **Every case is time-boxed** (`Timed`, 25 s). A freeze is the symptom under investigation, so it has to fail as
 a freeze rather than hang the test run.

@@ -393,9 +393,30 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
     protected override NtStatus SetDeleteOnClose(IFileHandle handle, bool delete)
     {
         if (_readOnly && delete) return NtStatus.AccessDenied;
+
+        // MS-FSA §2.1.5.14.3: marking a file (or a stream of it) delete-pending while it carries
+        // FILE_ATTRIBUTE_READONLY must fail with STATUS_CANNOT_DELETE. Explorer relies on the decline:
+        // it asks the user, clears the attribute and retries — a server that deletes anyway removes
+        // files Windows promised were protected.
+        if (delete && HasReadOnlyAttribute(handle))
+            return NtStatus.CannotDelete;
+
         if (handle is NamedStreamHandle ns) { ns.DeleteOnClose = delete; return NtStatus.Success; }
         ((LocalFileHandle)handle).DeleteOnClose = delete;
         return NtStatus.Success;
+    }
+
+    private static bool HasReadOnlyAttribute(IFileHandle handle)
+    {
+        string path = handle is NamedStreamHandle ns ? ns.BaseFullPath : ((LocalFileHandle)handle).FullPath;
+        try
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReadOnly) != 0;
+        }
+        catch (IOException)
+        {
+            return false; // no attributes to protect (e.g. just created, or already gone)
+        }
     }
 
     protected override NtStatus Flush(IFileHandle handle)

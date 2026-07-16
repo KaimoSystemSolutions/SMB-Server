@@ -180,6 +180,9 @@ await using SmbServer server = SmbServerBuilder.Create()
     // ── Fine-grained escape hatch for options without a dedicated method ────
     .Configure(o =>
     {
+        o.ConcurrentMetadataOps = true;                       // metadata ops off the connection barrier — without
+                                                              // this, one slow backend CREATE/QUERY freezes every
+                                                              // other op on the connection (Explorer hangs)
         o.MaxCreditsPerResponse = 512;                        // credit grant cap per response
         o.MaxOutstandingRequests = 512;                       // async ops (blocking LOCK / CHANGE_NOTIFY) cap
         o.MaxConcurrentFileOpsPerConnection = 8;              // pipelined READ/WRITE parallelism (1 = sequential)

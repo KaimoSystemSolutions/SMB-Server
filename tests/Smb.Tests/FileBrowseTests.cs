@@ -149,6 +149,94 @@ public class FileBrowseTests : IDisposable
         Assert.False(File.Exists(Path.Combine(_shareDir, "new.txt")), "File should be gone after DELETE_ON_CLOSE.");
     }
 
+    /// <summary>
+    /// A truncating open must leave no tail of the previous, longer content behind.
+    /// <para>
+    /// The Windows redirector does not implement <c>FileMode.Truncate</c> (and an app saving a shorter file)
+    /// with FILE_OVERWRITE. It opens FILE_OPEN, sends SET_INFO <b>FileAllocationInformation</b> with the new
+    /// size (0 here), then writes the new, shorter content — exactly the three messages replayed below. The
+    /// server used to accept FileAllocationInformation as a no-op, so the file kept its old length and the
+    /// new write only overwrote a prefix: writing "BB" over "AAAAAAAAAA" left "BBAAAAAAAA" on disk.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void TruncatingOpen_ViaAllocationInformation_DropsTheOldTail()
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+        };
+        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: false) });
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+        (ulong sessionId, uint treeId) = LoginAndConnect(dispatcher, conn);
+
+        File.WriteAllText(Path.Combine(_shareDir, "doc.txt"), "AAAAAAAAAA"); // 10 bytes of old content
+
+        // 1) FILE_OPEN with write access — no truncation disposition, just as the redirector sends.
+        byte[] create = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+            4, sessionId, treeId, "doc.txt", desiredAccess: 0x00000003 /* read+write */,
+            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        (ulong p, ulong v) = ExtractCreateFileId(create);
+
+        // 2) SET_INFO FileAllocationInformation = 0 → the truncation request.
+        byte[] alloc = new byte[8]; // AllocationSize = 0
+        byte[] setInfo = dispatcher.ProcessMessage(conn, TestHelpers.BuildSetInfoRequest(
+            5, sessionId, treeId, p, v, infoType: 0x01,
+            fileInfoClass: (byte)FileInformationClass.FileAllocationInformation, buffer: alloc));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(setInfo).Status);
+
+        // 3) Write the new, shorter content at offset 0.
+        byte[] write = dispatcher.ProcessMessage(conn, TestHelpers.BuildWriteRequest(
+            6, sessionId, treeId, p, v, 0, Encoding.UTF8.GetBytes("BB")));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(write).Status);
+        dispatcher.ProcessMessage(conn, TestHelpers.BuildCloseRequest(7, sessionId, treeId, p, v));
+
+        Assert.Equal("BB", File.ReadAllText(Path.Combine(_shareDir, "doc.txt")));
+    }
+
+    /// <summary>
+    /// The counterpart: FileAllocationInformation asking for a size at or above the current end-of-file is a
+    /// reservation hint only and must not change the file's content or length. Guards against "fix truncation"
+    /// turning every allocation set into a truncation.
+    /// </summary>
+    [Fact]
+    public void AllocationInformation_GrowOrEqual_LeavesContentUnchanged()
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+        };
+        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: false) });
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+        (ulong sessionId, uint treeId) = LoginAndConnect(dispatcher, conn);
+
+        File.WriteAllText(Path.Combine(_shareDir, "keep.txt"), "HELLO"); // 5 bytes
+
+        byte[] create = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+            4, sessionId, treeId, "keep.txt", desiredAccess: 0x00000003,
+            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile));
+        (ulong p, ulong v) = ExtractCreateFileId(create);
+
+        byte[] alloc = new byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(alloc, 4096); // reserve well above EOF
+        byte[] setInfo = dispatcher.ProcessMessage(conn, TestHelpers.BuildSetInfoRequest(
+            5, sessionId, treeId, p, v, infoType: 0x01,
+            fileInfoClass: (byte)FileInformationClass.FileAllocationInformation, buffer: alloc));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(setInfo).Status);
+        dispatcher.ProcessMessage(conn, TestHelpers.BuildCloseRequest(6, sessionId, treeId, p, v));
+
+        Assert.Equal("HELLO", File.ReadAllText(Path.Combine(_shareDir, "keep.txt")));
+    }
+
     [Fact]
     public void CreateDirectory_Then_List_Works()
     {

@@ -71,6 +71,80 @@ public class Phase10CompressionTests
         Assert.Equal(data, PlainLz77.Decompress(compressed, size));
     }
 
+    /// <summary>
+    /// Pins the <b>wire format</b> against bytes validated with the real Windows decoder
+    /// (<c>ntdll!RtlDecompressBufferEx</c>, XPRESS — the codec behind SMB2 LZ77) — the case a
+    /// symmetric round-trip cannot catch. Two regressions live here: (1) long match lengths were
+    /// written as a full byte instead of the spec's shared half-byte (<c>LastLengthHalfByte</c>,
+    /// MS-XCA §2.4); (2) unused flag bits were padded with 0s, but the Windows decoder is
+    /// input-driven and needs the 1-padding as its end-of-stream marker. Either way our own decoder
+    /// read the stream back fine while the real client tore the connection down on every compressible
+    /// response — "unexpected network error" browsing a 500-entry directory in Explorer.
+    /// </summary>
+    [Fact]
+    public void Lz77_WireFormat_SingleLongMatch_UsesLowNibble()
+    {
+        // "x" ×20 → tokens: literal 'x', match(dist=1, len=19). len-3 = 16 ≥ 7 → escape nibble 9.
+        var data = new byte[20];
+        Array.Fill(data, (byte)'x');
+
+        byte[] expected =
+        [
+            0xFF, 0xFF, 0xFF, 0x7F,   // flags: bit31=0 (literal), bit30=1 (match), rest 1s (end marker)
+            (byte)'x',
+            0x07, 0x00,               // head: dist-1=0, length field 7 (escape)
+            0x09,                     // nibble byte: low nibble 9 → length 9+7+3 = 19
+        ];
+        Assert.Equal(expected, PlainLz77.Compress(data));
+        Assert.Equal(data, PlainLz77.Decompress(expected, data.Length));
+    }
+
+    /// <summary>
+    /// Two long matches share one length byte: the first writes its low nibble, the second patches the
+    /// high nibble of that same byte — with each match's further escape bytes staying at its own
+    /// stream position. Layout validated against <c>RtlDecompressBufferEx</c>.
+    /// </summary>
+    [Fact]
+    public void Lz77_WireFormat_TwoLongMatches_ShareTheLengthHalfByte()
+    {
+        // "abc" ×100 (300 bytes) → literals a,b,c then match(3,264) (MaxMatch cap) + match(3,33).
+        byte[] data = Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("abc", 100)));
+
+        byte[] expected =
+        [
+            0xFF, 0xFF, 0xFF, 0x1F,   // flags: 0,0,0 (literals), 1,1 (matches), rest 1s (end marker)
+            (byte)'a', (byte)'b', (byte)'c',
+            0x17, 0x00,               // match 1 head: dist-1=2, length field 7
+            0xFF,                     // shared nibble byte: low=15 (match 1), high=15 (match 2, patched)
+            0xEF,                     // match 1 second stage: 264-3-22 = 239
+            0x17, 0x00,               // match 2 head: dist-1=2, length field 7
+            0x08,                     // match 2 second stage: 33-3-22 = 8
+        ];
+        Assert.Equal(expected, PlainLz77.Compress(data));
+        Assert.Equal(data, PlainLz77.Decompress(expected, data.Length));
+    }
+
+    /// <summary>
+    /// A token stream that fills its final flag group exactly still needs the end marker: Windows'
+    /// input-driven decoder reads one more flag group and terminates on a match flag with exhausted
+    /// input, so the compressor must append an all-1s group — Windows' own compressor emits exactly
+    /// this layout for 32 incompressible bytes (validated against ntdll).
+    /// </summary>
+    [Fact]
+    public void Lz77_WireFormat_ExactlyFullFlagGroup_AppendsTerminatorGroup()
+    {
+        var data = new byte[32];
+        for (int i = 0; i < data.Length; i++) data[i] = (byte)i; // 32 distinct literals, no match
+
+        byte[] compressed = PlainLz77.Compress(data);
+
+        Assert.Equal(4 + 32 + 4, compressed.Length);
+        Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x00 }, compressed[..4]);          // 32 literal flags
+        Assert.Equal(data, compressed[4..36]);
+        Assert.Equal(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF }, compressed[36..]);          // terminator group
+        Assert.Equal(data, PlainLz77.Decompress(compressed, data.Length));
+    }
+
     // ---- LZNT1 codec ----
 
     [Fact]

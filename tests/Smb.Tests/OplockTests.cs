@@ -52,6 +52,63 @@ public class OplockTests : IDisposable
         Assert.Equal((byte)OplockLevel.Exclusive, GrantedOplock(create));
     }
 
+    /// <summary>
+    /// A directory can hold read caching at most (MS-FSA §2.1.5.17.1) — an exclusive/batch oplock on one is
+    /// not expressible, so the request must be declined rather than honoured. The Windows client asks for
+    /// BATCH on every directory open, which is why this is the normal case and not an edge one.
+    /// </summary>
+    [Theory]
+    [InlineData((byte)OplockLevel.Batch)]
+    [InlineData((byte)OplockLevel.Exclusive)]
+    public void Create_RequestingBatchOrExclusive_OnDirectory_GrantsNone(byte requested)
+    {
+        var (d, conn, sid, tid) = Setup();
+
+        byte[] create = OpenDirectory(d, conn, sid, tid, 10, oplock: requested);
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        Assert.Equal((byte)OplockLevel.None, GrantedOplock(create));
+    }
+
+    /// <summary>
+    /// Opening a directory twice must answer both opens — the case that froze Explorer on every share.
+    /// <para>
+    /// Granting the first open the BATCH oplock it asked for made the second open break it, and a break away
+    /// from BATCH must be acknowledged before the CREATE may be answered (W1.1). But the client never
+    /// believed it held a batch oplock on a directory, so it never acknowledged: the second open parked until
+    /// the break timed out. The whole flow is in-process here, so a parked CREATE surfaces as exactly what
+    /// the client saw — no response at all.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Create_SecondOpenOfSameDirectory_IsAnsweredAndBreaksNothing()
+    {
+        var (d, conn, sid, tid) = Setup();
+        OpenDirectory(d, conn, sid, tid, 10, oplock: (byte)OplockLevel.Batch);
+
+        byte[] second = OpenDirectoryRaw(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch);
+
+        Assert.NotEmpty(second);   // empty ⇒ parked behind a break nobody will ever acknowledge
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(second).Status);
+        Assert.Equal((byte)OplockLevel.None, GrantedOplock(second));
+    }
+
+    /// <summary>
+    /// The cap is about directories only: a second open of the same <i>file</i> must still break the first
+    /// holder's batch oplock and park until it acknowledges. Without this, "fix the freeze" could be read as
+    /// "stop granting oplocks", which would silently drop break-before-grant (W1.1) for real files.
+    /// </summary>
+    [Fact]
+    public void Create_SecondOpenOfSameFile_StillParksBehindBatchBreak()
+    {
+        var (d, conn, sid, tid) = Setup();
+        OpenFile(d, conn, sid, tid, 10, oplock: (byte)OplockLevel.Batch);
+
+        byte[] second = OpenFileRaw(d, conn, sid, tid, 11, oplock: (byte)OplockLevel.Batch);
+
+        Assert.Empty(second);   // parked behind the batch break — answered out-of-band once acknowledged
+    }
+
     [Fact]
     public void Create_WithoutRequestingOplock_GrantsNone()
     {
@@ -187,6 +244,20 @@ public class OplockTests : IDisposable
         => d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
             mid, sid, tid, "doc.txt", desiredAccess: 0x00000003 /* read+write */,
             disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile,
+            requestedOplockLevel: oplock));
+
+    /// <summary>Opens the share root — a directory open, as every client makes when it browses a share.</summary>
+    private static byte[] OpenDirectory(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong mid, byte oplock)
+    {
+        byte[] create = OpenDirectoryRaw(d, conn, sid, tid, mid, oplock);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        return create;
+    }
+
+    private static byte[] OpenDirectoryRaw(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong mid, byte oplock)
+        => d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+            mid, sid, tid, "", desiredAccess: 0x00000001 /* read */,
+            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.DirectoryFile,
             requestedOplockLevel: oplock));
 
     /// <summary>Reads the OplockLevel byte (offset +2 in body) — valid for both CREATE response and OPLOCK_BREAK.</summary>

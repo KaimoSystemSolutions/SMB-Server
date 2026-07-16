@@ -33,6 +33,20 @@ public sealed class InMemoryShareModeManager : IShareModeManager
         }
     }
 
+    /// <summary>
+    /// The current registrations for a key, for the sharing-violation diagnostic log line — "which
+    /// open blocked this CREATE" is otherwise invisible from either side of the wire.
+    /// </summary>
+    public string Describe(string fileKey)
+    {
+        lock (_gate)
+        {
+            if (!_files.TryGetValue(fileKey, out List<Entry>? list) || list.Count == 0) return "(none)";
+            return string.Join(", ", list.Select(e =>
+                $"[access={e.Access} share={e.Share} owner={(e.Owner as State.SmbOpen)?.PathName ?? e.Owner.GetType().Name}]"));
+        }
+    }
+
     public void Close(string fileKey, object owner)
     {
         lock (_gate)

@@ -161,10 +161,30 @@ public sealed partial class Smb2Dispatcher
 
         // [O5] Sharing-violation check BEFORE the backend acts, so a conflict causes no side effects
         // (e.g. truncation). Keyed on the share-scoped logical path; released at CLOSE/teardown.
-        string shareKey = ShareModeKey(tree, request.Name);
-        if (!_server.Options.ShareModeManager.TryOpen(shareKey, open, access, MapShare(request.ShareAccess)))
-            return BuildError(header, NtStatus.SharingViolation);
-        open.ShareModeKey = shareKey;
+        //
+        // MS-FSA §2.1.5.1.2: only an open that wants data or namespace effects — read/write/append/
+        // delete (or MAXIMUM_ALLOWED, mapped to an intent above) — participates in sharing checks. An
+        // attributes-only open (FILE_READ_ATTRIBUTES | SYNCHRONIZE, intent None here) neither checks
+        // nor REGISTERS share modes. The Windows redirector relies on both halves: it opens the share
+        // root that way for every GetDiskFreeSpaceEx — Explorer's drive bar — often with ShareAccess=0,
+        // and caches that handle. Registering it turned the cached handle into a poison pill that made
+        // every later root open (enumerating the share!) fail with a sharing violation, and vice versa.
+        string? shareKey = null;
+        if (access != FileAccessIntent.None)
+        {
+            shareKey = ShareModeKey(tree, request.Name);
+            if (!_server.Options.ShareModeManager.TryOpen(shareKey, open, access, MapShare(request.ShareAccess)))
+            {
+                // Name the blocker: a sharing violation names neither side on the wire, and "which open
+                // blocked this CREATE" is the whole diagnosis (a leaked registration looks identical to
+                // a legitimate conflict from the outside).
+                if (_server.Options.ShareModeManager is Sharing.InMemoryShareModeManager m)
+                    _log?.Invoke($"[share] CREATE '{request.Name}' access={access} share={MapShare(request.ShareAccess)} " +
+                                 $"blocked by: {m.Describe(shareKey)}");
+                return BuildError(header, NtStatus.SharingViolation);
+            }
+            open.ShareModeKey = shareKey;
+        }
 
         FileStoreResult<FileCreateResult> result = namedStream
             ? await ((INamedStreamStore)store).OpenNamedStreamAsync(
@@ -173,7 +193,7 @@ public sealed partial class Smb2Dispatcher
                 effectiveName, access, disposition, dirRequired, nonDirRequired).ConfigureAwait(false);
         if (!result.IsSuccess)
         {
-            _server.Options.ShareModeManager.Close(shareKey, open);
+            if (shareKey is not null) _server.Options.ShareModeManager.Close(shareKey, open);
             return BuildError(header, result.Status);
         }
 
@@ -194,7 +214,7 @@ public sealed partial class Smb2Dispatcher
             if (!AccessCheck.IsGranted(sd.Value!, callerSids, desired, out uint daclGranted))
             {
                 await handle.DisposeAsync().ConfigureAwait(false);
-                _server.Options.ShareModeManager.Close(shareKey, open);
+                if (shareKey is not null) _server.Options.ShareModeManager.Close(shareKey, open);
                 return BuildError(header, NtStatus.AccessDenied);
             }
             grantedAccess = daclGranted;
@@ -213,7 +233,7 @@ public sealed partial class Smb2Dispatcher
             if (delStatus != NtStatus.Success)
             {
                 await handle.DisposeAsync().ConfigureAwait(false);
-                _server.Options.ShareModeManager.Close(shareKey, open);
+                if (shareKey is not null) _server.Options.ShareModeManager.Close(shareKey, open);
                 return BuildError(header, delStatus);
             }
             open.DeleteOnClose = true;   // so CLOSE knows the entry will be removed (directory-lease break)
@@ -256,7 +276,8 @@ public sealed partial class Smb2Dispatcher
         {
             // Request oplock (Context §15): the manager determines the granted level and delivers
             // any breaks due to other holders, who are notified out-of-band.
-            OplockGrant grant = _server.Options.OplockManager.RequestOplock(open, request.RequestedOplockLevel);
+            OplockGrant grant = _server.Options.OplockManager.RequestOplock(
+                open, RequestableOplockLevel(open, request.RequestedOplockLevel));
             grantedOplock = grant.GrantedLevel;
             armed = ArmOplockBreaks(grant.Breaks, track: true);
         }
@@ -347,6 +368,30 @@ public sealed partial class Smb2Dispatcher
             return response.ToBody(responseContexts);
         }
     }
+
+    /// <summary>
+    /// The classic oplock level a CREATE may actually be granted, which is not always the one it asked for.
+    /// <para>
+    /// A directory can hold read caching at most (MS-FSA §2.1.5.17.1): write and handle caching describe
+    /// dirty data and pending closes a directory handle does not have, so an exclusive/batch oplock on one
+    /// is not a thing the protocol can express. Only classic oplocks are capped here — a <i>directory
+    /// lease</i> (read+handle, M1.3) is the supported way to cache a directory and goes through
+    /// <see cref="ILeaseManager"/> untouched.
+    /// </para>
+    /// <para>
+    /// This cannot be left to the oplock manager to decide. The Windows client requests BATCH on <i>every</i>
+    /// directory open and then ignores a grant it should never have received: it does not believe it holds
+    /// the oplock, so it never acknowledges the break when the next open forces one. Granting it therefore
+    /// parks that next opener behind an acknowledgment that can never arrive, and the client sits on the
+    /// directory until the break times out — Explorer freezing for the whole
+    /// <see cref="SmbServerOptions.OplockBreakTimeout"/> the moment a share is opened twice. Capping the
+    /// request means no such break is ever armed, and every <see cref="IOplockManager"/> inherits that.
+    /// </para>
+    /// </summary>
+    private static OplockLevel RequestableOplockLevel(SmbOpen open, OplockLevel requested)
+        => open.LocalOpen?.IsDirectory == true && requested is OplockLevel.Exclusive or OplockLevel.Batch
+            ? OplockLevel.None
+            : requested;
 
     /// <summary>
     /// [W1.1/W1.2] Parks a CREATE that broke another holder's caching until the holder acknowledges or the
@@ -1211,7 +1256,16 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.AccessDenied);
 
         QueryInfoMessage.Request req = QueryInfoMessage.ParseRequest(segment.Span, Smb2Header.Size);
-        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
+        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open))
+            return BuildError(header, NtStatus.FileClosed);
+
+        // A named-pipe handle has no backing file, so the stat below has nothing to read. It is still a
+        // queryable object: the Windows client asks a freshly opened \srvsvc for FileStandardInformation
+        // before it will send the DCERPC bind, and answering FileClosed there fails the whole RPC.
+        if (open.Pipe is not null)
+            return HandleQueryPipeInfo(session, header, open, req);
+
+        if (open.LocalOpen is null)
             return BuildError(header, NtStatus.FileClosed);
 
         if (req.InfoType == InfoType.Security)
@@ -1241,6 +1295,45 @@ public sealed partial class Smb2Dispatcher
             InfoType.FileSystem => BuildFsInfo(session, header.TreeId, (FsInformationClass)req.FileInfoClass),
             _ => null,
         };
+
+        if (buffer is null)
+            return BuildError(header, NtStatus.InvalidInfoClass);
+
+        return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(buffer));
+    }
+
+    /// <summary>
+    /// Nominal allocation size reported for an IPC$ named pipe, matching what Windows reports for its own
+    /// pipes. Nothing is allocated — the value only has to be a plausible non-zero buffer size.
+    /// </summary>
+    private const long PipeAllocationSize = 4096;
+
+    /// <summary>
+    /// QUERY_INFO against an IPC$ named-pipe handle (MS-FSCC §2.4). A pipe is not backed by a file, so the
+    /// answer is synthesized rather than stat'd: a zero-length, non-directory, single-link object. The
+    /// Windows client issues FileStandardInformation on \srvsvc between CREATE and the DCERPC bind and drops
+    /// the connection if it fails, so this path decides whether share enumeration works at all.
+    /// <para>
+    /// Only InfoType FILE is answerable here. SECURITY and QUOTA have no meaning on a pipe, and FILESYSTEM
+    /// would describe the IPC$ "volume", which has no backing store — all three are declined by the class
+    /// lookup below rather than guessed at.
+    /// </para>
+    /// </summary>
+    private ResponseSegment HandleQueryPipeInfo(SmbSession session, Smb2Header header, SmbOpen open, QueryInfoMessage.Request req)
+    {
+        var stat = new FsccFileStat
+        {
+            Name = "\\" + open.PathName,
+            FileAttributes = (uint)SmbFileAttributes.Normal,
+            AllocationSize = PipeAllocationSize,
+            EndOfFile = 0,
+            IsDirectory = false,
+            NumberOfLinks = 1,
+        };
+
+        byte[]? buffer = req.InfoType == InfoType.File
+            ? FsccStructures.BuildFileInformation(stat, (FileInformationClass)req.FileInfoClass)
+            : null;
 
         if (buffer is null)
             return BuildError(header, NtStatus.InvalidInfoClass);
@@ -1283,6 +1376,8 @@ public sealed partial class Smb2Dispatcher
         uint requiredAccess = infoClass switch
         {
             FileInformationClass.FileEndOfFileInformation => AccessMask.FileWriteData,
+            // FileAllocationInformation can shrink the file (§2.4.4), so it is a write like EndOfFile.
+            FileInformationClass.FileAllocationInformation => AccessMask.FileWriteData,
             FileInformationClass.FileDispositionInformation => AccessMask.Delete,
             FileInformationClass.FileRenameInformation => AccessMask.Delete,
             FileInformationClass.FileBasicInformation => AccessMask.FileWriteAttributes,
@@ -1306,8 +1401,8 @@ public sealed partial class Smb2Dispatcher
             FileInformationClass.FileRenameInformation => await DoRenameAsync(store, open.LocalOpen, req.Buffer).ConfigureAwait(false),
             FileInformationClass.FileBasicInformation =>
                 await DoSetBasicInfoAsync(store, open.LocalOpen, req.Buffer).ConfigureAwait(false),
-            // Allocation size is a hint about reserved space, not observable content — accepted as a no-op.
-            FileInformationClass.FileAllocationInformation => NtStatus.Success,
+            FileInformationClass.FileAllocationInformation =>
+                await DoSetAllocationAsync(store, open.LocalOpen, req.Buffer).ConfigureAwait(false),
             FileInformationClass.FilePositionInformation => NtStatus.Success,
             _ => NtStatus.InvalidInfoClass,
         };
@@ -1346,6 +1441,29 @@ public sealed partial class Smb2Dispatcher
         => store is IBasicInfoStore basicInfo
             ? basicInfo.SetBasicInfoAsync(handle, SetInfoMessage.ParseBasicInfo(buffer))
             : new ValueTask<NtStatus>(NtStatus.Success);
+
+    /// <summary>
+    /// SET_INFO FileAllocationInformation (§2.4.4): sets the file's allocation size. The Windows redirector
+    /// uses this — not FILE_OVERWRITE — to implement a truncating open (<c>FileMode.Truncate</c> / an app
+    /// saving a shorter file): it opens FILE_OPEN, sends FileAllocationInformation with the new size, then
+    /// writes. Growing the allocation is only a reservation hint with no observable content, so it is a
+    /// no-op here; shrinking it below the current end-of-file must truncate the data, exactly as NTFS does —
+    /// otherwise the tail of the previous, longer content is left behind after the new (shorter) write.
+    /// </summary>
+    private static async ValueTask<NtStatus> DoSetAllocationAsync(IFileStore store, IFileHandle handle, byte[] buffer)
+    {
+        if (buffer.Length < 8)
+            return NtStatus.InvalidParameter;
+        long allocationSize = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(buffer);
+        if (allocationSize < 0)
+            return NtStatus.InvalidParameter;
+
+        long currentEndOfFile = ToStat(await handle.GetInfoAsync().ConfigureAwait(false)).EndOfFile;
+        if (allocationSize >= currentEndOfFile)
+            return NtStatus.Success;   // reservation-only grow (or no change) — nothing observable to do
+
+        return await store.SetEndOfFileAsync(handle, allocationSize).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// QUERY_INFO with InfoType Security (§2.2.37 / MS-DTYP §2.4.6): returns the open's security
