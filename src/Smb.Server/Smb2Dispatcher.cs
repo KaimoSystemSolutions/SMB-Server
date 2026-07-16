@@ -665,7 +665,14 @@ public sealed partial class Smb2Dispatcher
         byte[] respBody = response.ToBody();
 
         // Final response: sign (except guest/anonymous), NOT included in hash anymore (Context §8.2/§8.4).
-        bool sign = session.SigningRequired && !session.IsGuest && !session.IsAnonymous;
+        // On 3.1.1 the signature is MANDATORY regardless of the signing *requirement* (§3.3.5.5.3):
+        // it is what binds the preauth-integrity hash to the derived key, and the client verifies it
+        // even when neither side requires signing. Sending it unsigned makes a Windows client drop
+        // the connection right after auth succeeds (observed: `net use` error 1208, no TREE_CONNECT
+        // — the F1 failure family, sixth instance: signing decided away from the choke points).
+        // `SignIfRequestWasSigned` cannot rescue this path — the final NTLM request is unsigned.
+        bool sign = (session.SigningRequired || connection.Dialect == SmbDialect.Smb311)
+                    && !session.IsGuest && !session.IsAnonymous;
         return sign
             ? ResponseSegment.Signed(respHeader, respBody, session)
             : ResponseSegment.Unsigned(respHeader, respBody);

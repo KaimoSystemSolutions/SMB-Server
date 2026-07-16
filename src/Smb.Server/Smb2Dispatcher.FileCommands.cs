@@ -1056,7 +1056,7 @@ public sealed partial class Smb2Dispatcher
         open.ChangeNotify?.CompleteAtClose();
         ReleaseLocks(connection, open);
         _server.Options.OplockManager.ReleaseOwner(open);
-        _server.Options.LeaseManager.ReleaseOwner(open);
+        bool leaseReleased = _server.Options.LeaseManager.ReleaseOwner(open);
         if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
 
         // [C2] A persistent handle is gone for good on CLOSE → drop its restart-surviving record.
@@ -1070,6 +1070,15 @@ public sealed partial class Smb2Dispatcher
             await open.LocalOpen.DisposeAsync().ConfigureAwait(false);
         if (removedPhysicalPath is not null)
             BreakParentDirectoryLease(removedPhysicalPath);
+
+        // [W1] §3.3.5.9.8: a break wait ends on the acknowledgment OR the Open being closed. The Windows
+        // redirector answers a batch break on a deferred-close handle (the Explorer .lnk pattern) with
+        // this CLOSE and never an ack — without this, every such reopen stalled for OplockBreakTimeout.
+        // Ordered after ReleaseOwner (the lease boolean IS the release result; manager state settled
+        // before the waiter proceeds) and after DisposeAsync (the released CREATE's response reports this
+        // file's size/timestamps — it must see the flushed file, not pre-flush metadata).
+        _breaks?.CompleteOplockBreakOnClose(open);
+        if (leaseReleased) _breaks?.CompleteLeaseBreakOnClose(open.LeaseKey);
 
         _server.Options.Metrics.OnHandleClosed();
         if (open.DeleteOnClose)
@@ -1855,13 +1864,27 @@ public sealed partial class Smb2Dispatcher
                     CreateGuid = open.DurableCreateGuid,
                     IsPersistent = open.IsPersistentHandle,
                 });
+                // [W1] A disconnected holder cannot acknowledge on any channel of this session, and
+                // reconnect does not replay break notifications — release a waiter parked on its classic
+                // oplock now (its caching state was already downgraded when the break was decided). The
+                // lease wait is deliberately NOT completed here: the preserved open still holds the lease
+                // (ReleaseOwner is not called), and another still-connected open sharing the key could
+                // legitimately acknowledge. The timeout remains the backstop for that corner.
+                _breaks?.CompleteOplockBreakOnClose(open);
                 continue;
             }
 
             _server.Options.LockManager.ReleaseOwner(open);
             _server.Options.OplockManager.ReleaseOwner(open);
-            _server.Options.LeaseManager.ReleaseOwner(open);
+            bool leaseReleased = _server.Options.LeaseManager.ReleaseOwner(open);
             if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
+            // [W1] §3.3.5.9.8: the holder's opens are gone with the session/connection — complete any
+            // break wait parked on them (LOGOFF, idle-session expiry, last-channel teardown). Handles are
+            // disposed by the caller after this returns; a waiter proceeding on possibly pre-flush
+            // metadata here is strictly better than a 35 s stall (the same tradeoff TimedOut makes —
+            // this is abnormal teardown, not the ordinary CLOSE path).
+            _breaks?.CompleteOplockBreakOnClose(open);
+            if (leaseReleased) _breaks?.CompleteLeaseBreakOnClose(open.LeaseKey);
             // [W3.1] Tear down the per-open CHANGE_NOTIFY watch. A parked request on it is completed
             // separately by CancelNonSurvivingPending (or rerouted to a surviving channel, M6.3).
             open.ChangeNotify?.Dispose();
@@ -2139,9 +2162,13 @@ public sealed partial class Smb2Dispatcher
         SmbOpen open = dh.Open;
         _server.Options.LockManager.ReleaseOwner(open);
         _server.Options.OplockManager.ReleaseOwner(open);
-        _server.Options.LeaseManager.ReleaseOwner(open);
+        bool leaseReleased = _server.Options.LeaseManager.ReleaseOwner(open);
         if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
         open.LocalOpen?.Dispose();
+        // [W1] Durable expiry is this open's final close (§3.3.5.9.8) — release any waiter still parked
+        // on its break. Ordered after the dispose, matching HandleCloseAsync.
+        _breaks?.CompleteOplockBreakOnClose(open);
+        if (leaseReleased) _breaks?.CompleteLeaseBreakOnClose(open.LeaseKey);
     }
 
     /// <summary>

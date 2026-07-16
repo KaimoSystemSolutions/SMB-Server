@@ -269,6 +269,41 @@ public abstract class WindowsInteropBattery(IWindowsInteropLab lab, ITestOutputH
         Assert.Contains("deep.txt", Timed("enumerate nested", () => Directory.GetFiles($@"{unc}\a\b\c").Select(Path.GetFileName)));
     }
 
+    /// <summary>
+    /// Explorer's new-folder flow: after CREATE it looks the folder up by its <b>exact name</b>
+    /// (QUERY_DIRECTORY with a specific pattern, no wildcard) to select it and open the inline-rename
+    /// box. The server used to synthesize "." into every listing regardless of the pattern, so that
+    /// lookup returned "." as the first (and with SL_RETURN_SINGLE_ENTRY: only) entry — Explorer then
+    /// displayed the new folder as "." and the rename box never opened. <c>Directory.GetDirectories</c>
+    /// with a literal name issues exactly that FindFirstFile shape through the real redirector.
+    /// </summary>
+    [SkippableFact]
+    public void Enumerate_ExactName_ReturnsTheRealEntry_NotDot()
+    {
+        var (unc, local) = Dir();
+        Directory.CreateDirectory(Path.Combine(local, "Neuer Ordner"));
+
+        var hits = Timed("find exact name", () => Directory.GetDirectories(unc, "Neuer Ordner").Select(Path.GetFileName).ToList());
+        Assert.Equal(["Neuer Ordner"], hits);
+
+        // The dual: an exact-name lookup for a name that does not exist must come back empty
+        // (STATUS_NO_SUCH_FILE), which the unconditional "." synthesis used to mask.
+        Assert.Empty(Timed("find missing name", () => Directory.GetFileSystemEntries(unc, "does-not-exist")));
+    }
+
+    /// <summary>The rest of the Explorer new-folder flow: create under the provisional name, then rename.</summary>
+    [SkippableFact]
+    public void NewFolder_CreateThenRename_Works()
+    {
+        var (unc, local) = Dir();
+
+        Timed("mkdir provisional", () => Directory.CreateDirectory($@"{unc}\Neuer Ordner"));
+        Timed("rename to final", () => Directory.Move($@"{unc}\Neuer Ordner", $@"{unc}\Projekte"));
+
+        Assert.True(Directory.Exists(Path.Combine(local, "Projekte")));
+        Assert.False(Directory.Exists(Path.Combine(local, "Neuer Ordner")));
+    }
+
     // ─── Enumeration (QUERY_DIRECTORY) ────────────────────────────────────
 
     /// <summary>
@@ -330,6 +365,31 @@ public abstract class WindowsInteropBattery(IWindowsInteropLab lab, ITestOutputH
         });
 
         Assert.Single(entries);
+    }
+
+    /// <summary>
+    /// The shortcut (.lnk) creation pattern that froze Explorer: write a small file, then reopen it
+    /// immediately (Explorer re-opens a fresh .lnk several times — icon extraction, preview, Defender).
+    /// The redirector holds a <b>batch</b> oplock from the write and keeps the handle alive after the
+    /// app-level close (that is what "batch" means), so the reopen breaks Batch — and the redirector's
+    /// answer to that break on a deferred-close handle is a CLOSE, <b>not</b> an OPLOCK_BREAK ack.
+    /// §3.3.5.9.8 requires the server to treat that close as the end of the wait; before it did, every
+    /// such reopen parked for the full <c>OplockBreakTimeout</c> (35 s), felt as a per-file Explorer freeze.
+    /// </summary>
+    [SkippableFact]
+    public void CreateShortcut_WriteThenImmediateReopen_DoesNotFreeze()
+    {
+        var (unc, local) = Dir();
+        byte[] payload = Encoding.ASCII.GetBytes("L\0\0\0fake-lnk-payload");
+
+        byte[] readBack = Timed("write .lnk then reopen", () =>
+        {
+            File.WriteAllBytes($@"{unc}\new.lnk", payload);   // redirector takes a batch oplock + deferred close
+            return File.ReadAllBytes($@"{unc}\new.lnk");      // reopen breaks Batch → client CLOSEs, never acks
+        });
+
+        Assert.Equal(payload, readBack);
+        Assert.Equal(payload, File.ReadAllBytes(Path.Combine(local, "new.lnk")));
     }
 
     [SkippableFact]

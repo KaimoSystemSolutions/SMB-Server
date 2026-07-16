@@ -86,14 +86,23 @@ public sealed partial class Smb2Dispatcher
         SmbOpen open = brk.Holder;
         SmbSession session = open.Session;
 
+        // §3.3.4.7: SessionId and TreeId MUST be 0 in a lease-break notification (the client locates the
+        // break by the LeaseKey in the body), and a SessionId-0 frame has no signing key — the frame goes
+        // out UNSIGNED even on a signing-required session (§3.2.5.1.3 exempts MessageId 0xFFFF…FF from
+        // client-side verification; Windows servers behave the same).
+        // Deliberate deviation on an ENCRYPTED session: the host resolves the encryption key from the
+        // response header's SessionId (SmbConnectionHandler.EncodeOutbound), so the real SessionId is
+        // kept there — inside the TRANSFORM_HEADER envelope the inner ids are opaque on the wire anyway.
+        // Follow-up: pass the session through the raw-send seam, then SessionId can be 0 unconditionally.
+        bool encrypt = ResponseNeedsEncryption(session, open);
         var h = new Smb2Header
         {
             Command = SmbCommand.OplockBreak,
             MessageId = UnsolicitedMessageId,
             Flags = Smb2HeaderFlags.ServerToRedir,
             Status = NtStatus.Success,
-            SessionId = session.SessionId,
-            TreeId = (uint)open.TreeConnect.TreeId,
+            SessionId = encrypt ? session.SessionId : 0,
+            TreeId = 0,
             CreditRequestResponse = 0,
         };
 
@@ -101,8 +110,8 @@ public sealed partial class Smb2Dispatcher
             brk.Key, brk.FromState, brk.ToState, brk.Epoch, LeaseAckRequired(brk));
 
         // Failover (M6.3): send on a surviving channel, preferring the session's primary connection.
-        await SendOutOfBandAsync(session, session.Connection, MaybeSigned(session, h, body),
-            ResponseNeedsEncryption(session, open)).ConfigureAwait(false);
+        await SendOutOfBandAsync(session, session.Connection, ResponseSegment.Unsigned(h, body),
+            encrypt).ConfigureAwait(false);
     }
 
     /// <summary>

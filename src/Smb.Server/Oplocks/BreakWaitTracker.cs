@@ -17,12 +17,16 @@ namespace Smb.Server.Oplocks;
 /// <see cref="LeaseKey"/>. <see cref="BreakKey"/> unifies both into one dictionary.
 /// </para>
 /// <para>
-/// Every registered break carries its own clock (<see cref="TimeProvider"/>): if the acknowledgment
-/// does not arrive within the timeout, the wait completes anyway (<see cref="BreakOutcome.TimedOut"/>)
-/// rather than hanging the triggering request forever — a client that stops acknowledging must not be
-/// able to freeze another client's CREATE. An acknowledgment arriving after that is a clean no-op (the
-/// entry is already gone), and one arriving for a break nobody registered is a no-op too: the ack is
-/// still answered normally by the dispatcher, only the wait side ignores it.
+/// A wait ends one of three ways (§3.3.5.9.8): the holder <b>acknowledges</b>, the holder's open is
+/// <b>closed</b> (<see cref="CompleteOplockBreakOnClose"/> / <see cref="CompleteLeaseBreakOnClose"/> —
+/// the Windows redirector's standard reply to a batch break on a deferred-close handle is a CLOSE, not
+/// an ack), or the <b>timeout</b> fires. Every registered break carries its own clock
+/// (<see cref="TimeProvider"/>): if neither ack nor close arrives within the timeout, the wait completes
+/// anyway (<see cref="BreakOutcome.TimedOut"/>) rather than hanging the triggering request forever — a
+/// client that stops acknowledging must not be able to freeze another client's CREATE. An acknowledgment
+/// arriving after that is a clean no-op (the entry is already gone), and one arriving for a break nobody
+/// registered is a no-op too: the ack is still answered normally by the dispatcher, only the wait side
+/// ignores it.
 /// </para>
 /// <para><b>Note on "force downgrade":</b> the default managers downgrade their state <i>eagerly</i>
 /// when they decide the break (see <c>InMemoryOplockManager.RequestOplock</c>), so a timeout has no
@@ -63,6 +67,22 @@ internal sealed class BreakWaitTracker
 
     /// <summary>Completes the wait for a lease break that was just acknowledged. No-op if none is pending.</summary>
     public void CompleteLeaseBreak(LeaseKey key) => Complete(BreakKey.ForLease(key), BreakOutcome.Acknowledged);
+
+    /// <summary>
+    /// Completes the wait for an oplock break whose holder's open was <b>closed instead of
+    /// acknowledged</b> (§3.3.5.9.8: the server waits for the acknowledgment OR the Open being closed).
+    /// The Windows redirector answers a batch break on a deferred-close handle with exactly that CLOSE —
+    /// it never sends an ack for a handle it only kept alive for the deferred close (the Explorer
+    /// .lnk-creation freeze). No-op if none is pending.
+    /// </summary>
+    public void CompleteOplockBreakOnClose(SmbOpen holder) => Complete(BreakKey.ForOplock(holder), BreakOutcome.HolderClosed);
+
+    /// <summary>
+    /// Completes the wait for a lease break whose <b>last</b> holding open was closed (§3.3.5.9.8 — a
+    /// lease survives until all opens sharing its key are gone; the caller asserts that just happened,
+    /// see <c>ILeaseManager.ReleaseOwner</c>). No-op if none is pending.
+    /// </summary>
+    public void CompleteLeaseBreakOnClose(LeaseKey key) => Complete(BreakKey.ForLease(key), BreakOutcome.HolderClosed);
 
     private Task<BreakOutcome> Register(BreakKey key)
     {
@@ -140,4 +160,12 @@ internal enum BreakOutcome
     /// stops acknowledging degrades coherency for itself, it does not stall anyone else indefinitely.
     /// </summary>
     TimedOut,
+
+    /// <summary>
+    /// The holder closed its open (leases: the last open of the key) instead of acknowledging —
+    /// there is no cached state left to flush and the waiter may proceed (§3.3.5.9.8 counts the close
+    /// as the end of the wait). The Windows redirector's standard reply to a batch break on a
+    /// deferred-close handle is this close, so this outcome is the <i>common</i> one against Explorer.
+    /// </summary>
+    HolderClosed,
 }

@@ -85,6 +85,12 @@ public static class NegotiateProcessor
         if (options.DfsNamespace is not null)
             caps |= Smb2Capabilities.Dfs;
 
+        // SMB2_GLOBAL_CAP_LEASING is deliberately NOT advertised (yet): without it Windows never sends
+        // RqLs create contexts and falls back to classic batch oplocks for every open, so only the
+        // classic half of the break-before-grant machinery (W1) is load-bearing against real clients —
+        // the lease half is exercised by dispatcher tests. Advertising it is a planned, lab-gated change
+        // (more shared caching, fewer waited-on breaks); flipping this bit makes the lease paths real.
+
         var responseContexts = new List<NegotiateContext>();
 
         if (dialect == SmbDialect.Smb311)

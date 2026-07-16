@@ -118,15 +118,15 @@ public sealed class InMemoryLeaseManager : ILeaseManager
         }
     }
 
-    public void ReleaseOwner(SmbOpen open)
+    public bool ReleaseOwner(SmbOpen open)
     {
         lock (_gate)
         {
-            if (!_openIndex.Remove(open, out LeaseKey key)) return;
-            if (!_byKey.TryGetValue(key, out LeaseHolder? holder)) return;
+            if (!_openIndex.Remove(open, out LeaseKey key)) return false;
+            if (!_byKey.TryGetValue(key, out LeaseHolder? holder)) return false;
 
             holder.Opens.Remove(open);
-            if (holder.Opens.Count != 0) return;
+            if (holder.Opens.Count != 0) return false;  // other opens keep the lease alive
 
             _byKey.Remove(key);
             if (_fileKeys.TryGetValue(holder.FileKey, out HashSet<LeaseKey>? keys))
@@ -134,6 +134,9 @@ public sealed class InMemoryLeaseManager : ILeaseManager
                 keys.Remove(key);
                 if (keys.Count == 0) _fileKeys.Remove(holder.FileKey);
             }
+            // Decided under _gate, atomically with the removal: of two concurrent closers exactly one
+            // sees the count reach zero and reports "lease fully released" (the interface contract).
+            return true;
         }
     }
 

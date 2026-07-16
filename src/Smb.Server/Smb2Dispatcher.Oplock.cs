@@ -142,6 +142,13 @@ public sealed partial class Smb2Dispatcher
         SmbOpen open = brk.Holder;
         SmbSession session = open.Session;
 
+        // §3.3.4.6: TreeId MUST be 0 in the notification header (the client locates the break by the
+        // FileId in the body, not by tree); SessionId stays the holder's session. The frame is sent
+        // UNSIGNED even on a signing-required session: §3.2.5.1.3 exempts MessageId 0xFFFF…FF from
+        // client-side verification, and Windows servers never sign break notifications (a lease break's
+        // SessionId-0 header has no signing key to begin with). Signing it — as MaybeSigned used to —
+        // risks the F1-shaped failure one level up: a client that does verify unexpected signatures
+        // discards the frame, the holder never acks, and the parked CREATE waits out the break timeout.
         var h = new Smb2Header
         {
             Command = SmbCommand.OplockBreak,
@@ -149,14 +156,14 @@ public sealed partial class Smb2Dispatcher
             Flags = Smb2HeaderFlags.ServerToRedir,
             Status = NtStatus.Success,
             SessionId = session.SessionId,
-            TreeId = (uint)open.TreeConnect.TreeId,
+            TreeId = 0,
             CreditRequestResponse = 0,
         };
 
         byte[] body = OplockBreakMessage.BuildBody(brk.NewLevel, open.PersistentFileId, open.VolatileFileId);
 
         // Failover (M6.3): send on a surviving channel, preferring the session's primary connection.
-        await SendOutOfBandAsync(session, session.Connection, MaybeSigned(session, h, body),
+        await SendOutOfBandAsync(session, session.Connection, ResponseSegment.Unsigned(h, body),
             ResponseNeedsEncryption(session, open)).ConfigureAwait(false);
     }
 

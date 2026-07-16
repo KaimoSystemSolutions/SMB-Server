@@ -1,4 +1,5 @@
 using Microsoft.Win32.SafeHandles;
+using System.IO.Enumeration;
 using Smb.FileSystem.Security;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
@@ -250,10 +251,16 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
         string pattern = string.IsNullOrEmpty(searchPattern) ? "*" : searchPattern;
         var entries = new List<FileEntryInfo>();
 
-        // Prepend "." and ".." (expected by clients).
+        // Prepend "." and ".." — but only when the search pattern matches them, like any other entry
+        // (FsRtlIsNameInExpression semantics; wildcards match, a specific name does not). Synthesizing
+        // them unconditionally broke Explorer's new-folder flow: its post-CREATE lookup with the exact
+        // folder name + SL_RETURN_SINGLE_ENTRY got "." as the single entry, so the new folder displayed
+        // as "." and the inline-rename box never opened. It also masked STATUS_NO_SUCH_FILE for
+        // non-matching specific patterns (the list was never empty).
         var dirInfo = new DirectoryInfo(h.FullPath);
-        entries.Add(ToEntry(dirInfo, "."));
-        if (Path.GetFullPath(h.FullPath) != _root)
+        if (FileSystemName.MatchesWin32Expression(pattern, "."))
+            entries.Add(ToEntry(dirInfo, "."));
+        if (Path.GetFullPath(h.FullPath) != _root && FileSystemName.MatchesWin32Expression(pattern, ".."))
             entries.Add(ToEntry(dirInfo.Parent ?? dirInfo, ".."));
 
         try
@@ -283,9 +290,11 @@ public sealed class LocalFileStore : SyncFileStore, INamedStreamStore, IExtended
         string pattern = string.IsNullOrEmpty(searchPattern) ? "*" : searchPattern;
         var entries = new List<FileEntryInfo>();
 
+        // Pattern-gated "." / ".." synthesis — same rule as the unbounded overload above.
         var dirInfo = new DirectoryInfo(h.FullPath);
-        entries.Add(ToEntry(dirInfo, "."));
-        if (Path.GetFullPath(h.FullPath) != _root)
+        if (FileSystemName.MatchesWin32Expression(pattern, "."))
+            entries.Add(ToEntry(dirInfo, "."));
+        if (Path.GetFullPath(h.FullPath) != _root && FileSystemName.MatchesWin32Expression(pattern, ".."))
             entries.Add(ToEntry(dirInfo.Parent ?? dirInfo, ".."));
 
         bool truncated = false;

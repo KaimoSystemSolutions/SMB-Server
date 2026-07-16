@@ -51,7 +51,13 @@ public interface ILeaseManager
 
     /// <summary>At CLOSE, detaches <paramref name="open"/> from its lease; when the last open of a
     /// lease closes, the lease is released (§3.3.5.10).</summary>
-    void ReleaseOwner(SmbOpen open);
+    /// <returns><c>true</c> when <paramref name="open"/> was the last open holding its lease and the
+    /// lease is now fully released — the caller must then complete any break wait pending on the key
+    /// (§3.3.5.9.8: a lease break wait ends when all opens sharing the lease key are closed).
+    /// <c>false</c> when other opens keep the lease alive, or the open held no lease. The decision must
+    /// be made atomically with the removal (under the manager's lock), so of two concurrent closers
+    /// exactly one observes <c>true</c>.</returns>
+    bool ReleaseOwner(SmbOpen open);
 
     /// <summary>
     /// Breaks any <b>directory</b> lease held on the directory whose backend file key is
@@ -74,6 +80,6 @@ public sealed class NullLeaseManager : ILeaseManager
 {
     public LeaseGrant RequestLease(SmbOpen open, LeaseRequest request) => LeaseGrant.None;
     public LeaseState Acknowledge(LeaseKey key, LeaseState newState) => LeaseState.None;
-    public void ReleaseOwner(SmbOpen open) { }
+    public bool ReleaseOwner(SmbOpen open) => false;
     public IReadOnlyList<LeaseBreak> BreakDirectoryLease(string directoryFileKey) => Array.Empty<LeaseBreak>();
 }

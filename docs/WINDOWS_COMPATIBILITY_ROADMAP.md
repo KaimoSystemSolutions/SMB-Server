@@ -64,6 +64,15 @@ flawlessly"):
 | **F4** | `LocalFileHandle.Build()` reported `Attributes` **hard-coded as `Normal`** (resp. `Directory`) instead of reading them. | QUERY_INFO on an open handle contradicted a directory listing of the same file: hidden/read-only looked "normal" in the properties dialog. | `LocalFileStore.MapAttributes` is now used by both paths. |
 | **F5** (found 2026-07-15 while implementing W1, **not** lab-measured) | **F1 all over again, on the out-of-band path.** `SendAsyncFinalAsync` (CHANGE_NOTIFY, witness) and `SendFinalLockResponseAsync` (blocking LOCK) sent their **error/cancelled finals unsigned** on a signed session — literally `status.IsSuccess() ? MaybeSigned(...) : ResponseSegment.Unsigned(...)`. | Same mechanism as F1 (§3.2.5.1.3: the client *discards* it rather than failing the call), one path over: a client that CANCELs a CHANGE_NOTIFY, or is refused a blocking LOCK, never sees the answer and waits out its own timeout. `SignIfRequestWasSigned` does not cover these — nothing assembles an out-of-band final centrally. | New `SignedLikeRequest` helper applies §3.3.4.1.1 (request signed ⇒ response signed) to every async final. |
 
+**Three further findings from the first manual Explorer session against the sample server (2026-07-16)** —
+all three reproduced by the user in one session, all three root-caused in code review and fixed the same day:
+
+| # | Cause | Effect on the real client | Fix | Test |
+|---|-------|---------------------------|-----|------|
+| **F6** | **The final STATUS_SUCCESS SESSION_SETUP response was only signed when `session.SigningRequired`.** §3.3.5.5.3 makes that signature MANDATORY on 3.1.1 (non-guest/anonymous) regardless of the signing *requirement* — it binds the preauth-integrity hash to the derived key. With the sample server's `RequireSigning(false)` and Windows' default `SigningEnabled`-only security mode it went out unsigned. `SignIfRequestWasSigned` cannot rescue it: the final NTLM request is unsigned. **F1 family, sixth instance.** | Server logs 4624 AuthenticationSucceeded, client verifies the missing binding, drops the connection before TREE_CONNECT; `net use` reports **error 1208**. Looked like "login broken" with a green server log. | Sign the final response whenever dialect is 3.1.1 (non-guest/anonymous), independent of `SigningRequired` (`Smb2Dispatcher.cs` `HandleSessionSetup`; the binding path already signed unconditionally). Sample server deliberately keeps `RequireSigning(false)` as lab coverage of this configuration. | `SessionSetupFinalSigningTests` (3) |
+| **F7** | **CLOSE of the break holder was never treated as an implicit break acknowledgment.** §3.3.5.9.8: the wait ends on the ack OR the Open being closed (leases: all opens of the key closed). The redirector's standard answer to a batch break on a deferred-close handle is a CLOSE, never an ack — and leasing is not advertised, so Explorer holds **batch oplocks on every open**. `HandleCloseAsync`/`DetachSessionOpens`/`ReleaseDurable` called `ReleaseOwner` but never completed the `BreakWaitTracker` wait. | Creating a shortcut (.lnk) froze Explorer: every immediate reopen (write → icon → preview) parked behind a break whose ack never came and waited out the full 35 s `OplockBreakTimeout`, per reopen. | `BreakOutcome.HolderClosed` + `CompleteOplockBreakOnClose`/`CompleteLeaseBreakOnClose`; `ILeaseManager.ReleaseOwner` returns `bool` ("last open of the key gone", decided atomically under the manager lock); hooks in CLOSE, session/connection teardown (durable-preserve branch releases only the oplock wait — the preserved open keeps its lease) and durable expiry. Break notifications also made spec-shaped (§3.3.4.6/§3.3.4.7): TreeId 0, lease SessionId 0 (unless the frame is encrypted — the host resolves the encryption key by header SessionId), and **unsigned** (§3.2.5.1.3 exempts MessageId 0xFFFF…FF; signed notifications risked the F1-shaped discard one level up). | `BreakBeforeGrantTests` +6 (close-instead-of-ack, lease last-open-of-key, holder connection teardown, late ack after close → FILE_CLOSED, notification shapes signed-session/lease), `WindowsInteropBattery.CreateShortcut_WriteThenImmediateReopen_DoesNotFreeze` |
+| **F8** | **QUERY_DIRECTORY synthesized "." / ".." unconditionally — even for a specific-name pattern.** Explorer's post-CREATE lookup of a new folder (exact name + `SL_RETURN_SINGLE_ENTRY`) got "." as the single entry (the dispatcher caps at 1). Also masked `STATUS_NO_SUCH_FILE` for non-matching patterns (the listing was never empty). | Creating a new folder displayed it literally named "." and the inline-rename box never opened. | Gate the synthetic entries on the pattern actually matching them (`FileSystemName.MatchesWin32Expression(pattern, ".")`, both `LocalFileStore.QueryDirectory` overloads) — "." / ".." behave like any other entry. | `FileBrowseTests` +3 (specific name → only the real entry; + `SL_RETURN_SINGLE_ENTRY`; non-matching → `NO_SUCH_FILE`), `WindowsInteropBattery.Enumerate_ExactName_ReturnsTheRealEntry_NotDot`, `NewFolder_CreateThenRename_Works` |
+
 > **The generalisable lesson from F1 + F5 — this root cause has now bitten three times.** Every place that
 > builds a response **outside** a central choke point re-decides signing, and re-decides it wrong. First the
 > sequential `BuildError` paths, then `ExecutePreparedFrameAsync` (the gotcha that cost time twice on
@@ -802,4 +811,44 @@ touches the policy and stays synchronous.
     to load — rebuild clean if that error appears.
   - **Next action: W3.3** (measure `FileSystemWatcher` on the real ZFS mount before building a custom watcher)
     or **W1.5 / W2.1 flip / W4** — user's call. W3.3 is the last open W3 item and is gated on the TrueNAS lab.
+- **2026-07-16** — **F6/F7/F8 found and fixed: the first manual Explorer session against the sample server
+  surfaced three fresh defects — login error 1208, an Explorer freeze on shortcut creation, and new folders
+  displaying as "."** (all reported by the user in one session; full table in
+  [the freeze-cause section](#freeze-causes--measured-in-the-windows-lab-2026-07-15)). All three were
+  root-caused by code inspection before any fix was written, and none was a regression from W1/W3 — each was
+  a latent spec gap that only a real Explorer session in exactly this configuration could hit:
+  - **F6 (error 1208):** the final SESSION_SETUP response was signed only when `SigningRequired` — §3.3.5.5.3
+    makes it mandatory on 3.1.1. Only the sample server runs `RequireSigning(false)`, and the previously
+    green lab (`WindowsSmbLab`) uses the default `RequireMessageSigning = true`, which is why 32 interop
+    cases never saw it. **The F1 family's sixth instance**; the fix is one condition at the response build,
+    the sample server deliberately keeps `RequireSigning(false)` as standing coverage of this configuration.
+  - **F7 (.lnk freeze):** close-instead-of-ack. W1's `BreakWaitTracker` had exactly two completion sources
+    (explicit ack, timeout); §3.3.5.9.8 has a third — the holder's Open being closed, which is the Windows
+    redirector's **standard** reply to a batch break on a deferred-close handle. New `BreakOutcome.HolderClosed`;
+    `ILeaseManager.ReleaseOwner` now returns "last open of the key gone" (**public-interface signature change**,
+    source-breaking for external implementations — the compiler finds every call site); completion hooks in
+    CLOSE, both `DetachSessionOpens` branches and durable expiry. **Known benign race** (arm ↔ close, a few
+    instructions wide, timeout-bounded) documented at the hook rather than closed — closing it would couple
+    the manager and tracker locks. Break notifications also brought to spec shape (§3.3.4.6/§3.3.4.7:
+    TreeId 0, lease SessionId 0, **unsigned**) — with one documented deviation: on an *encrypted* session the
+    lease notification keeps the real SessionId because `SmbConnectionHandler.EncodeOutbound` resolves the
+    encryption key from the response header's SessionId; follow-up is to pass the session through the raw-send
+    seam. `SMB2_GLOBAL_CAP_LEASING` remains un-advertised (comment added at the capabilities block): Windows
+    therefore batch-oplocks every open, which is what made F7 fire on every .lnk reopen — advertising leasing
+    is a planned, lab-gated follow-up that would also make the lease half of these fixes load-bearing.
+  - **F8 ("." folder):** unconditional "." / ".." synthesis in both `LocalFileStore.QueryDirectory` overloads;
+    Explorer's exact-name + `SL_RETURN_SINGLE_ENTRY` post-create lookup got "." as its single entry. Fixed by
+    matching the synthetic entries against the pattern (`FileSystemName.MatchesWin32Expression`) — which also
+    un-masks `STATUS_NO_SUCH_FILE` for non-matching specific patterns. **Test-coverage lesson:** every
+    QUERY_DIRECTORY test in the repo used `"*"`; not one used a specific-name pattern or
+    `SL_RETURN_SINGLE_ENTRY` — the exact shape Explorer sends after every folder creation.
+  - **Tests:** `SessionSetupFinalSigningTests` (3 new), `BreakBeforeGrantTests` 7 → 13, `FileBrowseTests` +3,
+    interop battery +3 (`CreateShortcut_WriteThenImmediateReopen_DoesNotFreeze`,
+    `Enumerate_ExactName_ReturnsTheRealEntry_NotDot`, `NewFolder_CreateThenRename_Works` — these run against
+    both labs and are the real-client proof, pending the next lab run). **Suite: Smb.Tests 607 → 622 green
+    (± the environment-gated skips), Smb.Fuzz 128 green.**
+  - **Next action:** lab run (user stops `LanmanServer`) = Phase 1 of the current plan — full interop suite
+    incl. the three new cases, W1.5 tick-off, manual Explorer probe of the three original symptoms. Then the
+    hardening backlog (parked CHANGE_NOTIFY slot overwrite in `ChangeNotifyRegistration`, watcher root-event
+    "." hazard, `SMB2_REOPEN`/`SMB2_INDEX_SPECIFIED`, DOS wildcards, leasing capability, W2.1 default flip).
 - _(append progress here, tick off items in the phases)_

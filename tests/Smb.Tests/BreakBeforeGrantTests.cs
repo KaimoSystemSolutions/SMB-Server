@@ -229,9 +229,180 @@ public class BreakBeforeGrantTests : IDisposable
         Assert.Equal(LeaseState.Read, GrantedLeaseState(final));
     }
 
+    /// <summary>
+    /// §3.3.5.9.8: the wait ends on the acknowledgment <b>or the Open being closed</b>. The Windows
+    /// redirector answers a batch break on a deferred-close handle with a CLOSE and never an ack — the
+    /// Explorer .lnk-creation pattern. Before the close completed the wait, every such reopen stalled
+    /// for the full OplockBreakTimeout (35 s).
+    /// </summary>
+    [Fact]
+    public async Task HolderCloses_InsteadOfAcknowledging_ReleasesParkedCreate()
+    {
+        var lab = Setup();
+
+        byte[] first = lab.Open(10, oplock: (byte)OplockLevel.Batch);
+        (ulong fp, ulong fv) = CreateFileId(first);
+        Assert.Empty(lab.Open(11, oplock: (byte)OplockLevel.Batch));
+        await lab.NextSent();   // interim
+        await lab.NextSent();   // break notification
+        Assert.False(await lab.AnythingSentWithin(TimeSpan.FromMilliseconds(150)));
+
+        // The holder closes its handle instead of acknowledging.
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(lab.Close(12, fp, fv)).Status);
+
+        // The parked CREATE completes promptly — no clock advance, so this is the close, not the timeout.
+        byte[] final = await lab.NextSent();
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(final).Status);
+        Assert.Equal(SmbCommand.Create, Smb2Header.Read(final).Command);
+        Assert.Equal(0, lab.Metrics.PendingBreaks);
+        Assert.Equal(0, lab.Metrics.OplockBreakTimeouts);   // resolved by close, not by clock
+    }
+
+    /// <summary>An ack for an already-closed FileId is answered FILE_CLOSED and must not touch the tracker.</summary>
+    [Fact]
+    public async Task LateAcknowledgment_AfterHolderClose_IsFileClosed_AndReleasesNothing()
+    {
+        var lab = Setup();
+
+        byte[] first = lab.Open(10, oplock: (byte)OplockLevel.Batch);
+        (ulong fp, ulong fv) = CreateFileId(first);
+        Assert.Empty(lab.Open(11, oplock: (byte)OplockLevel.Batch));
+        await lab.NextSent();
+        await lab.NextSent();
+        lab.Close(12, fp, fv);
+        await lab.NextSent();   // the parked CREATE's final, released by the close
+
+        byte[] ack = lab.Dispatcher.ProcessMessage(lab.Connection,
+            TestHelpers.BuildOplockBreakAck(13, lab.SessionId, lab.TreeId, fp, fv, (byte)OplockLevel.LevelII));
+        Assert.Equal(NtStatus.FileClosed, Smb2Header.Read(ack).Status);
+
+        Assert.False(await lab.AnythingSentWithin(TimeSpan.FromMilliseconds(150)));   // no second final
+        Assert.Equal(0, lab.Metrics.PendingBreaks);
+        Assert.Equal(0, lab.Metrics.OplockBreakTimeouts);
+    }
+
+    /// <summary>
+    /// The lease variant is stricter (§3.3.5.9.8): a lease survives until <b>all</b> opens sharing its
+    /// key are gone, so closing one of two same-key opens must not release the waiter — only the last
+    /// close does. ILeaseManager.ReleaseOwner's return value is what encodes "that was the last one".
+    /// </summary>
+    [Fact]
+    public async Task LeaseHolder_TwoOpensSameKey_ReleasesOnlyWhenLastCloses()
+    {
+        var lab = Setup();
+        byte[] k1 = Key(0x01), k2 = Key(0x02);
+
+        byte[] firstOpen = lab.OpenWithLease(10, k1, LeaseState.ReadWriteHandle);
+        (ulong p1, ulong v1) = CreateFileId(firstOpen);
+        byte[] secondOpen = lab.OpenWithLease(11, k1, LeaseState.ReadWriteHandle);   // joins the same lease
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(secondOpen).Status);
+        (ulong p2, ulong v2) = CreateFileId(secondOpen);
+
+        // A distinct key costs the holder W+H → ack required → the CREATE parks.
+        Assert.Empty(lab.OpenWithLease(12, k2, LeaseState.ReadWriteHandle));
+        await lab.NextSent();   // interim
+        await lab.NextSent();   // lease-break notification
+
+        // First same-key open closes → the lease is still held by the second → still parked.
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(lab.Close(13, p1, v1)).Status);
+        Assert.False(await lab.AnythingSentWithin(TimeSpan.FromMilliseconds(150)));
+
+        // Last same-key open closes → the lease is fully released → the waiter proceeds.
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(lab.Close(14, p2, v2)).Status);
+        byte[] final = await lab.NextSent();
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(final).Status);
+        Assert.Equal(SmbCommand.Create, Smb2Header.Read(final).Command);
+        Assert.Equal(0, lab.Metrics.PendingBreaks);
+        Assert.Equal(0, lab.Metrics.OplockBreakTimeouts);
+    }
+
+    /// <summary>
+    /// A holder whose connection tears down can never acknowledge — its opens are reaped by
+    /// DetachSessionOpens, which must count as the §3.3.5.9.8 close. The parked CREATE lives on a
+    /// different connection and must be released promptly, not after 35 s.
+    /// </summary>
+    [Fact]
+    public async Task HolderConnectionTeardown_ReleasesParkedCreate()
+    {
+        var holder = Setup();
+        var parker = SecondClient(holder);
+
+        holder.Open(10, oplock: (byte)OplockLevel.Batch);
+        Assert.Empty(parker.Open(20, oplock: (byte)OplockLevel.Batch));
+        await parker.NextSent();   // interim → to the parked CREATE's connection
+        await holder.NextSent();   // break notification → to the holder's connection
+        Assert.False(await parker.AnythingSentWithin(TimeSpan.FromMilliseconds(150)));
+
+        // The holder's connection drops (client vanished). No ack will ever come from it.
+        await holder.Dispatcher.OnConnectionClosedAsync(holder.Connection);
+
+        byte[] final = await parker.NextSent();
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(final).Status);
+        Assert.Equal(SmbCommand.Create, Smb2Header.Read(final).Command);
+        Assert.Equal(0, parker.Metrics.PendingBreaks);
+        Assert.Equal(0, parker.Metrics.OplockBreakTimeouts);
+    }
+
+    /// <summary>
+    /// Wire shape of the classic oplock-break notification (§3.3.4.6): TreeId 0, the holder's SessionId,
+    /// and UNSIGNED even on a signing-required session (§3.2.5.1.3 exempts MessageId 0xFFFF…FF from
+    /// verification; Windows never signs break notifications). The regression guard is the other half:
+    /// the parked CREATE's <b>final</b> on that same session must stay signed — unsigning the
+    /// notification must not bleed into ordinary responses (the F1/F5 family, walked backwards).
+    /// </summary>
+    [Fact]
+    public async Task OplockBreakNotification_OnSignedSession_IsUnsigned_WithZeroTreeId_ButFinalStaysSigned()
+    {
+        var lab = Setup(requireSigning: true);
+
+        byte[] first = lab.Open(10, oplock: (byte)OplockLevel.Batch);
+        (ulong fp, ulong fv) = CreateFileId(first);
+        Assert.Empty(lab.Open(11, oplock: (byte)OplockLevel.Batch));
+
+        byte[] interim = await lab.NextSent();
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(interim).Status);
+
+        byte[] notify = await lab.NextSent();
+        Smb2Header nh = Smb2Header.Read(notify);
+        Assert.Equal(SmbCommand.OplockBreak, nh.Command);
+        Assert.Equal(0xFFFFFFFFFFFFFFFFul, nh.MessageId);
+        Assert.Equal(0u, nh.TreeId);                                    // §3.3.4.6
+        Assert.Equal(lab.SessionId, nh.SessionId);                      // classic break keeps the session id
+        Assert.False(nh.Flags.HasFlag(Smb2HeaderFlags.Signed),
+            "a break notification must go out unsigned — a client that tries to verify it discards it, " +
+            "the holder never acks, and the parked CREATE waits out the break timeout.");
+
+        lab.Dispatcher.ProcessMessage(lab.Connection, TestHelpers.BuildOplockBreakAck(
+            12, lab.SessionId, lab.TreeId, fp, fv, (byte)OplockLevel.LevelII, lab.SigningKey));
+
+        byte[] final = await lab.NextSent();
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(final).Status);
+        Assert.True(Smb2Header.Read(final).Flags.HasFlag(Smb2HeaderFlags.Signed),
+            "the parked CREATE's final must stay signed on a signing-required session (F5).");
+    }
+
+    /// <summary>Lease-break notification shape (§3.3.4.7): SessionId 0, TreeId 0, unsigned (unencrypted session).</summary>
+    [Fact]
+    public async Task LeaseBreakNotification_HasZeroSessionAndTree_AndIsUnsigned()
+    {
+        var lab = Setup();
+
+        lab.OpenWithLease(10, Key(0x01), LeaseState.ReadWriteHandle);
+        Assert.Empty(lab.OpenWithLease(11, Key(0x02), LeaseState.ReadWriteHandle));
+        await lab.NextSent();   // interim
+
+        byte[] notify = await lab.NextSent();
+        Smb2Header nh = Smb2Header.Read(notify);
+        Assert.Equal(SmbCommand.OplockBreak, nh.Command);
+        Assert.Equal(0xFFFFFFFFFFFFFFFFul, nh.MessageId);
+        Assert.Equal(0ul, nh.SessionId);   // §3.3.4.7 — the client routes by the LeaseKey in the body
+        Assert.Equal(0u, nh.TreeId);
+        Assert.False(nh.Flags.HasFlag(Smb2HeaderFlags.Signed));
+    }
+
     // --- setup & helpers ---
 
-    private Lab Setup(TimeSpan? breakTimeout = null)
+    private Lab Setup(TimeSpan? breakTimeout = null, bool requireSigning = false)
     {
         var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
         var metrics = new SmbServerMetricsProbe();
@@ -239,7 +410,7 @@ public class BreakBeforeGrantTests : IDisposable
         {
             ServerGuid = new byte[16],
             SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
-            RequireMessageSigning = false,
+            RequireMessageSigning = requireSigning,
             TimeProvider = _time,
             Metrics = metrics,
         };
@@ -247,30 +418,58 @@ public class BreakBeforeGrantTests : IDisposable
         options.Shares.Add(Share.CreateIpc());
         options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: false) });
 
-        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var state = new SmbServerState(options);
+        var dispatcher = new Smb2Dispatcher(state);
         var conn = new SmbConnection();
         var sent = new ConcurrentQueue<byte[]>();
         conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
 
-        dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311],
+            signingAlgs: requireSigning ? [SmbSigningAlgorithmId.AesCmac] : null));
         var client = new NtlmClient("DOM", "alice", "pw");
         byte[] r1 = dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
         ulong sessionId = Smb2Header.Read(r1).SessionId;
         dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(2, sessionId, client.BuildAuthenticate(SecurityBuffer(r1))));
-        uint treeId = Smb2Header.Read(dispatcher.ProcessMessage(conn, TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\s\Files"))).TreeId;
+        byte[]? signingKey = requireSigning ? state.SessionGlobalList[sessionId].SigningKey : null;
+        uint treeId = Smb2Header.Read(dispatcher.ProcessMessage(conn,
+            TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\s\Files", signingKey))).TreeId;
 
-        return new Lab(dispatcher, conn, sessionId, treeId, sent, metrics);
+        return new Lab(dispatcher, conn, sessionId, treeId, sent, metrics, signingKey);
+    }
+
+    /// <summary>A second, independent client (own connection, session and out-of-band queue) against the
+    /// same dispatcher — for cases where the break holder and the parked CREATE live on different
+    /// connections (teardown of one must not be teardown of the other).</summary>
+    private static Lab SecondClient(Lab first)
+    {
+        var conn = new SmbConnection();
+        var sent = new ConcurrentQueue<byte[]>();
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
+
+        first.Dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        var client = new NtlmClient("DOM", "alice", "pw");
+        byte[] r1 = first.Dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(1, 0, client.BuildNegotiate()));
+        ulong sessionId = Smb2Header.Read(r1).SessionId;
+        first.Dispatcher.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(2, sessionId, client.BuildAuthenticate(SecurityBuffer(r1))));
+        uint treeId = Smb2Header.Read(first.Dispatcher.ProcessMessage(conn,
+            TestHelpers.BuildTreeConnectRequest(3, sessionId, @"\\s\Files"))).TreeId;
+
+        return first with { Connection = conn, SessionId = sessionId, TreeId = treeId, Sent = sent };
     }
 
     private sealed record Lab(
         Smb2Dispatcher Dispatcher, SmbConnection Connection, ulong SessionId, uint TreeId,
-        ConcurrentQueue<byte[]> Sent, SmbServerMetricsProbe Metrics)
+        ConcurrentQueue<byte[]> Sent, SmbServerMetricsProbe Metrics, byte[]? SigningKey = null)
     {
         /// <summary>A CREATE requesting a classic oplock. Returns the raw response — <b>empty when parked</b>.</summary>
         public byte[] Open(ulong mid, byte oplock) => Dispatcher.ProcessMessage(Connection,
             TestHelpers.BuildCreateRequest(mid, SessionId, TreeId, "doc.txt", desiredAccess: 0x00000003,
                 disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile,
-                requestedOplockLevel: oplock));
+                signingKey: SigningKey, requestedOplockLevel: oplock));
+
+        /// <summary>A CLOSE of the given FileId, answered in-band.</summary>
+        public byte[] Close(ulong mid, ulong persistent, ulong vol) => Dispatcher.ProcessMessage(Connection,
+            TestHelpers.BuildCloseRequest(mid, SessionId, TreeId, persistent, vol, SigningKey));
 
         /// <summary>A CREATE requesting a lease. Returns the raw response — <b>empty when parked</b>.</summary>
         public byte[] OpenWithLease(ulong mid, byte[] leaseKey, LeaseState requested) => Dispatcher.ProcessMessage(Connection,

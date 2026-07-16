@@ -274,6 +274,88 @@ public class FileBrowseTests : IDisposable
         dispatcher.ProcessMessage(conn, TestHelpers.BuildCloseRequest(6, sessionId, treeId, p, v));
     }
 
+    /// <summary>
+    /// A specific-name search pattern must return only the matching entry — never the synthesized
+    /// "." / ".." (they are matched against the pattern like any other name, FsRtlIsNameInExpression
+    /// semantics). This was Explorer's new-folder bug: its post-CREATE lookup with the exact folder
+    /// name (+ SL_RETURN_SINGLE_ENTRY) got "." as the single entry, so the freshly created folder
+    /// displayed as "." and the inline-rename box never opened.
+    /// </summary>
+    [Fact]
+    public void QueryDirectory_SpecificName_ReturnsOnlyThatEntry_WithoutDotSynthesis()
+    {
+        var (dispatcher, conn, sessionId, treeId) = WritableShare();
+        Directory.CreateDirectory(Path.Combine(_shareDir, "Neuer Ordner"));
+
+        (ulong p, ulong v) = OpenRootDirectory(dispatcher, conn, sessionId, treeId, mid: 4);
+        byte[] list = dispatcher.ProcessMessage(conn, TestHelpers.BuildQueryDirectoryRequest(
+            5, sessionId, treeId, p, v,
+            (byte)FileInformationClass.FileIdBothDirectoryInformation, "Neuer Ordner", outputBufferLength: 65536));
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(list).Status);
+        Assert.Equal(["Neuer Ordner"], ParseDirectoryNames(list));
+    }
+
+    /// <summary>The exact Explorer shape: specific name + SL_RETURN_SINGLE_ENTRY → the real entry, not ".".</summary>
+    [Fact]
+    public void QueryDirectory_SpecificName_SingleEntry_ReturnsTheRealEntry()
+    {
+        var (dispatcher, conn, sessionId, treeId) = WritableShare();
+        Directory.CreateDirectory(Path.Combine(_shareDir, "Neuer Ordner"));
+
+        (ulong p, ulong v) = OpenRootDirectory(dispatcher, conn, sessionId, treeId, mid: 4);
+        byte[] list = dispatcher.ProcessMessage(conn, TestHelpers.BuildQueryDirectoryRequest(
+            5, sessionId, treeId, p, v,
+            (byte)FileInformationClass.FileIdBothDirectoryInformation, "Neuer Ordner", outputBufferLength: 65536,
+            flags: QueryDirectoryMessage.FlagReturnSingleEntry));
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(list).Status);
+        Assert.Equal(["Neuer Ordner"], ParseDirectoryNames(list));
+    }
+
+    /// <summary>
+    /// A specific pattern matching nothing must yield STATUS_NO_SUCH_FILE on the first scan call —
+    /// the unconditional "." synthesis previously made the listing non-empty and masked this status.
+    /// </summary>
+    [Fact]
+    public void QueryDirectory_NonMatchingSpecificName_ReturnsNoSuchFile()
+    {
+        var (dispatcher, conn, sessionId, treeId) = WritableShare();
+
+        (ulong p, ulong v) = OpenRootDirectory(dispatcher, conn, sessionId, treeId, mid: 4);
+        byte[] list = dispatcher.ProcessMessage(conn, TestHelpers.BuildQueryDirectoryRequest(
+            5, sessionId, treeId, p, v,
+            (byte)FileInformationClass.FileIdBothDirectoryInformation, "does-not-exist", outputBufferLength: 65536));
+
+        Assert.Equal(NtStatus.NoSuchFile, Smb2Header.Read(list).Status);
+    }
+
+    private (Smb2Dispatcher dispatcher, SmbConnection conn, ulong sessionId, uint treeId) WritableShare()
+    {
+        var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
+        var options = new SmbServerOptions
+        {
+            ServerGuid = new byte[16],
+            SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
+            RequireMessageSigning = false,
+        };
+        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: false) });
+        var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
+        var conn = new SmbConnection();
+        (ulong sessionId, uint treeId) = LoginAndConnect(dispatcher, conn);
+        return (dispatcher, conn, sessionId, treeId);
+    }
+
+    private static (ulong p, ulong v) OpenRootDirectory(Smb2Dispatcher dispatcher, SmbConnection conn,
+        ulong sessionId, uint treeId, ulong mid)
+    {
+        byte[] openDir = dispatcher.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+            mid, sessionId, treeId, name: "", desiredAccess: 0x00000001,
+            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.DirectoryFile));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(openDir).Status);
+        return ExtractCreateFileId(openDir);
+    }
+
     private (ulong sessionId, uint treeId) LoginAndConnect(Smb2Dispatcher dispatcher, SmbConnection conn)
     {
         dispatcher.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
