@@ -15,7 +15,7 @@ namespace Smb.Tests;
 
 public class RpcShareEnumTests
 {
-    // --- DCERPC-Test-PDUs (Client-Seite) ---
+    // --- DCERPC test PDUs (client side) ---
 
     private static byte[] DcerpcHeader(byte ptype, uint callId)
     {
@@ -28,7 +28,7 @@ public class RpcShareEnumTests
 
     private static byte[] BindPdu(uint callId)
     {
-        // 16-Byte-Header (ptype=11) + minimaler Body (Server ignoriert den Body).
+        // 16-byte header (ptype=11) + minimal body (server ignores the body).
         var body = new byte[8];
         return TestHelpers.Concat(DcerpcHeader(11, callId), body);
     }
@@ -36,7 +36,7 @@ public class RpcShareEnumTests
     private static byte[] RequestPdu(uint callId, ushort opnum)
     {
         var body = new byte[8];
-        BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(6, 2), opnum); // opnum bei Offset 22
+        BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(6, 2), opnum); // opnum at offset 22
         return TestHelpers.Concat(DcerpcHeader(0, callId), body);
     }
 
@@ -52,7 +52,7 @@ public class RpcShareEnumTests
     {
         var endpoint = new SrvsvcEndpoint(
         [
-            new ShareEntry("Files", SrvsvcEndpoint.StypeDisktree, "Daten"),
+            new ShareEntry("Files", SrvsvcEndpoint.StypeDisktree, "Data"),
             new ShareEntry("IPC$", SrvsvcEndpoint.StypeIpc | SrvsvcEndpoint.StypeSpecial, "Remote IPC"),
         ]);
 
@@ -62,7 +62,7 @@ public class RpcShareEnumTests
         byte[] response = endpoint.HandlePdu(RequestPdu(2, 15));
         Assert.Equal((byte)DcerpcPduType.Response, response[2]);
 
-        // NDR-Stub beginnt nach dem 24-Byte-Response-Header: EntriesRead bei Offset 24+12.
+        // NDR stub begins after the 24-byte response header: EntriesRead at offset 24+12.
         int entriesRead = BinaryPrimitives.ReadInt32LittleEndian(response.AsSpan(24 + 12, 4));
         Assert.Equal(2, entriesRead);
         Assert.True(Contains(response, Encoding.Unicode.GetBytes("Files")));
@@ -80,7 +80,7 @@ public class RpcShareEnumTests
             RequireMessageSigning = false,
         };
         options.Shares.Add(Share.CreateIpc());
-        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, Remark = "Daten" });
+        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, Remark = "Data" });
 
         var state = new SmbServerState(options);
         var dispatcher = new Smb2Dispatcher(state);
@@ -118,8 +118,8 @@ public class RpcShareEnumTests
 
         byte[] output = ReadIoctlOutput(enumResp);
         Assert.Equal((byte)DcerpcPduType.Response, output[2]);
-        Assert.True(Contains(output, Encoding.Unicode.GetBytes("Files")), "Share 'Files' muss in der Enumeration erscheinen.");
-        Assert.True(Contains(output, Encoding.Unicode.GetBytes("IPC$")), "Share 'IPC$' muss in der Enumeration erscheinen.");
+        Assert.True(Contains(output, Encoding.Unicode.GetBytes("Files")), "Share 'Files' must appear in the enumeration.");
+        Assert.True(Contains(output, Encoding.Unicode.GetBytes("IPC$")), "Share 'IPC$' must appear in the enumeration.");
     }
 
     /// <summary>
@@ -149,8 +149,8 @@ public class RpcShareEnumTests
                     isVisible: ctx => ctx.ShareName != "Secret"),
         };
         options.Shares.Add(Share.CreateIpc());
-        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, Remark = "Daten" });
-        options.Shares.Add(new Share { Name = "Secret", Type = ShareType.Disk, Remark = "Geheim" });
+        options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, Remark = "Data" });
+        options.Shares.Add(new Share { Name = "Secret", Type = ShareType.Disk, Remark = "Confidential" });
 
         var dispatcher = new Smb2Dispatcher(new SmbServerState(options));
         var conn = new SmbConnection();
@@ -179,9 +179,9 @@ public class RpcShareEnumTests
 
         byte[] output = ReadIoctlOutput(enumResp);
         Assert.Equal((byte)DcerpcPduType.Response, output[2]);
-        Assert.True(Contains(output, Encoding.Unicode.GetBytes("Files")), "Sichtbarer Share muss enumeriert werden.");
-        Assert.True(Contains(output, Encoding.Unicode.GetBytes("IPC$")), "IPC$ muss enumeriert werden.");
-        Assert.False(Contains(output, Encoding.Unicode.GetBytes("Secret")), "Policy-gefilterter Share darf nicht enumeriert werden.");
+        Assert.True(Contains(output, Encoding.Unicode.GetBytes("Files")), "A visible share must be enumerated.");
+        Assert.True(Contains(output, Encoding.Unicode.GetBytes("IPC$")), "IPC$ must be enumerated.");
+        Assert.False(Contains(output, Encoding.Unicode.GetBytes("Secret")), "A policy-filtered share must not be enumerated.");
     }
 
     private static byte[] ReadSecurityBuffer(byte[] resp)

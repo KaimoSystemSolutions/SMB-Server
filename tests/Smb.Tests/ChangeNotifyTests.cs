@@ -144,9 +144,130 @@ public class ChangeNotifyTests : IDisposable
         Assert.Equal(NtStatus.Cancelled, fh.Status);
     }
 
+    // --- W3.1 buffering between two requests / W3.2 STATUS_NOTIFY_CLEANUP at CLOSE ---
+
+    [Fact]
+    public async Task ChangeInWindowBetweenRequests_IsDeliveredImmediately_OnReRegister()
+    {
+        var watcher = new ManualDirectoryWatcher();
+        var (d, conn, sid, tid) = Setup(watcher);
+        (ulong p, ulong v) = OpenEntry(d, conn, sid, tid, 4, "watched", isDir: true);
+
+        var sent = new System.Collections.Concurrent.ConcurrentQueue<byte[]>();
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
+
+        // First request parks and establishes the per-open watch; complete it with a change.
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(Notify(d, conn, sid, tid, 5, p, v)).Status);
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "a.txt"));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(await WaitForSend(sent)).Status);
+
+        // A change now arrives while the client has NO request registered — the pre-W3 gap. It must be
+        // buffered on the open, then delivered in-band the moment the client re-registers (no interim).
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Removed, "b.txt"));
+        byte[] resp = Notify(d, conn, sid, tid, 6, p, v);
+        Smb2Header h = Smb2Header.Read(resp);
+        Assert.Equal(NtStatus.Success, h.Status);
+        Assert.False(h.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand)); // answered directly, not parked
+        uint outLen = BinaryPrimitives.ReadUInt32LittleEndian(resp.AsSpan(Smb2Header.Size + 4, 4));
+        Assert.True(outLen > 0); // the buffered change was actually carried
+    }
+
+    [Fact]
+    public void BufferOverflow_AnswersNotifyEnumDir()
+    {
+        var watcher = new ManualDirectoryWatcher();
+        var (d, conn, sid, tid) = Setup(watcher, changeNotifyBufferLimit: 2);
+        (ulong p, ulong v) = OpenEntry(d, conn, sid, tid, 4, "watched", isDir: true);
+        conn.SendRawAsync = (_, _) => Task.CompletedTask;
+
+        // Establish the watch, complete the first request, then flood past the buffer cap with no request parked.
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(Notify(d, conn, sid, tid, 5, p, v)).Status);
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "first.txt")); // completes request 5
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "1.txt"));
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "2.txt"));
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "3.txt")); // exceeds cap 2 → overflow latched
+
+        byte[] resp = Notify(d, conn, sid, tid, 6, p, v);
+        Assert.Equal(NtStatus.NotifyEnumDir, Smb2Header.Read(resp).Status);
+    }
+
+    [Fact]
+    public void ChangeBeforeFirstRegister_IsNotDelivered()
+    {
+        var watcher = new ManualDirectoryWatcher();
+        var (d, conn, sid, tid) = Setup(watcher);
+        (ulong p, ulong v) = OpenEntry(d, conn, sid, tid, 4, "watched", isDir: true);
+        conn.SendRawAsync = (_, _) => Task.CompletedTask;
+
+        // Nothing was watching before the first CHANGE_NOTIFY, so there is nothing to deliver: the first
+        // request must park (STATUS_PENDING), not return an immediate answer. Guards against over-buffering.
+        Assert.Equal(0, watcher.WatchCount);
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(Notify(d, conn, sid, tid, 5, p, v)).Status);
+        Assert.Equal(1, watcher.WatchCount);
+    }
+
+    [Fact]
+    public void DifferentFilter_RestartsWatch_SameFilterReuses()
+    {
+        var watcher = new ManualDirectoryWatcher();
+        var (d, conn, sid, tid) = Setup(watcher);
+        (ulong p, ulong v) = OpenEntry(d, conn, sid, tid, 4, "watched", isDir: true);
+        conn.SendRawAsync = (_, _) => Task.CompletedTask;
+
+        // filter FileName → watch #1
+        Notify(d, conn, sid, tid, 5, p, v, filter: 0x00000001);
+        Assert.Equal(1, watcher.WatchCount);
+        ManualDirectoryWatcher.Registration first = watcher.Active!;
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "a.txt")); // complete request 5
+
+        // Same (filter, tree) → the watch is reused, not restarted.
+        Notify(d, conn, sid, tid, 6, p, v, filter: 0x00000001);
+        Assert.Equal(1, watcher.WatchCount);
+        watcher.Fire(new FileNotifyEvent(FileNotifyAction.Added, "b.txt")); // complete request 6
+
+        // Different filter (DirName) → the old watch is disposed and a new one established.
+        Notify(d, conn, sid, tid, 7, p, v, filter: 0x00000002);
+        Assert.Equal(2, watcher.WatchCount);
+        Assert.True(first.Disposed);
+    }
+
+    [Fact]
+    public async Task Close_CompletesParkedChangeNotify_WithNotifyCleanup_AndClearsPending()
+    {
+        var watcher = new ManualDirectoryWatcher();
+        var (d, conn, sid, tid) = Setup(watcher);
+        (ulong p, ulong v) = OpenEntry(d, conn, sid, tid, 4, "watched", isDir: true);
+
+        var sent = new System.Collections.Concurrent.ConcurrentQueue<byte[]>();
+        conn.SendRawAsync = (b, _) => { sent.Enqueue(b); return Task.CompletedTask; };
+
+        Assert.Equal(NtStatus.Pending, Smb2Header.Read(Notify(d, conn, sid, tid, 5, p, v)).Status);
+        Assert.Single(conn.PendingRequests);
+
+        // CLOSE the directory handle with the CHANGE_NOTIFY still parked (a client that just closes, without a
+        // CANCEL first). §3.3.5.10: the outstanding notify is completed with STATUS_NOTIFY_CLEANUP — not the
+        // generic STATUS_CANCELLED — and its watcher subscription is torn down (no leak).
+        byte[] closeResp = d.ProcessMessage(conn, TestHelpers.BuildCloseRequest(6, sid, tid, p, v));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(closeResp).Status);
+
+        Smb2Header fh = Smb2Header.Read(await WaitForSend(sent));
+        Assert.Equal(NtStatus.NotifyCleanup, fh.Status);
+        Assert.True(fh.Flags.HasFlag(Smb2HeaderFlags.AsyncCommand));
+        Assert.Empty(conn.PendingRequests);
+        Assert.True(watcher.Active!.Disposed);
+    }
+
     // --- Setup ---
 
+    private static byte[] Notify(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong mid,
+        ulong p, ulong v, uint filter = FilterFileName)
+        => d.ProcessMessage(conn, TestHelpers.BuildChangeNotifyRequest(mid, sid, tid, p, v, filter));
+
     private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(bool withWatcher)
+        => Setup(withWatcher ? new FileSystemDirectoryWatcher() : new NullDirectoryWatcher());
+
+    private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(
+        IDirectoryWatcher watcher, int changeNotifyBufferLimit = 1024)
     {
         var backend = new InMemoryIdentityBackend().AddUser("DOM", "alice", "pw");
         var options = new SmbServerOptions
@@ -154,8 +275,9 @@ public class ChangeNotifyTests : IDisposable
             ServerGuid = new byte[16],
             SpnegoNegotiator = new NtlmSpnegoNegotiator(backend, new NtlmServerOptions { NetbiosDomainName = "DOM" }),
             RequireMessageSigning = false,
+            ChangeNotifyBufferLimit = changeNotifyBufferLimit,
         };
-        options.DirectoryWatcher = withWatcher ? new FileSystemDirectoryWatcher() : new NullDirectoryWatcher();
+        options.DirectoryWatcher = watcher;
         options.Shares.Add(Share.CreateIpc());
         options.Shares.Add(new Share { Name = "Files", Type = ShareType.Disk, FileStore = new LocalFileStore(_shareDir, readOnly: false) });
 
@@ -203,5 +325,49 @@ public class ChangeNotifyTests : IDisposable
             await Task.Delay(20);
         }
         throw new Xunit.Sdk.XunitException("No out-of-band CHANGE_NOTIFY response received within the time limit.");
+    }
+
+    /// <summary>
+    /// A deterministic <see cref="IDirectoryWatcher"/>: it captures the callback of the most recently
+    /// established watch and lets the test drive changes synchronously via <see cref="Fire"/> — no reliance
+    /// on real filesystem-watcher timing. Tracks how many watches were established (to prove reuse vs restart)
+    /// and whether each was disposed.
+    /// </summary>
+    private sealed class ManualDirectoryWatcher : IDirectoryWatcher
+    {
+        private readonly object _gate = new();
+        private Registration? _active;
+
+        public int WatchCount { get; private set; }
+        public Registration? Active { get { lock (_gate) return _active; } }
+
+        public IDisposable? Watch(string directoryFullPath, bool watchSubtree, ChangeNotifyFilter filter,
+            Action<IReadOnlyList<FileNotifyEvent>> onChanges)
+        {
+            lock (_gate)
+            {
+                var reg = new Registration(watchSubtree, filter, onChanges);
+                _active = reg;
+                WatchCount++;
+                return reg;
+            }
+        }
+
+        public void Fire(params FileNotifyEvent[] events)
+        {
+            Registration? reg;
+            lock (_gate) reg = _active;
+            if (reg is { Disposed: false }) reg.OnChanges(events);
+        }
+
+        internal sealed class Registration(bool watchTree, ChangeNotifyFilter filter,
+            Action<IReadOnlyList<FileNotifyEvent>> onChanges) : IDisposable
+        {
+            public bool WatchTree { get; } = watchTree;
+            public ChangeNotifyFilter Filter { get; } = filter;
+            public Action<IReadOnlyList<FileNotifyEvent>> OnChanges { get; } = onChanges;
+            public bool Disposed { get; private set; }
+            public void Dispose() => Disposed = true;
+        }
     }
 }

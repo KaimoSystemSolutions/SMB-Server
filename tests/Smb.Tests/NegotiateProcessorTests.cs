@@ -46,7 +46,7 @@ public class NegotiateProcessorTests
     public void BuildResponse_311_NegotiatesCipherBySeverPreference()
     {
         var options = DefaultOptions();
-        // Server bevorzugt AES-128-GCM; Client bietet CCM und GCM.
+        // Server prefers AES-128-GCM; client offers CCM and GCM.
         var connection = new SmbConnection();
         var request = NegotiateRequest.Parse(
             TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311],

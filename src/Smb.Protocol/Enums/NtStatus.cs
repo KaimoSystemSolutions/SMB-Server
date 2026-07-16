@@ -8,6 +8,10 @@ public enum NtStatus : uint
 {
     Success = 0x00000000,
     Pending = 0x00000103,
+
+    /// <summary>A CHANGE_NOTIFY was completed because the directory handle it watched is being closed
+    /// (MS-SMB2 §3.3.5.10). The client treats it as a benign end of the watch, not an error.</summary>
+    NotifyCleanup = 0x0000010B,
     NotifyEnumDir = 0x0000010C,
 
     BufferOverflow = 0x80000005,

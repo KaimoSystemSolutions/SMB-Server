@@ -32,52 +32,57 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.NotSupported); // backend without a real path (e.g. virtual)
 
         // [AUDIT-2026-06] Cap outstanding async operations per connection (resource protection):
-        // each CHANGE_NOTIFY subscription holds a PendingRequest and possibly a filesystem watcher.
-        // See docs/SECURITY_AUDIT.md (Finding H1).
+        // each parked CHANGE_NOTIFY holds a PendingRequest; the watch itself is per-open (W3.1), so a
+        // re-registering client no longer churns a fresh watcher per request. See docs/SECURITY_AUDIT.md (H1).
         if (connection.PendingRequests.Count >= _server.Options.MaxOutstandingRequests)
             return BuildError(header, NtStatus.InsufficientResources);
 
+        // [W3.1] The watch lives on the open, not on this request: established on the first CHANGE_NOTIFY,
+        // reused (or restarted on a filter change) afterwards, torn down at CLOSE. Changes between two
+        // requests are buffered by the registration instead of being lost.
+        ChangeNotifyRegistration registration =
+            open.ChangeNotify ??= new ChangeNotifyRegistration(_server.Options.ChangeNotifyBufferLimit);
+
         ulong asyncId = connection.AllocateAsyncId();
+        bool encrypt = ResponseNeedsEncryption(session, open);
+
+        Task Send(NtStatus status, byte[] body)
+        {
+            connection.PendingRequests.TryRemove(header.MessageId, out _);
+            return SendAsyncFinalAsync(connection, header, session, asyncId, status, body, encrypt);
+        }
+
+        // Register the pending entry *before* handing the send callback to the registration: if a change
+        // fires the moment the request parks, Send runs on the watcher thread and must find the entry to
+        // remove. If the request is not parked (immediate answer below) it is removed again.
         var pending = new PendingAsyncRequest { MessageId = header.MessageId, AsyncId = asyncId, Owner = open };
-        var once = new NotifyOnce();
-
-        void Complete(NtStatus status, byte[] body)
-        {
-            if (!once.TryFire()) return;
-            connection.PendingRequests.TryRemove(pending.MessageId, out _);
-            _ = SendAsyncFinalAsync(connection, header, session, asyncId, status, body, ResponseNeedsEncryption(session, open));
-        }
-
-        IDisposable? subscription;
-        try
-        {
-            subscription = _server.Options.DirectoryWatcher.Watch(
-                watchPath, req.WatchTree, (ChangeNotifyFilter)req.CompletionFilter,
-                changes =>
-                {
-                    var list = new List<(uint, string)>(changes.Count);
-                    foreach (FileNotifyEvent c in changes)
-                        list.Add(((uint)c.Action, c.RelativeName));
-                    (byte[] body, bool overflow) = ChangeNotifyMessage.BuildResponseBody(list, req.OutputBufferLength);
-                    Complete(overflow ? NtStatus.NotifyEnumDir : NtStatus.Success, body);
-                });
-        }
-        catch
-        {
-            return BuildError(header, NtStatus.NotSupported);
-        }
-
-        if (subscription is null)
-            return BuildError(header, NtStatus.NotSupported); // watcher cannot watch this path
-
-        once.Attach(subscription);                 // race-safe: if an event already fired, disposed immediately here
         connection.PendingRequests[header.MessageId] = pending;
-        pending.Token.Register(() => Complete(NtStatus.Cancelled, ErrorResponse.BuildBody()));
 
-        // Note: theoretically a change can arrive in the µs window between Watch() and sending
-        // this interim response; in practice filesystem watchers deliver events ms later.
-        // Correct buffering of changes between two requests remains an open issue.
-        return InterimResponse(header, session, asyncId);
+        ChangeNotifyRegistration.RequestOutcome outcome = registration.HandleRequest(
+            watchPath, (ChangeNotifyFilter)req.CompletionFilter, req.WatchTree, req.OutputBufferLength,
+            header.MessageId, _server.Options.DirectoryWatcher, Send);
+
+        if (outcome.Disposition != ChangeNotifyRegistration.Disposition.Park)
+            connection.PendingRequests.TryRemove(header.MessageId, out _);
+
+        switch (outcome.Disposition)
+        {
+            case ChangeNotifyRegistration.Disposition.WatcherUnavailable:
+                return BuildError(header, NtStatus.NotSupported); // watcher cannot watch this path
+
+            case ChangeNotifyRegistration.Disposition.Immediate:
+            {
+                // Buffered changes (or a latched overflow) were available → answer in-band, no async round trip.
+                Smb2Header h = header.CreateResponse(outcome.Status);
+                h.SessionId = session.SessionId;
+                h.CreditRequestResponse = CreditManager.ComputeCreditGrant(header.CreditRequestResponse, _server.Options.MaxCreditsPerResponse);
+                return MaybeSigned(session, h, outcome.Body);
+            }
+
+            default: // Park
+                pending.Token.Register(() => registration.TryCancel(header.MessageId));
+                return InterimResponse(header, session, asyncId);
+        }
     }
 
     /// <summary>

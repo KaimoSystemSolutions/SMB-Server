@@ -1,7 +1,7 @@
 <Project>
   <!--
-    Gemeinsame Build-Einstellungen für alle Projekte der SMB-2/3-Server-Lib.
-    Siehe SMB2-3_Server_Context.md §2 (Architektur) und §20 (Sicherheits-Defaults).
+    Shared build settings for all projects of the SMB-2/3 server library.
+    See SMB2-3_Server_Context.md §2 (Architecture) and §20 (Security Defaults).
   -->
   <PropertyGroup>
     <!-- net9.0: required for SMB-over-QUIC (System.Net.Quic became stable public API in .NET 9,
@@ -13,19 +13,19 @@
     <Deterministic>true</Deterministic>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <!-- CS1591: fehlende XML-Doku ist für interne Wire-Strukturen ok. -->
+    <!-- CS1591: missing XML documentation is acceptable for internal wire structures. -->
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
-  <!-- Gemeinsame NuGet-Paket-Metadaten + EINE zentrale Version für alle Smb.*-Pakete.
-       Version hier zentral pflegen; per `dotnet pack -p:Version=x.y.z` überschreibbar.
-       Die vier Dependency-Pakete (Protocol/Crypto/Auth/FileSystem) müssen mit dieser
-       Version mitveröffentlicht werden, sonst scheitert der Restore beim Konsumenten. -->
+  <!-- Shared NuGet package metadata + ONE central version for all Smb.* packages.
+       Maintain version centrally here; can be overridden via `dotnet pack -p:Version=x.y.z`.
+       The four dependency packages (Protocol/Crypto/Auth/FileSystem) must be published together with
+       this version, otherwise restore fails for the consumer. -->
   <PropertyGroup>
-    <!-- Single-Package-Modell: standardmäßig packt KEIN Projekt. Nur Smb.Host
-         (PackageId=SMB-Server) setzt IsPackable=true und bettet die übrigen
-         Smb.*-DLLs ein. Verhindert versehentliche Streupakete beim Build/Pack. -->
+    <!-- Single-package model: by default NO project packages. Only Smb.Host
+         (PackageId=SMB-Server) sets IsPackable=true and embeds the remaining
+         Smb.* DLLs. Prevents accidental scattered packages during build/pack. -->
     <IsPackable>false</IsPackable>
     <Version>1.0.0</Version>
     <Authors>kaimoSystem</Authors>

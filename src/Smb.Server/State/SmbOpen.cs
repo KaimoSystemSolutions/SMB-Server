@@ -1,6 +1,7 @@
 using Smb.FileSystem;
 using Smb.Protocol.Enums;
 using Smb.Protocol.Messages;
+using Smb.Server.Notification;
 using Smb.Server.Rpc;
 
 namespace Smb.Server.State;
@@ -94,6 +95,13 @@ public sealed class SmbOpen
     /// FSCTL_SRV_REQUEST_RESUME_KEY so this open can act as a copychunk source; <c>null</c> until then.
     /// </summary>
     public byte[]? ResumeKey { get; set; }
+
+    /// <summary>
+    /// [W3.1] CHANGE_NOTIFY state for a directory handle: the per-open filesystem watch plus the FIFO of
+    /// changes buffered between two requests. <c>null</c> until the first CHANGE_NOTIFY on this open; disposed
+    /// at CLOSE/teardown. Only ever set for directory opens.
+    /// </summary>
+    public ChangeNotifyRegistration? ChangeNotify { get; set; }
 
     /// <summary>For named-pipe opens (IPC$, e.g. \PIPE\srvsvc): the DCERPC pipe state. Otherwise null.</summary>
     public RpcPipe? Pipe { get; set; }

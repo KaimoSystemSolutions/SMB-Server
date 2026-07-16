@@ -260,9 +260,10 @@ Goal: remove hypothesis #1. The machinery already exists (`ConcurrentMetadataOps
 
 ## Phase W3 — CHANGE_NOTIFY & Explorer behaviour ("case works flawlessly")
 
-**Status: OPEN.** No freeze, but the Explorer view goes stale and needs F5 — and there is a resource leak
-(below). The mechanism itself works against the real client since F2 was fixed
-(`ChangeNotify_ReportsCreate_AndDropsWatchPromptly` is green).
+**Status: W3.1 + W3.2 DONE (2026-07-16). W3.3 (ZFS watcher, manual-verify against TrueNAS) open.** No
+freeze, but the Explorer view went stale and needed F5. The mechanism itself works against the real client
+since F2 was fixed (`ChangeNotify_ReportsCreate_AndDropsWatchPromptly` is green); the two implemented items
+close the buffering gap and the CLOSE-completion status.
 
 ### The shape of the problem
 
@@ -273,7 +274,15 @@ notification** — so every change that happens inside that window is lost, perm
 (`Smb2Dispatcher.Notification.cs:77-79`: "Correct buffering of changes between two requests remains an open
 issue").
 
-### W3.1 — Close the change-buffering gap (#4)
+### W3.1 — Close the change-buffering gap (#4) ✅ DONE (2026-07-16)
+Implemented exactly as designed below. The per-open state lives in a new
+`ChangeNotifyRegistration` (`src/Smb.Server/Notification/ChangeNotifyRegistration.cs`), held on
+`SmbOpen.ChangeNotify`; `HandleChangeNotify` now delegates establish/drain/park to it and answers a buffered
+change **in-band** (no interim/async round trip). Buffer cap is `SmbServerOptions.ChangeNotifyBufferLimit`
+(default 1024 events); overflow latches and the next request gets `STATUS_NOTIFY_ENUM_DIR`. Tests:
+`ChangeInWindowBetweenRequests_IsDeliveredImmediately_OnReRegister`, `BufferOverflow_AnswersNotifyEnumDir`,
+`ChangeBeforeFirstRegister_IsNotDelivered`, `DifferentFilter_RestartsWatch_SameFilterReuses` (a deterministic
+`ManualDirectoryWatcher` drives changes synchronously — no reliance on real FS-watcher timing).
 - Move the watch's lifetime from **the request** to **the directory open**: establish it on the first
   CHANGE_NOTIFY for that `SmbOpen`, tear it down at CLOSE. Add a bounded FIFO of pending `FileNotifyEvent`s per
   open.
@@ -294,22 +303,30 @@ issue").
   → `STATUS_NOTIFY_ENUM_DIR`; a change *before* the first register is not delivered (nobody was watching —
   guards against over-buffering); different filter → watch restarted.
 
-### W3.2 — Complete a parked CHANGE_NOTIFY at CLOSE (§3.3.5.10)
-Found on 2026-07-15 while writing this plan: `PendingAsyncRequest.Owner` is documented as "the open that the
-operation belongs to (**for cancellation at CLOSE**)" — but **no CLOSE path uses it**. Only connection teardown
-(`CancelNonSurvivingPending`) and CANCEL complete a parked request. Closing a directory handle with a
-CHANGE_NOTIFY parked on it therefore leaves the request and its watcher subscription hanging until the
-connection dies.
-- §3.3.5.10 requires outstanding CHANGE_NOTIFYs on a closing handle to be completed with
-  `STATUS_NOTIFY_CLEANUP`. Today they are completed with nothing.
-- Not currently visible against Windows (its watcher sends CANCEL before CLOSE — which is why the interop test
-  is green), but it is a real leak against a client that just closes: `PendingRequests` and the watcher
-  subscription both survive, bounded only by `MaxOutstandingRequests` per connection.
-- **Files:** `Smb2Dispatcher.FileCommands.cs` (`HandleCloseAsync`), `PendingAsyncRequest`.
-- **Tests:** park a CHANGE_NOTIFY → CLOSE the directory handle → final response is `STATUS_NOTIFY_CLEANUP` and
-  `PendingRequests` is empty afterwards. `NtStatus.NotifyCleanup` (0x0000010C) needs adding.
+### W3.2 — Complete a parked CHANGE_NOTIFY at CLOSE (§3.3.5.10) ✅ DONE (2026-07-16)
+§3.3.5.10 requires outstanding CHANGE_NOTIFYs on a closing handle to be completed with
+`STATUS_NOTIFY_CLEANUP`. `HandleCloseAsync` now calls `open.ChangeNotify?.CompleteAtClose()` **before**
+`ReleaseLocks`, which sends the parked request's out-of-band final with `STATUS_NOTIFY_CLEANUP` and tears the
+watch down; the once-taken parked slot makes the generic owner-cancellation in `ReleaseLocks` a no-op, so the
+client sees NOTIFY_CLEANUP rather than the generic `STATUS_CANCELLED`.
+- **Correction to the 2026-07-15 finding.** The claim "no CLOSE path uses `Owner`" was already stale: since
+  the locking rework, `ReleaseLocks` cancels **every** pending whose `Owner` matches the closing open — a
+  parked CHANGE_NOTIFY was in fact reaped at CLOSE, just with the **wrong status** (`STATUS_CANCELLED`). So
+  W3.2's real substance was the status code, not a leak. (The teardown/durable paths dispose the watch via
+  `open.ChangeNotify?.Dispose()` in `DetachSessionOpens`.)
+- **`NtStatus.NotifyCleanup` value corrected:** the plan wrote `0x0000010C`, but that is `STATUS_NOTIFY_ENUM_DIR`
+  (already in the enum). `STATUS_NOTIFY_CLEANUP` is **`0x0000010B`** (MS-ERREF) — added with that value.
+- **Files:** `Smb2Dispatcher.FileCommands.cs` (`HandleCloseAsync`, `DetachSessionOpens`),
+  `Notification/ChangeNotifyRegistration.cs`, `Smb.Protocol/Enums/NtStatus.cs`.
+- **Test:** `Close_CompletesParkedChangeNotify_WithNotifyCleanup_AndClearsPending` — park a CHANGE_NOTIFY →
+  CLOSE the directory handle → the out-of-band final is `STATUS_NOTIFY_CLEANUP`, `PendingRequests` is empty,
+  and the watch is disposed.
 
-### W3.3 — ZFS-capable watcher (#5)
+### W3.3 — ZFS-capable watcher (#5) ⬜ OPEN (measure-first; needs the TrueNAS/ZFS + Explorer lab)
+The only remaining W3 item. Deliberately **not** built speculatively — see "Measure before building" below:
+.NET's `FileSystemWatcher` already uses inotify on Linux, and the seam (`IDirectoryWatcher`) is unchanged, so
+a custom watcher is a drop-in *if and only if* measurement shows `FileSystemWatcher` is unreliable on the
+actual ZFS mount. That measurement requires the real deployment hardware.
 - For the TrueNAS deployment, provide an `IDirectoryWatcher` based on inotify/ZFS events (instead of .NET
   `FileSystemWatcher`) and verify against Explorer (create/delete/rename appear without F5). **Measure before
   building:** .NET's `FileSystemWatcher` already uses inotify on Linux, so the question is specifically whether
@@ -746,4 +763,43 @@ touches the policy and stays synchronous.
     mode one level up). Then **W3** (CHANGE_NOTIFY buffering gap + W3.2 `STATUS_NOTIFY_CLEANUP` leak) and the
     **W2.1 default flip**, which is now more attractive than before: the W1 design deliberately does not
     depend on it.
+- **2026-07-16** — **W3.1 + W3.2 IMPLEMENTED (CHANGE_NOTIFY buffering + CLOSE completion). W3 is now only
+  W3.3 (the ZFS watcher), which is measure-first and needs the TrueNAS lab.** Full suite green before starting
+  (Smb.Tests 602 + Smb.Fuzz 128) and after (Smb.Tests **607** + Smb.Fuzz 128 = 735); the 5 new tests are the
+  delta.
+  - **W3.1 — the watch now lives on the open, not the request.** New `ChangeNotifyRegistration`
+    (`src/Smb.Server/Notification/ChangeNotifyRegistration.cs`) on `SmbOpen.ChangeNotify`: established on the
+    first CHANGE_NOTIFY, reused on the same `(filter, watchTree)` pair, restarted on a different pair, disposed
+    at CLOSE/teardown. Changes that arrive while no request is parked are buffered in a bounded FIFO
+    (`SmbServerOptions.ChangeNotifyBufferLimit`, default 1024); the next request **drains them in-band** (a
+    direct response, no interim/async round trip — §3.3.5.19 permits it when data is ready). Overflow latches
+    and the next request gets `STATUS_NOTIFY_ENUM_DIR` (empty body) → the client re-enumerates; bounds memory
+    against a rename storm. `HandleChangeNotify` shrank to: validate → get/create the registration →
+    `HandleRequest` → answer in-band or park.
+  - **Concurrency note that shaped the design:** CHANGE_NOTIFY is classified **sequential** (barrier) —
+    `TryClassifyConcurrent` has no case for it — while CLOSE runs **concurrent/exclusive** under
+    `ConcurrentMetadataOps`. So the only actor that races the dispatch path is the async watcher callback; a
+    single lock in the registration serializes buffer/parked/watch. The pending entry is added to
+    `PendingRequests` **before** the send callback is handed to the registration, so a change that fires the
+    instant the request parks (watcher thread) still finds the entry to remove; if the request is answered
+    in-band instead, the entry is removed again.
+  - **W3.2 — CLOSE completes a parked CHANGE_NOTIFY with `STATUS_NOTIFY_CLEANUP`** (§3.3.5.10) via
+    `CompleteAtClose()`, called before `ReleaseLocks`. **The 2026-07-15 finding was half-stale:** `ReleaseLocks`
+    already reaped a parked notify (it cancels *every* pending whose `Owner` is the closing open), so there was
+    no leak — only the **wrong status** (`STATUS_CANCELLED`). The once-taken parked slot makes the later
+    owner-cancellation a no-op, so NOTIFY_CLEANUP wins.
+  - **Roadmap fact corrected:** the plan said `NtStatus.NotifyCleanup = 0x0000010C`, but that value is
+    `STATUS_NOTIFY_ENUM_DIR` (already present). `STATUS_NOTIFY_CLEANUP` is **`0x0000010B`** (MS-ERREF) — added
+    with the correct value.
+  - **Tests (5 new, deterministic):** a `ManualDirectoryWatcher` test double drives changes synchronously
+    (no FS-watcher timing): change-between-requests delivered in-band on re-register; overflow →
+    `NOTIFY_ENUM_DIR`; change before the first register not delivered (guards over-buffering); different filter
+    restarts the watch / same filter reuses it; CLOSE → `NOTIFY_CLEANUP` + `PendingRequests` empty + watch
+    disposed. The 4 pre-existing CHANGE_NOTIFY tests (interim/async, sync + async CANCEL) stay green unchanged.
+  - **Env note (not a code issue):** Windows Smart App Control intermittently blocks a freshly-built unsigned
+    `Smb.Tests.dll` (`0x800711C7`, "application control policy has blocked this file"); a clean
+    `rm -rf bin obj` + rebuild produces an allowed binary. `dotnet test --no-build` reusing a blocked DLL fails
+    to load — rebuild clean if that error appears.
+  - **Next action: W3.3** (measure `FileSystemWatcher` on the real ZFS mount before building a custom watcher)
+    or **W1.5 / W2.1 flip / W4** — user's call. W3.3 is the last open W3 item and is gated on the TrueNAS lab.
 - _(append progress here, tick off items in the phases)_

@@ -87,7 +87,7 @@ internal static class TestHelpers
         return Concat(header, body.ToArray());
     }
 
-    /// <summary>Baut einen SESSION_SETUP-Request (Header + Body) mit gegebenem Token.</summary>
+    /// <summary>Builds a SESSION_SETUP request (Header + Body) with the given token.</summary>
     public static byte[] BuildSessionSetupRequest(ulong messageId, ulong sessionId, byte[] token,
         Smb2HeaderFlags flags = Smb2HeaderFlags.None, byte[]? signingKey = null,
         SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac,
@@ -115,7 +115,7 @@ internal static class TestHelpers
         return message;
     }
 
-    /// <summary>Baut einen TREE_CONNECT-Request zu <c>\\server\share</c>.</summary>
+    /// <summary>Builds a TREE_CONNECT request to <c>\\server\share</c>.</summary>
     public static byte[] BuildTreeConnectRequest(ulong messageId, ulong sessionId, string uncPath,
         byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
     {
@@ -136,7 +136,7 @@ internal static class TestHelpers
         return message;
     }
 
-    /// <summary>Baut einen LOGOFF-Request (StructureSize 4), optional signiert.</summary>
+    /// <summary>Builds a LOGOFF request (StructureSize 4), optionally signed.</summary>
     public static byte[] BuildLogoffRequest(ulong messageId, ulong sessionId,
         byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
     {
@@ -151,7 +151,7 @@ internal static class TestHelpers
         return message;
     }
 
-    /// <summary>Baut einen ECHO-Request, optional signiert.</summary>
+    /// <summary>Builds an ECHO request, optionally signed.</summary>
     public static byte[] BuildEchoRequest(ulong messageId, ulong sessionId = 0,
         byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
     {
@@ -431,7 +431,7 @@ internal static class TestHelpers
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
     }
 
-    /// <summary>Baut einen LOCK-Request mit beliebig vielen Lock-/Unlock-Elementen.</summary>
+    /// <summary>Builds a LOCK request with any number of lock/unlock elements.</summary>
     public static byte[] BuildLockRequest(ulong messageId, ulong sessionId, uint treeId,
         ulong persistentId, ulong volatileId, (ulong Offset, ulong Length, uint Flags)[] locks,
         byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
@@ -472,7 +472,7 @@ internal static class TestHelpers
         return Finish(header, body.ToArray(), messageId, signingKey, alg);
     }
 
-    /// <summary>Baut ein OPLOCK_BREAK Acknowledgment (Client→Server, §2.2.24.1).</summary>
+    /// <summary>Builds an OPLOCK_BREAK Acknowledgment (Client→Server, §2.2.24.1).</summary>
     public static byte[] BuildOplockBreakAck(ulong messageId, ulong sessionId, uint treeId,
         ulong persistentId, ulong volatileId, byte oplockLevel,
         byte[]? signingKey = null, SmbSigningAlgorithmId alg = SmbSigningAlgorithmId.AesCmac)
@@ -498,7 +498,7 @@ internal static class TestHelpers
 
     private static void SignInPlace(byte[] message, ulong messageId, byte[] signingKey, SmbSigningAlgorithmId alg)
     {
-        // SMB2_FLAGS_SIGNED setzen (Offset 16).
+        // Set SMB2_FLAGS_SIGNED flag (Offset 16).
         uint flags = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(message.AsSpan(16, 4));
         flags |= (uint)Smb2HeaderFlags.Signed;
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(message.AsSpan(16, 4), flags);

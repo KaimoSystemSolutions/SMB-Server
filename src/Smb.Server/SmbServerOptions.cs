@@ -186,6 +186,17 @@ public sealed class SmbServerOptions
     public IDirectoryWatcher DirectoryWatcher { get; set; } = new FileSystemDirectoryWatcher();
 
     /// <summary>
+    /// [W3.1] Maximum number of directory-change events buffered per open handle between two CHANGE_NOTIFY
+    /// requests. A watch now lives on the directory open (not on a single request), so changes that occur
+    /// while the client has no request registered are queued for the next one (MS-SMB2 §3.3.5.19 leaves that
+    /// gap to the server). When the buffer exceeds this cap the queued events are dropped and the next
+    /// request is answered with <c>STATUS_NOTIFY_ENUM_DIR</c> (empty body), telling the client to
+    /// re-enumerate the directory itself — a defined protocol outcome that bounds memory against a
+    /// rename/create storm. Default 1024; ≤ 0 disables the cap (unbounded — not recommended).
+    /// </summary>
+    public int ChangeNotifyBufferLimit { get; set; } = 1024;
+
+    /// <summary>
     /// Oplock management (SMB2 oplocks, Context §15). Default <see cref="InMemoryOplockManager"/>
     /// (process-local). Set to <see cref="NullOplockManager"/> to disable oplocks (CREATE
     /// then always grants <c>OplockLevel.None</c>), or hook in a custom implementation to

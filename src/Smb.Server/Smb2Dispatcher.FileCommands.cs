@@ -1005,6 +1005,10 @@ public sealed partial class Smb2Dispatcher
         if ((flags & CloseMessage.FlagPostQueryAttributes) != 0 && open.LocalOpen is not null)
             info = await open.LocalOpen.GetInfoAsync().ConfigureAwait(false);
         session.Opens.TryRemove(open.Key, out _);
+        // [W3.2] A CHANGE_NOTIFY parked on this directory handle must be completed with STATUS_NOTIFY_CLEANUP
+        // (§3.3.5.10), and its watch torn down. Done before ReleaseLocks so the client sees NOTIFY_CLEANUP
+        // rather than the generic STATUS_CANCELLED that the owner-cancellation loop there would otherwise send.
+        open.ChangeNotify?.CompleteAtClose();
         ReleaseLocks(connection, open);
         _server.Options.OplockManager.ReleaseOwner(open);
         _server.Options.LeaseManager.ReleaseOwner(open);
@@ -1740,6 +1744,9 @@ public sealed partial class Smb2Dispatcher
             _server.Options.OplockManager.ReleaseOwner(open);
             _server.Options.LeaseManager.ReleaseOwner(open);
             if (open.ShareModeKey is { } shareKey) _server.Options.ShareModeManager.Close(shareKey, open);
+            // [W3.1] Tear down the per-open CHANGE_NOTIFY watch. A parked request on it is completed
+            // separately by CancelNonSurvivingPending (or rerouted to a surviving channel, M6.3).
+            open.ChangeNotify?.Dispose();
             if (open.LocalOpen is { } handle) handles.Add(handle);
         }
         session.Opens.Clear();
