@@ -258,6 +258,40 @@ public class BreakBeforeGrantTests : IDisposable
         Assert.Equal(0, lab.Metrics.OplockBreakTimeouts);   // resolved by close, not by clock
     }
 
+    /// <summary>
+    /// The rename-leak freeze (measured 2026-07-17: PowerPoint SaveAs 43.7 s, shortcut-wizard delay).
+    /// A file opened with a batch oplock, renamed over its handle, then closed must leave <b>no</b> oplock
+    /// registration behind. The in-memory managers key their holders by the open's backend physical path,
+    /// and a rename relocates that path <i>in place</i> (<c>IFileHandle.Relocate</c>, for
+    /// FileNormalizedName after the move); a release that recomputes the key from the now-current path looks
+    /// under the NEW name and never removes the holder registered under the OLD one. The leak is invisible
+    /// until any later open reuses the original name — the shortcut wizard always proposes
+    /// "Neue Verknüpfung.lnk", Office always writes the same temp names — at which point that open breaks a
+    /// phantom holder whose handle is long gone. Nothing can acknowledge it, so the CREATE parks for the
+    /// full <see cref="SmbServerOptions.OplockBreakTimeout"/> (35 s), felt as the per-operation freeze.
+    /// </summary>
+    [Fact]
+    public async Task RenameOverHandle_ThenReopenUnderOldName_DoesNotParkBehindPhantomBreak()
+    {
+        var lab = Setup();
+
+        // Provisional open with a batch oplock → registered under the provisional name's physical path.
+        (ulong p, ulong v) = CreateFileId(lab.OpenNamed(20, "provisional.dat", CreateDisposition.Create, (byte)OplockLevel.Batch));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(lab.Rename(21, p, v, "final.dat")).Status);
+        // Close releases the open; with the leak the holder survives under the pre-rename key.
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(lab.Close(22, p, v)).Status);
+
+        // Reopen under the reused provisional name. There is no live holder, so this is a solo open: it must
+        // answer in-band immediately, not park behind a break on the closed handle.
+        byte[] reopen = lab.OpenNamed(23, "provisional.dat", CreateDisposition.Create, (byte)OplockLevel.Batch);
+        Assert.True(reopen.Length > 0,
+            "the reopen parked behind a phantom oplock break — a holder leaked because the rename relocated " +
+            "the physical path the manager keys by, and CLOSE released under the new key, not the old one.");
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(reopen).Status);
+        Assert.Equal(0, lab.Metrics.OplockBreaksSent);
+        Assert.False(await lab.AnythingSentWithin(TimeSpan.FromMilliseconds(150)));
+    }
+
     /// <summary>An ack for an already-closed FileId is answered FILE_CLOSED and must not touch the tracker.</summary>
     [Fact]
     public async Task LateAcknowledgment_AfterHolderClose_IsFileClosed_AndReleasesNothing()
@@ -467,6 +501,23 @@ public class BreakBeforeGrantTests : IDisposable
                 disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile,
                 signingKey: SigningKey, requestedOplockLevel: oplock));
 
+        /// <summary>
+        /// A CREATE of an arbitrary name/disposition requesting a classic oplock — for the rename-leak
+        /// case, which needs a distinct provisional name and DELETE rights (MAXIMUM_ALLOWED). Returns the
+        /// raw response — <b>empty when parked</b>.
+        /// </summary>
+        public byte[] OpenNamed(ulong mid, string name, CreateDisposition disposition, byte oplock) =>
+            Dispatcher.ProcessMessage(Connection, TestHelpers.BuildCreateRequest(mid, SessionId, TreeId, name,
+                desiredAccess: 0x02000000 /* MAXIMUM_ALLOWED → full incl. DELETE for the rename */,
+                disposition: (uint)disposition, options: (uint)CreateOptions.NonDirectoryFile,
+                signingKey: SigningKey, requestedOplockLevel: oplock));
+
+        /// <summary>A rename of the open (SET_INFO FileRenameInformation) to <paramref name="newName"/>.</summary>
+        public byte[] Rename(ulong mid, ulong persistent, ulong vol, string newName) => Dispatcher.ProcessMessage(
+            Connection, TestHelpers.BuildSetInfoRequest(mid, SessionId, TreeId, persistent, vol,
+                infoType: 0x01 /* File */, fileInfoClass: (byte)FileInformationClass.FileRenameInformation,
+                buffer: BuildRenameBuffer(newName), signingKey: SigningKey));
+
         /// <summary>A CLOSE of the given FileId, answered in-band.</summary>
         public byte[] Close(ulong mid, ulong persistent, ulong vol) => Dispatcher.ProcessMessage(Connection,
             TestHelpers.BuildCloseRequest(mid, SessionId, TreeId, persistent, vol, SigningKey));
@@ -509,6 +560,16 @@ public class BreakBeforeGrantTests : IDisposable
         var k = new byte[16];
         Array.Fill(k, value);
         return k;
+    }
+
+    /// <summary>A FileRenameInformation SET_INFO buffer (MS-FSCC §2.4.34): ReplaceIfExists=0, no RootDir.</summary>
+    private static byte[] BuildRenameBuffer(string newPath)
+    {
+        byte[] name = System.Text.Encoding.Unicode.GetBytes(newPath);
+        var buf = new byte[20 + name.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(16, 4), (uint)name.Length);
+        name.CopyTo(buf, 20);
+        return buf;
     }
 
     private static byte GrantedOplock(byte[] message) => message[Smb2Header.Size + 2];

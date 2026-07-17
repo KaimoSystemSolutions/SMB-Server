@@ -405,6 +405,39 @@ public abstract class WindowsInteropBattery(IWindowsInteropLab lab, ITestOutputH
         Assert.Equal(payload, File.ReadAllBytes(Path.Combine(local, "new.lnk")));
     }
 
+    /// <summary>
+    /// The rename-leak freeze (fixed 2026-07-17): a file created under a <b>provisional</b> name, renamed to
+    /// its final name, then closed, must strand no oplock/lock registration under the provisional name — or
+    /// the next create reusing that name breaks a phantom holder whose handle is already gone. Nothing can
+    /// acknowledge it, so the create parks for the whole 35&nbsp;s <c>OplockBreakTimeout</c>. It is the exact
+    /// shape the shortcut wizard (always proposing "Neue Verknüpfung.lnk") and Office (reusing temp names)
+    /// produce, and what made real PowerPoint's <c>SaveAs</c> take 43.7&nbsp;s. The in-memory managers keyed
+    /// their holders by the open's backend physical path, which a rename relocates in place; releasing under
+    /// the recomputed key left the holder registered under the old one. The loop reuses one provisional name
+    /// across rounds — each round is time-boxed, so a re-introduced leak fails here as a freeze.
+    /// </summary>
+    [SkippableFact]
+    public void ReusedProvisionalName_CreateRenameClose_Repeated_DoesNotFreeze()
+    {
+        var (unc, local) = Dir();
+        string provisional = $@"{unc}\Neue Verknüpfung.lnk";
+
+        for (int round = 0; round < 4; round++)
+        {
+            int r = round;
+            Timed($"round {r}: write provisional then rename to final", () =>
+            {
+                File.WriteAllBytes(provisional, Encoding.ASCII.GetBytes("L\0\0\0lnk"));
+                File.Move(provisional, $@"{unc}\Editor {r}.lnk");
+            });
+        }
+
+        for (int round = 0; round < 4; round++)
+            Assert.True(File.Exists(Path.Combine(local, $"Editor {round}.lnk")),
+                $"final name from round {round} never landed on the backend.{Environment.NewLine}{Lab.RecentLog()}");
+        Assert.False(File.Exists(Path.Combine(local, "Neue Verknüpfung.lnk")));
+    }
+
     // ─── Host alias (\\localhost) + Explorer file flows ───────────────────
     //
     // Reported 2026-07-16 from a manual Explorer session: double-clicking a text file produced the

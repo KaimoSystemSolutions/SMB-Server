@@ -132,6 +132,57 @@ public class LockDispatcherTests : IDisposable
         Assert.Equal(NtStatus.Cancelled, fh.Status);
     }
 
+    /// <summary>
+    /// A byte-range lock must not survive its owner under the wrong key after a rename. The default
+    /// <see cref="InMemoryLockManager"/> keys locks by the open's backend physical path; a rename relocates
+    /// that path in place, so releasing under the recomputed (new) key would strand the lock under the old
+    /// one. A stranded exclusive lock then blocks a later lock on the reused name forever — the lock-side
+    /// twin of the oplock rename-leak freeze. Uses FAIL_IMMEDIATELY so the bug shows as a spurious Conflict
+    /// rather than hanging the test.
+    /// </summary>
+    [Fact]
+    public void LockedRange_AfterRenameAndClose_DoesNotStrandUnderOldName()
+    {
+        var (d, conn, sid, tid) = Setup();
+        (ulong p, ulong v) = OpenFullAccess(d, conn, sid, tid, 4, "lock.txt");
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildLockRequest(
+            5, sid, tid, p, v, [(0, 10, (uint)(LockFlags.ExclusiveLock | LockFlags.FailImmediately))]))).Status);
+
+        // Rename the locked file over its handle, then close it. With the leak, the [0,10) lock stays
+        // registered under "lock.txt" (the pre-rename key) because CLOSE releases under "moved.txt".
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildSetInfoRequest(
+            6, sid, tid, p, v, infoType: 0x01, fileInfoClass: (byte)FileInformationClass.FileRenameInformation,
+            buffer: RenameBuffer("moved.txt")))).Status);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn,
+            TestHelpers.BuildCloseRequest(7, sid, tid, p, v))).Status);
+
+        // A fresh file reusing the original name must lock cleanly — no phantom conflict.
+        File.WriteAllText(Path.Combine(_shareDir, "lock.txt"), new string('x', 100));
+        (ulong p2, ulong v2) = OpenFullAccess(d, conn, sid, tid, 8, "lock.txt");
+        byte[] resp = d.ProcessMessage(conn, TestHelpers.BuildLockRequest(
+            9, sid, tid, p2, v2, [(0, 10, (uint)(LockFlags.ExclusiveLock | LockFlags.FailImmediately))]));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(resp).Status);
+    }
+
+    private static (ulong p, ulong v) OpenFullAccess(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong mid, string name)
+    {
+        byte[] create = d.ProcessMessage(conn, TestHelpers.BuildCreateRequest(
+            mid, sid, tid, name, desiredAccess: 0x02000000 /* MAXIMUM_ALLOWED, incl. DELETE for the rename */,
+            disposition: (uint)CreateDisposition.Open, options: (uint)CreateOptions.NonDirectoryFile));
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(create).Status);
+        return ExtractCreateFileId(create);
+    }
+
+    private static byte[] RenameBuffer(string newPath)
+    {
+        byte[] name = Encoding.Unicode.GetBytes(newPath);
+        var buf = new byte[20 + name.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(16, 4), (uint)name.Length);
+        name.CopyTo(buf, 20);
+        return buf;
+    }
+
     // --- Setup ---
 
     private (Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid) Setup(

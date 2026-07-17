@@ -969,4 +969,49 @@ touches the policy and stays synchronous.
     editor cases (each is green in isolation — verified repeatedly). Candidate fixes: per-lab run tags
     in window titles + a pre-lab `net use * /delete` scoped to lab hosts, or serialising the editor
     cases into the first lab only.
+- **2026-07-17** — **F12 found and fixed: a rename over an open handle leaked its oplock/lock
+  registration, and the next open reusing the old name froze 35 s on a phantom break.** The user
+  re-reported all three original symptoms — double-click "cannot open the file, Notepad shows an error",
+  a delay creating a shortcut, and a delay saving a PowerPoint — against a build already carrying F6–F11.
+  Measured, then root-caused by code inspection; fixed with a dispatcher-level regression test and a
+  real-client battery guard.
+  - **The measurement (this is what broke the guessing):** a fresh sample server whose stdout the harness
+    captured, driven by **real PowerPoint** (`PowerPoint.Application` COM) and the **real shortcut wizard**
+    (`WScript.Shell`) over `\\localhost\Files`. `SaveAs` to the share took **43,767 ms**; the server log
+    carried exactly one `[oplock] break not acknowledged within 00:00:35; proceeding with CREATE mid=262`.
+    A batch-oplock break on `probe.pptx` was armed against a holder that never acked and never closed —
+    i.e. a holder that was no longer there.
+  - **Root cause:** the in-memory `IOplockManager`/`ILockManager` key their holders by
+    `open.LocalOpen.PhysicalPath` (`FileKey`). `LocalFileStore.RenameAsync` calls `IFileHandle.Relocate`,
+    which mutates that path **in place** (needed since F9 for FileNormalizedName after a move). Registration
+    happened at CREATE under the *old* path; `ReleaseOwner` **recomputed** `FileKey` at CLOSE and looked
+    under the *new* path — so it removed nothing and the holder leaked under the old name. Office and the
+    shortcut wizard both create under a provisional name (`8xxxxxxx.tmp`, `Neue Verknüpfung.lnk`), rename to
+    the final name, and close — then reuse the *same* provisional name, whose next CREATE breaks the phantom
+    and parks for the full `OplockBreakTimeout`. That single stall is a 35 s tax the app absorbs as a
+    freeze; it also explains the double-click "not found" (a probe open that parks past the app's own
+    timeout). **The `InMemoryLeaseManager` was already immune** — it stores `LeaseHolder.FileKey` at
+    creation and releases by it; the oplock and lock managers recomputed instead.
+  - **Fix:** both managers now capture the registration key per open (`_openKeys` / `_ownerKeys`,
+    mirroring the lease manager) and use the stored key at Acknowledge/Release — never recompute it. A
+    rename may now split grouping (a new open at the new name won't join the old holder), which is correct:
+    the renamed handle is on its way out and Windows handles its own local coherency. Behaviour is
+    unchanged for the (overwhelmingly common) no-rename path.
+  - **Result, measured on the fixed build:** PowerPoint `SaveAs` **43,767 ms → 9,038 ms** (first save,
+    now dominated by PowerPoint's own cold start — the second `SaveAs` is 487 ms, `Save` 377 ms); the
+    shortcut create+rename loop reusing `Neue Verknüpfung.lnk` runs 141–257 ms per round (was a per-round
+    freeze); files that went through the rename churn open+read in 29–49 ms (was "cannot find file"). **No
+    `not acknowledged` line anywhere in the server log** (was exactly one before).
+  - **Tests:** `BreakBeforeGrantTests.RenameOverHandle_ThenReopenUnderOldName_DoesNotParkBehindPhantomBreak`
+    (dispatcher-level, deterministic — **fails before the fix**: the reopen parks with an empty in-band
+    response), `LockDispatcherTests.LockedRange_AfterRenameAndClose_DoesNotStrandUnderOldName` (the lock
+    twin, FAIL_IMMEDIATELY so a leak shows as a spurious Conflict not a hang), and battery
+    `ReusedProvisionalName_CreateRenameClose_Repeated_DoesNotFreeze` (real-client guard, both labs,
+    time-boxed). Full suite ran **763 green, 0 skipped** with `LanmanServer` stopped (interop labs live);
+    the 3 new tests are the delta.
+  - **Lesson (the F1-family ledger, again):** the leak was invisible to every existing test because not one
+    renamed a file *while its oplock/lock was held* and then reused the name — the exact two-step only real
+    Office/Explorer produces. The diagnostics added in F9–F11 paid off a fourth time: the single
+    `[oplock] … not acknowledged` line named the mechanism, and the captured-stdout sample server turned a
+    "PowerPoint feels slow" report into a measured 35 s park.
 - _(append progress here, tick off items in the phases)_

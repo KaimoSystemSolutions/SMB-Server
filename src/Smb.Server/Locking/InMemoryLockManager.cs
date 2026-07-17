@@ -14,13 +14,25 @@ public sealed class InMemoryLockManager : ILockManager
     private readonly object _gate = new();
     private readonly Dictionary<string, FileLockState> _files = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// owner → the file key its locks live under. Captured when the owner first takes a lock and used at
+    /// release — <b>never recomputed</b>. <see cref="FileKey"/> reads the backend physical path, which a
+    /// rename relocates in place; recomputing at release would look under the new name and strand the
+    /// owner's locks under the old one. A stranded exclusive lock then blocks a later blocking lock on the
+    /// reused name forever (no holder ever unlocks it). Same defect and fix as
+    /// <c>InMemoryOplockManager</c>.
+    /// </summary>
+    private readonly Dictionary<SmbOpen, string> _ownerKeys = new();
+
     public Task<LockOutcome> ApplyAsync(SmbOpen owner, IReadOnlyList<LockElement> elements, bool failImmediately, CancellationToken ct)
     {
         if (elements.Count == 0) return Task.FromResult(LockOutcome.Granted);
-        string key = FileKey(owner);
 
         lock (_gate)
         {
+            // Stay on the key this owner already locked under, if any, so a rename between two lock calls
+            // cannot split one owner's locks across two states.
+            string key = _ownerKeys.TryGetValue(owner, out string? existing) ? existing : FileKey(owner);
             FileLockState state = GetOrAdd(key);
 
             if (elements[0].Unlock)
@@ -35,6 +47,7 @@ public sealed class InMemoryLockManager : ILockManager
             {
                 foreach (LockElement e in elements)
                     state.Active.Add(new ActiveLock(owner, e.Offset, e.Length, e.Exclusive));
+                _ownerKeys[owner] = key;
                 return Task.FromResult(LockOutcome.Granted);
             }
 
@@ -47,6 +60,7 @@ public sealed class InMemoryLockManager : ILockManager
             var tcs = new TaskCompletionSource<LockOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
             var waiter = new Waiter(owner, single.Offset, single.Length, single.Exclusive, tcs);
             state.Waiters.Add(waiter);
+            _ownerKeys[owner] = key;
             // CANCEL/Close triggers ct → remove waiter and cancel.
             waiter.Registration = ct.Register(() =>
             {
@@ -76,10 +90,11 @@ public sealed class InMemoryLockManager : ILockManager
 
     public void ReleaseOwner(SmbOpen owner)
     {
-        string key = FileKey(owner);
         lock (_gate)
         {
-            if (!_files.TryGetValue(key, out FileLockState? state)) return;
+            // Release under the key the owner locked with (see _ownerKeys), not the possibly-renamed
+            // current path. No entry → this owner never took a lock, nothing to release.
+            if (!_ownerKeys.Remove(owner, out string? key) || !_files.TryGetValue(key, out FileLockState? state)) return;
 
             state.Active.RemoveAll(a => ReferenceEquals(a.Owner, owner));
             for (int i = state.Waiters.Count - 1; i >= 0; i--)

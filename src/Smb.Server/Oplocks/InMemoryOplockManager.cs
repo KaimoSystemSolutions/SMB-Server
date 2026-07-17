@@ -30,6 +30,17 @@ public sealed class InMemoryOplockManager : IOplockManager
     private readonly object _gate = new();
     private readonly Dictionary<string, FileOplockState> _files = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// open → the file key it was registered under. Captured at grant and used at Acknowledge/Release —
+    /// <b>never recomputed</b>. <see cref="FileKey"/> reads the open's backend physical path, which a rename
+    /// relocates in place (<c>IFileHandle.Relocate</c>); recomputing the key at release then looks under the
+    /// NEW name and leaves the holder registered under the OLD one. That leaked holder is a phantom every
+    /// later open reusing the original name breaks — and it can never acknowledge, so the triggering CREATE
+    /// parks for the whole break timeout (the PowerPoint-save / shortcut-wizard freeze, measured
+    /// 2026-07-17). The lease manager avoids this the same way, via <c>LeaseHolder.FileKey</c>.
+    /// </summary>
+    private readonly Dictionary<SmbOpen, string> _openKeys = new();
+
     public OplockGrant RequestOplock(SmbOpen open, OplockLevel requested)
     {
         // Only handle classic oplocks. A lease (0xFF) is requested through a CREATE context and served by
@@ -42,6 +53,7 @@ public sealed class InMemoryOplockManager : IOplockManager
         lock (_gate)
         {
             FileOplockState state = GetOrAdd(key);
+            _openKeys[open] = key;   // remember where this open lives, so a later rename can't strand it
 
             if (state.Holders.Count == 0)
             {
@@ -71,7 +83,7 @@ public sealed class InMemoryOplockManager : IOplockManager
     {
         lock (_gate)
         {
-            if (!_files.TryGetValue(FileKey(open), out FileOplockState? state))
+            if (!_openKeys.TryGetValue(open, out string? key) || !_files.TryGetValue(key, out FileOplockState? state))
                 return OplockLevel.None;
 
             foreach (Holder h in state.Holders)
@@ -88,10 +100,12 @@ public sealed class InMemoryOplockManager : IOplockManager
 
     public void ReleaseOwner(SmbOpen open)
     {
-        string key = FileKey(open);
         lock (_gate)
         {
-            if (!_files.TryGetValue(key, out FileOplockState? state)) return;
+            // Release under the key the open was registered with (see _openKeys) — not FileKey(open), which
+            // a rename may have moved out from under it.
+            if (!_openKeys.Remove(open, out string? key) || !_files.TryGetValue(key, out FileOplockState? state))
+                return;
             state.Holders.RemoveAll(h => ReferenceEquals(h.Open, open));
             if (state.Holders.Count == 0)
                 _files.Remove(key);
