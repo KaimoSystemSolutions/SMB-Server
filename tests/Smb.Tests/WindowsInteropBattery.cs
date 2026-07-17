@@ -655,6 +655,82 @@ public abstract class WindowsInteropBattery(IWindowsInteropLab lab, ITestOutputH
     }
 
     /// <summary>
+    /// The reported VS Code failures, driven with the REAL editor: "cannot open text file" and
+    /// "the folder path does not exist on this computer" on <c>\\localhost\Files\…</c>. VS Code is a
+    /// classic Win32/Electron app — its file layer is Node/libuv on top of CreateFile/ReadFile, a
+    /// different code path from the packaged Notepad's <c>Windows.Storage</c> (srvsvc / object-id /
+    /// GetFinalPathNameByHandle), so the F9/F11 fixes do not cover it and it needs its own oracle.
+    /// <para>
+    /// Launch VS Code on the folder AND a file inside it in one new window. On success VS Code opens
+    /// the file in an editor tab, which reads its bytes — a DATA-read open on the wire. If the folder
+    /// "does not exist" to the client, or the file open declines, that data open never happens and the
+    /// server log (with its <c>[FAIL]</c> markers) names the request VS Code tripped over. Skips when
+    /// the <c>code</c> CLI is absent or VS Code is already running (the reused window would not
+    /// re-issue the opens under test, mirroring the single-instance handling in the Notepad case).
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public void RealVsCode_OpenFolderAndFile_OnLocalhost_ReadsContent()
+    {
+        var (unc, local) = Dir();
+        Directory.CreateDirectory(Path.Combine(local, "sub"));
+        File.WriteAllText(Path.Combine(local, "readme.txt"), "hello from VS Code over SMB\r\n");
+
+        string? codeCmd = FindVsCodeCli();
+        Skip.If(codeCmd is null, "the `code` CLI is not on PATH — VS Code interop case not applicable here");
+        var before = Process.GetProcessesByName("Code").Select(p => p.Id).ToHashSet();
+        Skip.If(before.Count > 0, "VS Code is already running — a reused window would not re-issue the " +
+                                  "folder/file opens under test");
+
+        try
+        {
+            ConnectVia("localhost");
+            string aliasFolder = ToAlias(unc, "localhost");
+            string aliasFile = $@"{aliasFolder}\readme.txt";
+
+            // One new window, extensions off (a stray formatter/linter must not be what reads the file):
+            // open the FOLDER and the FILE. Success ⇒ VS Code resolves the folder and reads the file.
+            Timed("launch VS Code on folder+file", () => RunProcessDetached(codeCmd!,
+                "--new-window", "--disable-extensions", aliasFolder, "--goto", aliasFile));
+
+            AssertDataOpenOnWire("readme.txt");
+        }
+        finally
+        {
+            foreach (Process p in Process.GetProcessesByName("Code"))
+                if (!before.Contains(p.Id))
+                    try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>Resolves the VS Code launcher (<c>code.cmd</c>) from PATH; null when not installed.</summary>
+    private static string? FindVsCodeCli()
+    {
+        foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+        {
+            if (string.IsNullOrWhiteSpace(dir)) continue;
+            string cmd = Path.Combine(dir.Trim(), "code.cmd");
+            if (File.Exists(cmd)) return cmd;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Launches a GUI app and returns immediately (it does not exit on its own). A <c>.cmd</c> launcher
+    /// needs the shell, so it goes through <c>cmd /c</c>; the started window is cleaned up by the caller.
+    /// </summary>
+    private void RunProcessDetached(string fileName, params string[] args)
+    {
+        var psi = new ProcessStartInfo("cmd.exe") { UseShellExecute = false, CreateNoWindow = true };
+        psi.ArgumentList.Add("/c");
+        psi.ArgumentList.Add(fileName);
+        foreach (string a in args) psi.ArgumentList.Add(a);
+        using Process p = Process.Start(psi)!;
+        p.WaitForExit(15_000); // the launcher forks the GUI and returns; the editor keeps running
+    }
+
+    /// <summary>
     /// The reported flows one level closer to reality: a REAL Explorer window is open on the folder
     /// (directory handle, CHANGE_NOTIFY watch, icon extraction — each with its own opens and batch
     /// oplocks) while the flow runs inside it. The prior repro tests drove the operations without a
@@ -988,6 +1064,56 @@ public abstract class WindowsInteropBattery(IWindowsInteropLab lab, ITestOutputH
     /// fails, so calling it directly is both the honest repro and the regression pin; the manual
     /// symptom was "Die Datei … kann nicht gefunden werden" on double-click for files that exist.
     /// </summary>
+    /// <summary>
+    /// The same <c>Windows.Storage</c> open as <see cref="WindowsStorageApi_OpenTextFileViaLocalhost_ReadsContent"/>,
+    /// but on a file that lives in the SHARE ROOT rather than a subdirectory. This is what the reported
+    /// manual failure actually was: Win11 Notepad on <c>\\localhost\Files\welcome.txt</c> (root), where the
+    /// server-side capture showed the shell probing in a retry loop while every request returned Success —
+    /// the classic "the tab shows the name but the body says it failed". Every other packaged-open test
+    /// (this one's subdirectory sibling, the F9 realpath test) uses a subfolder, so a root-file-only defect
+    /// would slip through. Root and subfolder differ on the wire: a root file's parent open is the share
+    /// root itself (empty relative name), a code path a subfolder open never takes.
+    /// </summary>
+    [SkippableFact]
+    public void WindowsStorageApi_OpenTextFileInShareRoot_ReadsContent()
+    {
+        Require();
+        string name = $"rootdoc-{_rootTag}.txt";
+        string local = Path.Combine(Lab.WritableShareRoot, name);
+        File.WriteAllText(local, "root storage api content");
+
+        try
+        {
+            ConnectVia("localhost");
+            string alias = $@"\\localhost\{Lab.WritableShareUnc.Split('\\', StringSplitOptions.RemoveEmptyEntries)[1]}\{name}";
+            output.WriteLine($"opening share-root file via StorageFile: {alias}");
+
+            string text = Timed("StorageFile open+read (share root)", () =>
+            {
+                try
+                {
+                    Windows.Storage.StorageFile file = Windows.Storage.StorageFile
+                        .GetFileFromPathAsync(alias).AsTask().GetAwaiter().GetResult();
+                    return Windows.Storage.FileIO.ReadTextAsync(file).AsTask().GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    throw new IOException(
+                        $"Windows.Storage failed to open a SHARE-ROOT file ({ex.GetType().Name}: {ex.Message}) — " +
+                        $"this is the packaged-Notepad 'opens but the body reports failure' symptom on a root " +
+                        $"file.{Environment.NewLine}Server log:{Environment.NewLine}{Lab.RecentLog()}", ex);
+                }
+            });
+
+            Assert.Equal("root storage api content", text);
+        }
+        finally
+        {
+            DisconnectAlias("localhost");
+            try { File.Delete(local); } catch { /* best-effort */ }
+        }
+    }
+
     [SkippableFact]
     public void WindowsStorageApi_OpenTextFileViaLocalhost_ReadsContent()
     {

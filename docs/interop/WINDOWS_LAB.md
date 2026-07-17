@@ -161,3 +161,29 @@ Loopback covers client semantics, auth and the file/metadata cases. It does **no
 None of that is relevant to the acute freeze (backend/auth latency) — latency is simulated more
 deterministically by the backend shim (`GatedCreateFileStore`) than by a real link. A VM (Hyper-V + PowerShell
 Direct + checkpoints) only pays off for the version matrix in W5.
+
+## Trap: packaged apps (Win11 Notepad) can't open loopback files — AppContainer isolation
+
+**Symptom.** On `\127.0.0.1` / `\localhost`, the Win11 **Notepad** (and other packaged/UWP apps) "open" a
+file but the window body reports failure, while **Notepad++ / `copy` / classic Win32 apps read the same file
+fine**. The server log shows only `Success` — including the shell's probes — because nothing declined.
+
+**Cause — not a server bug.** Packaged apps run in an **AppContainer**, and Windows blocks AppContainer
+processes from reaching the loopback range (`127.0.0.0/8`, `::1`) unless the app is explicitly exempted. The
+block is enforced on the client **before any SMB packet is sent**. A double-click resolves through Explorer
+(full trust → the server serves it, all `Success`), but Notepad's own re-open inside the container never
+reaches the server, so the editor reports failure. Full-trust callers — every test host, `Windows.Storage`
+from a normal process — are unaffected, which is why `WindowsStorageApi_*` passes and only the real packaged
+Notepad fails. `CheckNetIsolation LoopbackExempt -s` lists the exemptions; an empty list means blocked.
+
+**Fix (developer / loopback testing), admin shell:**
+```powershell
+CheckNetIsolation LoopbackExempt -a -n=Microsoft.WindowsNotepad_8wekyb3d8bbwe
+# undo: CheckNetIsolation LoopbackExempt -d -n=Microsoft.WindowsNotepad_8wekyb3d8bbwe
+```
+It is a developer/testing setting (non-persistent, cleared by Windows over time) — the supported production
+answer is to **serve on a non-loopback address** (bind `0.0.0.0` / the LAN IP) and connect via the host name
+or LAN IP; the loopback block only covers loopback.
+
+`PackagedAppLoopbackTests.Win11Notepad_IsLoopbackExempt_ElseLoopbackOpensWillFail` fails with this exact
+remedy when the exemption is missing and the packaged Notepad is installed.

@@ -580,6 +580,10 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.AccessDenied);
 
         IoctlMessage.Request req = IoctlMessage.ParseRequest(segment.Span, Smb2Header.Size);
+        // Name the FSCTL for interop captures: the packaged-app (Windows.Storage/shell) activation issues
+        // object-id and link-tracking FSCTLs, and a malformed answer there makes the shell retry-loop or
+        // report the open as failed while the transport-level status is still Success.
+        _log?.Invoke($"[ioctl] ctl=0x{req.CtlCode:X8} mid={header.MessageId} inlen={req.Input.Length}");
 
         // [M5.3] FSCTL_VALIDATE_NEGOTIATE_INFO — secure-negotiate downgrade check (3.0/3.0.2).
         if (req.CtlCode == IoctlMessage.FsctlValidateNegotiateInfo)
@@ -1201,6 +1205,10 @@ public sealed partial class Smb2Dispatcher
             return BuildError(header, NtStatus.EndOfFile);
 
         _server.Options.Metrics.OnBytesRead(open.TreeConnect.Share.Name, result.Value);
+        // Byte accounting for interop captures: an app that "opens but reports failure" can be looking at a
+        // READ that returned Success but the wrong number of bytes (short read, wrong offset). Logging
+        // asked-vs-returned makes a content mismatch visible without a packet capture.
+        _log?.Invoke($"[read] '{open.PathName}' offset={req.Offset} asked={length} returned={result.Value}");
         return MaybeSigned(session, RespHeader(header, session),
             ReadMessage.BuildResponseBody(buffer.AsSpan(0, result.Value)));
     }

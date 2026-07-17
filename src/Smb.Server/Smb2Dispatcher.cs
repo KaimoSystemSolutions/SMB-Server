@@ -182,6 +182,18 @@ public sealed partial class Smb2Dispatcher
                 trace?.Dispose();
             }
             _log?.Invoke($"[cmd] {header.Command} mid={header.MessageId} → {(response is { } r ? r.Header.Status.ToString() : "(no response)")}");
+            // High-signal decline marker for interop captures: an error-class status (top two bits set) is
+            // what an app trips over ("file not found on a file that exists", "path does not exist on this
+            // computer"). Two error-class values are benign protocol traffic, not faults, and are excluded
+            // so the marker stays greppable: MoreProcessingRequired (the normal NTLM continuation) and
+            // NotFound (the "this path is not a DFS namespace" answer to FSCTL_DFS_GET_REFERRALS, which the
+            // Windows client issues on every UNC connection — the real not-found symptoms use the distinct
+            // OBJECT_NAME_NOT_FOUND / OBJECT_PATH_NOT_FOUND statuses).
+            if (response is { } rr && !rr.Header.Status.IsSuccess()
+                && rr.Header.Status != NtStatus.MoreProcessingRequired
+                && rr.Header.Status != NtStatus.NotFound)
+                _log?.Invoke($"[FAIL] {header.Command} mid={header.MessageId} → {rr.Header.Status} " +
+                             $"(0x{(uint)rr.Header.Status:X8})");
 
             if (response is { } seg) segments.Add(SignIfRequestWasSigned(connection, header, seg));
 
@@ -676,6 +688,14 @@ public sealed partial class Smb2Dispatcher
         _server.Options.Metrics.OnAuthenticationSucceeded();
         Audit(SmbAuditEventType.AuthenticationSucceeded, SmbLogLevel.Information, connection,
             user: DescribeIdentity(session.Identity));
+        // Transport-security posture of the freshly authenticated session, for interop captures: when an
+        // app "opens but reports failure" while every request logs Success, the usual cause is the client
+        // silently discarding a response it cannot verify — a signing/encryption mismatch. Recording the
+        // negotiated dialect and whether this session signs/encrypts turns that from a guess into a fact.
+        _log?.Invoke($"[session] mid={header.MessageId} dialect={connection.Dialect} " +
+                     $"signing={(session.SigningRequired ? "required" : "off")} " +
+                     $"encrypt={(session.EncryptData ? "on" : "off")} " +
+                     $"guest={session.IsGuest} anon={session.IsAnonymous} user={DescribeIdentity(session.Identity)}");
 
         // Register the primary channel (Context §8.1 Session.ChannelList). Its signing key is the
         // session signing key; further connections bind additional channels with their own keys.

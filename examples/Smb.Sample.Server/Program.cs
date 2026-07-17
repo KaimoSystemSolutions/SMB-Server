@@ -51,6 +51,36 @@ string lockAuditFile = Path.Combine(AppContext.BaseDirectory, "locks", "lock_aud
 foreach (string dir in new[] { shareDir, versionDir, customDir, readOnlyDir, dfsRootDir })
     Directory.CreateDirectory(dir);
 
+// --- Diagnostic log sink -----------------------------------------------------
+// Every server message goes to the console AND to a file next to the binary, so a client-interop
+// problem ("VS Code / Notepad cannot open the file", "folder does not exist on this computer") can be
+// investigated after the fact: reproduce the failure, then read the log. Look for lines starting with
+// [FAIL] — those are the requests the server DECLINED, i.e. exactly what the app tripped over.
+//
+// The write goes through a background consumer thread, never inline on the request path: the logger is
+// called from every command handler, and doing synchronous, flushing disk I/O there would serialize the
+// server's request threads behind the disk — the very latency this server is built to avoid (a slow log
+// would look like the freezes the interop suite guards against). Producers only enqueue a string.
+// Timestamped per run so a fresh start (including a test-suite launch of this same binary) never
+// overwrites an earlier capture. A convenience copy at the stable name always points at the newest run.
+string logPath = Path.Combine(AppContext.BaseDirectory, $"sample-server-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+var logQueue = new System.Collections.Concurrent.BlockingCollection<string>(new System.Collections.Concurrent.ConcurrentQueue<string>());
+var logDrained = new ManualResetEventSlim(false);
+var logThread = new Thread(() =>
+{
+    using var w = new StreamWriter(logPath, append: false);
+    foreach (string line in logQueue.GetConsumingEnumerable())
+    {
+        Console.WriteLine(line);
+        w.WriteLine(line);
+        if (logQueue.Count == 0) w.Flush(); // flush once the burst is drained — the tail is what a repro needs
+    }
+    w.Flush();
+    logDrained.Set();
+}) { IsBackground = true, Name = "sample-server-log" };
+logThread.Start();
+void ServerLog(string msg) => logQueue.Add($"{DateTimeOffset.Now:HH:mm:ss.fff} [server] {msg}");
+
 // --- User database (local; replaceable later via LDAP/AD) ---------------------
 var identities = new InMemoryIdentityBackend()
     .AddUser(Domain, User, Password, userSid: DemoUserSid);
@@ -191,7 +221,7 @@ await using SmbServer server = SmbServerBuilder.Create()
         o.TimeoutSweepInterval = TimeSpan.FromSeconds(30);    // how often the idle/auth sweeper runs
     })
 
-    .WithLogger(msg => Console.WriteLine($"[server] {msg}"))
+    .WithLogger(ServerLog)
     .Build();
 
 await server.StartAsync();
@@ -201,6 +231,7 @@ Console.WriteLine($"Share 'Versions':       {versionDir} (lib default, in-memory
 Console.WriteLine($"Share 'CustomVersions': {customDir} (custom impl, persistent → {customVersionStore})");
 Console.WriteLine($"Share 'DfsRoot':        {dfsRootDir} (DFS namespace: \\SAMPLE\\DfsRoot\\Public → \\SAMPLE\\Files)");
 Console.WriteLine($"Lock audit:             {lockAuditFile} (custom ILockManager)");
+Console.WriteLine($"Diagnostic log:         {logPath} (grep for [FAIL] to see declined requests)");
 Console.WriteLine($"Login:                  {Domain}\\{User} / {Password}");
 Console.WriteLine();
 
@@ -260,6 +291,8 @@ Console.WriteLine($"Server running on {server.Endpoint}. Ctrl+C to stop.");
 try { await Task.Delay(Timeout.Infinite, cts.Token); }
 catch (OperationCanceledException) { }
 await server.StopAsync();
+logQueue.CompleteAdding();
+logDrained.Wait(TimeSpan.FromSeconds(5)); // let the background writer flush the tail before exit
 
 async Task<bool> TryWrongLogin()
 {
