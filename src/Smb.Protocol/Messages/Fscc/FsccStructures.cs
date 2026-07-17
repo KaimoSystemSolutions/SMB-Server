@@ -169,6 +169,11 @@ public static class FsccStructures
         FileInformationClass.FileAttributeTagInformation => FileAttributeTag(e),
         FileInformationClass.FileAllInformation => FileAll(e),
         FileInformationClass.FileNameInformation => FileName(e),
+        // Same wire shape as FileNameInformation (MS-FSCC §2.4.34.2); the caller supplies the
+        // share-root-relative name. Declining this class is not an option in practice: it is what
+        // GetFinalPathNameByHandle and every Windows.Storage-based app query while opening a file,
+        // and Office retries its whole lock-file open when it fails (measured: ~1s per retry).
+        FileInformationClass.FileNormalizedNameInformation => FileName(e),
         _ => null,
     };
 
@@ -254,7 +259,7 @@ public static class FsccStructures
 
     public static byte[]? BuildFileSystemInformation(
         FsInformationClass infoClass, string volumeLabel, uint serialNumber,
-        long totalBytes = -1, long availableBytes = -1)
+        long totalBytes = -1, long availableBytes = -1, ReadOnlySpan<byte> volumeObjectId = default)
         => infoClass switch
         {
             FsInformationClass.FileFsVolumeInformation => FsVolume(volumeLabel, serialNumber),
@@ -262,8 +267,23 @@ public static class FsccStructures
             FsInformationClass.FileFsFullSizeInformation => FsFullSize(totalBytes, availableBytes),
             FsInformationClass.FileFsDeviceInformation => FsDevice(),
             FsInformationClass.FileFsAttributeInformation => FsAttribute(),
+            FsInformationClass.FileFsObjectIdInformation => FsObjectId(volumeObjectId),
             _ => null,
         };
+
+    /// <summary>
+    /// FILE_FS_OBJECTID_INFORMATION (MS-FSCC §2.5.6): 16-byte volume object id + 48 bytes extended
+    /// info (zero here — NTFS leaves it zero too unless the link-tracking service filled it in).
+    /// The Windows shell queries this class after essentially every attribute open in a packaged-app
+    /// flow; declining it (the old behaviour) made those flows retry and finally abort — files that
+    /// plainly exist reported as not found, plus multi-second lags on shortcut/Office saves.
+    /// </summary>
+    private static byte[] FsObjectId(ReadOnlySpan<byte> objectId)
+    {
+        var b = new byte[64];
+        objectId[..Math.Min(objectId.Length, 16)].CopyTo(b);
+        return b;
+    }
 
     private static byte[] FsVolume(string label, uint serial)
     {

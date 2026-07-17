@@ -81,10 +81,17 @@ public sealed class SampleServerLab : IAsyncLifetime, IWindowsInteropLab
     public string ReadOnlyProbeContent => "read only content";
     public IReadOnlyCollection<string> VisibleShares =>
         [FilesShare, ReadOnlyShare, VersionsShare, CustomVersionsShare, DfsRootShare];
+    string IWindowsInteropLab.WritableShareRoot => FilesRoot;
+    string IWindowsInteropLab.Domain => Domain;
+    string IWindowsInteropLab.User => User;
+    string IWindowsInteropLab.Password => Password;
 
     public void Require() => Skip.If(SkipReason is not null, SkipReason);
 
     public string RecentLog() => string.Join(Environment.NewLine, _log.TakeLast(80));
+
+    /// <summary>The whole retained log window (for the manual-repro capture harness).</summary>
+    public string FullLog() => string.Join(Environment.NewLine, _log);
 
     /// <summary>
     /// A fresh, empty directory under the writable share; same per-run-suffix contract as
@@ -230,7 +237,9 @@ public sealed class SampleServerLab : IAsyncLifetime, IWindowsInteropLab
     private void Log(string line)
     {
         _log.Enqueue(line);
-        while (_log.Count > 800) _log.TryDequeue(out _);
+        // Generous window: manual-repro captures need the WHOLE session — at 800 lines the traffic
+        // of interest (one double-click among Explorer noise) had already rotated out twice.
+        while (_log.Count > 5000) _log.TryDequeue(out _);
     }
 
     /// <summary>

@@ -191,6 +191,38 @@ public class AdditionalFsctlTests : IDisposable
 
     // --- helpers ---
 
+    /// <summary>
+    /// FSCTL_CREATE_OR_GET_OBJECT_ID / FSCTL_GET_OBJECT_ID: the Windows shell issues these on every
+    /// packaged-app open (link tracking). The answer must be a 64-byte FILE_OBJECTID_BUFFER that is
+    /// STABLE — the same file reports the same id on every query — and distinct per file.
+    /// </summary>
+    [Fact]
+    public void ObjectIdFsctls_ReturnStableDistinctIds()
+    {
+        var store = new LocalFileStore(_dir, readOnly: false);
+        var (d, conn, sid, tid) = Setup(store);
+        File.WriteAllText(Path.Combine(_dir, "a.txt"), "a");
+        File.WriteAllText(Path.Combine(_dir, "b.txt"), "b");
+
+        Assert.Equal(NtStatus.Success, Open(d, conn, sid, tid, "a.txt", ReadAccess, out ulong pa, out ulong va));
+        Assert.Equal(NtStatus.Success, Open(d, conn, sid, tid, "b.txt", ReadAccess, out ulong pb, out ulong vb));
+
+        byte[] respA1 = Ioctl(d, conn, sid, tid, pa, va, 0x000900C0, []); // CREATE_OR_GET
+        byte[] respA2 = Ioctl(d, conn, sid, tid, pa, va, 0x0009009C, []); // GET
+        byte[] respB = Ioctl(d, conn, sid, tid, pb, vb, 0x000900C0, []);
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(respA1).Status);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(respA2).Status);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(respB).Status);
+
+        byte[] idA1 = IoctlOutput(respA1);
+        byte[] idA2 = IoctlOutput(respA2);
+        byte[] idB = IoctlOutput(respB);
+        Assert.Equal(64, idA1.Length);              // FILE_OBJECTID_BUFFER
+        Assert.Equal(idA1, idA2);                   // stable across queries and FSCTL variants
+        Assert.False(idA1.AsSpan(0, 16).SequenceEqual(idB.AsSpan(0, 16))); // distinct per file
+    }
+
     private byte[] Ioctl(Smb2Dispatcher d, SmbConnection conn, ulong sid, uint tid, ulong p, ulong v, uint ctlCode, byte[] input)
         => d.ProcessMessage(conn, TestHelpers.BuildIoctlRequest(NextMid(), sid, tid, p, v, ctlCode, input));
 

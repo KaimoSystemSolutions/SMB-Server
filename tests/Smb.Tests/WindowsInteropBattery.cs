@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Win32.SafeHandles;
 using Xunit;
 using Xunit.Abstractions;
@@ -40,6 +41,18 @@ public interface IWindowsInteropLab
 
     /// <summary>Share names <c>net view \\host</c> must list.</summary>
     IReadOnlyCollection<string> VisibleShares { get; }
+
+    /// <summary>Local backing directory of the writable share's ROOT (for root-level flows).</summary>
+    string WritableShareRoot { get; }
+
+    /// <summary>NTLM domain of the lab account (for connecting under a host alias).</summary>
+    string Domain { get; }
+
+    /// <summary>NTLM user of the lab account.</summary>
+    string User { get; }
+
+    /// <summary>NTLM password of the lab account.</summary>
+    string Password { get; }
 }
 
 /// <summary>
@@ -390,6 +403,630 @@ public abstract class WindowsInteropBattery(IWindowsInteropLab lab, ITestOutputH
 
         Assert.Equal(payload, readBack);
         Assert.Equal(payload, File.ReadAllBytes(Path.Combine(local, "new.lnk")));
+    }
+
+    // ─── Host alias (\\localhost) + Explorer file flows ───────────────────
+    //
+    // Reported 2026-07-16 from a manual Explorer session: double-clicking a text file produced the
+    // default editor's "Die Datei \\localhost\Files\notes.txt kann nicht gefunden werden", and creating
+    // a shortcut froze Explorer before falling back. Two things the battery had never modelled: the
+    // host ALIAS (`\\localhost` is a different server to the redirector than `\\127.0.0.1` — separate
+    // connection, session, and caches, with an IPv6 ::1 connect attempt first), and the REAL shell
+    // COM path for .lnk creation (IShellLink::Save, not File.WriteAllBytes).
+
+    /// <summary>
+    /// The exact failing user flow: browse and open a file via <c>\\localhost\…</c>. The redirector
+    /// treats every host string as its own server, so all coverage against <c>\\127.0.0.1</c> says
+    /// nothing about this path: `localhost` resolves to ::1 first (the server listens on IPv4 only),
+    /// and the fallback behaviour plus a second server entry against the same running server is what
+    /// this pins.
+    /// </summary>
+    [SkippableFact]
+    public void LocalhostAlias_EnumerateAndOpenFile_Works()
+    {
+        var (unc, local) = Dir();
+        File.WriteAllText(Path.Combine(local, "notes.txt"), "localhost content");
+        string aliasDir = ToAlias(unc, "localhost");
+
+        try
+        {
+            ConnectVia("localhost");
+
+            Assert.Contains("notes.txt",
+                Timed("enumerate via localhost", () => Directory.GetFiles(aliasDir).Select(Path.GetFileName)));
+            Assert.Equal("localhost content",
+                Timed("read via localhost", () => File.ReadAllText($@"{aliasDir}\notes.txt")));
+        }
+        finally
+        {
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>
+    /// The flow that produced the reported "kann nicht gefunden werden", end to end under the alias:
+    /// Explorer creates <c>Neues Textdokument.txt</c>, looks it up by exact name, the user renames it,
+    /// then double-clicks — the editor opens it by the new name over the SAME alias connection whose
+    /// caches watched the whole flow. Splitting create/rename from the final open across the alias vs.
+    /// the canonical host would miss any cache/lookup interaction, so everything runs on the alias.
+    /// </summary>
+    [SkippableFact]
+    public void LocalhostAlias_NewTextDocument_CreateRenameOpen_ExplorerFlow()
+    {
+        var (unc, local) = Dir();
+        string aliasDir = ToAlias(unc, "localhost");
+
+        try
+        {
+            ConnectVia("localhost");
+
+            Timed("create provisional", () =>
+            {
+                using var fs = new FileStream($@"{aliasDir}\Neues Textdokument.txt", FileMode.CreateNew, FileAccess.Write);
+            });
+
+            // Explorer's post-create exact-name lookup (the F8 shape), now under the alias.
+            Assert.Equal(["Neues Textdokument.txt"], Timed("exact-name lookup", () =>
+                Directory.GetFiles(aliasDir, "Neues Textdokument.txt").Select(Path.GetFileName).ToList()));
+
+            Timed("inline rename", () => File.Move($@"{aliasDir}\Neues Textdokument.txt", $@"{aliasDir}\notes.txt"));
+
+            // The double-click: open by the new name. This is where the user saw NOT_FOUND.
+            Assert.Equal(string.Empty, Timed("open renamed file", () => File.ReadAllText($@"{aliasDir}\notes.txt")));
+
+            Timed("edit and save", () => File.WriteAllText($@"{aliasDir}\notes.txt", "edited"));
+            Assert.Equal("edited", ReadBackendText(Path.Combine(local, "notes.txt")));
+        }
+        finally
+        {
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>
+    /// Shortcut creation through the REAL shell code path: <c>WScript.Shell</c>'s CreateShortcut is
+    /// IShellLink + IPersistFile::Save — the same COM machinery Explorer's "Neu → Verknüpfung" and
+    /// "Verknüpfung erstellen" run, as opposed to the plain write+reopen model of
+    /// <see cref="CreateShortcut_WriteThenImmediateReopen_DoesNotFreeze"/>. IPersistFile::Save opens
+    /// with shapes plain File I/O never sends; the reported symptom was a freeze followed by a
+    /// fallback, so the whole flow is time-boxed and then re-read like Explorer's icon extraction does.
+    /// </summary>
+    [SkippableFact]
+    public void CreateShortcut_ViaShellCom_SavesAndReopensPromptly()
+    {
+        var (unc, local) = Dir();
+        string lnkUnc = $@"{unc}\Editor - Verknüpfung.lnk";
+
+        Timed("IShellLink::Save", () =>
+        {
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell")
+                ?? throw new InvalidOperationException("WScript.Shell not available");
+            dynamic shell = Activator.CreateInstance(shellType)!;
+            try
+            {
+                dynamic lnk = shell.CreateShortcut(lnkUnc);
+                lnk.TargetPath = @"C:\Windows\notepad.exe";
+                lnk.Description = "battery probe";
+                lnk.Save();
+            }
+            finally
+            {
+                Marshal.FinalReleaseComObject(shell);
+            }
+        });
+
+        Assert.True(File.Exists(Path.Combine(local, "Editor - Verknüpfung.lnk")),
+            $"IPersistFile::Save reported success but nothing landed on the backend.{Environment.NewLine}{Lab.RecentLog()}");
+
+        // Explorer re-opens a fresh .lnk immediately (icon extraction, preview) — the reported freeze.
+        byte[] readBack = Timed("reopen .lnk", () => File.ReadAllBytes(lnkUnc));
+        Assert.True(readBack.Length > 0, ".lnk re-read came back empty");
+        Assert.Equal((byte)'L', readBack[0]); // shell link magic 0x4C
+    }
+
+    /// <summary>
+    /// <c>GetFinalPathNameByHandle</c> on a share file — the call <c>Windows.Storage</c> (and with it the
+    /// Windows 11 Notepad, every WinRT file picker, and packaged apps generally) makes while opening a
+    /// file. Over SMB it needs QUERY_INFO <c>FileNormalizedNameInformation</c>; a server that declines the
+    /// class fails this API, and the packaged editor then reports the file as <i>not found</i> even though
+    /// it just enumerated it — the reported double-click symptom.
+    /// </summary>
+    [SkippableFact]
+    public void GetFinalPathNameByHandle_OnShareFile_Works()
+    {
+        var (unc, local) = Dir();
+        File.WriteAllText(Path.Combine(local, "notes.txt"), "x");
+
+        using FileStream fs = File.Open($@"{unc}\notes.txt", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var buffer = new StringBuilder(1024);
+        uint len = GetFinalPathNameByHandleW(fs.SafeFileHandle, buffer, (uint)buffer.Capacity, 0);
+        int err = Marshal.GetLastWin32Error();
+        Output.WriteLine($"GetFinalPathNameByHandle → len={len} err={err} path='{buffer}'");
+
+        Assert.True(len > 0,
+            $"GetFinalPathNameByHandle failed with Win32 error {err} — Windows.Storage-based apps " +
+            $"(Windows 11 Notepad among them) fail their open on this call and report the file as not " +
+            $"found.{Environment.NewLine}Server log:{Environment.NewLine}{Lab.RecentLog()}");
+
+        // Exact, not Contains: the client REBUILDS this path from the server's name answers
+        // (FileNormalizedName/FileName), and the manual capture showed a leaf-only server answer
+        // making it reconstruct wrong paths (share component doubled, or the leaf dropped) which it
+        // then re-opened — the "file not found on a file that exists" family.
+        Assert.Equal($@"\\?\UNC{unc[1..]}\notes.txt", buffer.ToString(), ignoreCase: true);
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(
+        SafeFileHandle file, StringBuilder path, uint pathLength, uint flags);
+
+    /// <summary>
+    /// The reported double-click, driven end to end with the REAL editor: launch Notepad on a file under
+    /// <c>\\localhost\…</c> exactly as Explorer's double-click would (ShellExecute), and assert it got the
+    /// file open — its window title carries the document name on success, while a failed open falls back
+    /// to "Unbenannt"/"Untitled" plus an error dialog. The server log is attached either way, so a failure
+    /// names the request that declined. GUI-spawning, so the process is killed in <c>finally</c>.
+    /// </summary>
+    [SkippableFact]
+    public void RealNotepad_DoubleClickOnLocalhostFile_OpensIt()
+    {
+        var (unc, local) = Dir();
+        File.WriteAllText(Path.Combine(local, "probe-notes.txt"), "hello from the battery");
+
+        var before = Process.GetProcessesByName("Notepad").Select(p => p.Id).ToHashSet();
+        // Win11 Notepad is single-instance: with an instance already running (a GUI test seconds ago
+        // whose window is still winding down, or the user's own), the launch hands the file off as a
+        // TAB to that instance — whose state may point at a server that no longer exists mid-suite.
+        // That is not the scenario under test; skip rather than false-fail (or kill a human's notepad).
+        Skip.If(before.Count > 0, "a Notepad instance is already running — the single-instance handoff " +
+                                  "would not exercise a fresh open");
+        try
+        {
+            ConnectVia("localhost");
+            string alias = ToAlias(unc, "localhost");
+
+            using var launcher = Process.Start(new ProcessStartInfo("notepad.exe", $"\"{alias}\\probe-notes.txt\"")
+            {
+                UseShellExecute = true,
+            });
+
+            // Win11 Notepad is packaged: the launcher may exit after handing off, so find the window by
+            // title rather than by the launched process.
+            var deadline = Stopwatch.StartNew();
+            string titles = "";
+            while (deadline.Elapsed < OpTimeout)
+            {
+                titles = string.Join(" | ", Process.GetProcessesByName("Notepad")
+                    .Concat(Process.GetProcessesByName("notepad"))
+                    .Select(p => { try { return p.MainWindowTitle; } catch { return ""; } })
+                    .Where(t => t.Length > 0));
+                if (titles.Contains("probe-notes", StringComparison.OrdinalIgnoreCase)) break;
+                Thread.Sleep(250);
+            }
+            Output.WriteLine($"notepad titles after {deadline.ElapsedMilliseconds} ms: {titles}");
+
+            Assert.True(titles.Contains("probe-notes", StringComparison.OrdinalIgnoreCase),
+                $"Notepad never showed 'probe-notes' in a window title (saw: '{titles}') — the editor could " +
+                $"not open the file it was handed, which is the reported double-click failure.");
+
+            AssertDataOpenOnWire("probe-notes.txt");
+        }
+        finally
+        {
+            foreach (Process p in Process.GetProcessesByName("Notepad").Concat(Process.GetProcessesByName("notepad")))
+            {
+                if (!before.Contains(p.Id))
+                    try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            }
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>
+    /// The reported flows one level closer to reality: a REAL Explorer window is open on the folder
+    /// (directory handle, CHANGE_NOTIFY watch, icon extraction — each with its own opens and batch
+    /// oplocks) while the flow runs inside it. The prior repro tests drove the operations without a
+    /// window and stayed green; whatever broke manually involves Explorer's own concurrent opens.
+    /// </summary>
+    [SkippableFact]
+    public void RealExplorer_DoubleClickInOpenFolder_OpensEditor()
+    {
+        var (unc, local) = Dir();
+        File.WriteAllText(Path.Combine(local, "notes.txt"), "Example notes\r\nLine 2.\r\n");
+        var notepadsBefore = Process.GetProcessesByName("Notepad").Select(p => p.Id).ToHashSet();
+
+        try
+        {
+            ConnectVia("localhost");
+            string alias = ToAlias(unc, "localhost");
+
+            using var _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{alias}\"") { UseShellExecute = true });
+            dynamic folder = AwaitExplorerWindow(alias);
+
+            // Give Explorer a moment to run its usual post-enumeration work (icons, preview, details).
+            Thread.Sleep(1500);
+
+            // The double-click: invoke the item's default verb inside the open window.
+            dynamic item = folder.Document.Folder.ParseName("notes.txt")
+                ?? throw new InvalidOperationException($"Explorer window does not see notes.txt.{Environment.NewLine}{Lab.RecentLog()}");
+            Timed("invoke default verb", () => item.InvokeVerb());
+
+            var deadline = Stopwatch.StartNew();
+            string titles = "";
+            while (deadline.Elapsed < OpTimeout)
+            {
+                titles = NotepadTitles();
+                if (titles.Contains("notes", StringComparison.OrdinalIgnoreCase)) break;
+                Thread.Sleep(250);
+            }
+            Output.WriteLine($"editor titles after {deadline.ElapsedMilliseconds} ms: '{titles}'");
+            Assert.True(titles.Contains("notes", StringComparison.OrdinalIgnoreCase),
+                $"the editor never opened notes.txt from the Explorer window (titles: '{titles}') — " +
+                "the reported double-click failure.");
+            AssertDataOpenOnWire("notes.txt");
+        }
+        finally
+        {
+            CloseExplorerWindows("localhost");
+            KillNewNotepads(notepadsBefore);
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>
+    /// Shortcut creation inside a watched folder: IShellLink::Save writes <c>Neue Verknüpfung.lnk</c>
+    /// while the Explorer window watches the directory — Explorer reacts to the CHANGE_NOTIFY by opening
+    /// the fresh .lnk for icon extraction, and the wizard's subsequent rename then runs against a file
+    /// Explorer holds open under a batch oplock. That interleaving is what a bare COM save (no window)
+    /// never produced, and the manual session left exactly the un-renamed <c>Neue Verknüpfung.lnk</c>
+    /// behind after its freeze.
+    /// </summary>
+    [SkippableFact]
+    public void RealExplorer_CreateShortcutInWatchedFolder_SaveAndRename_DoesNotFreeze()
+    {
+        var (unc, local) = Dir();
+        File.WriteAllText(Path.Combine(local, "seed.txt"), "x"); // window has something to draw
+
+        try
+        {
+            ConnectVia("localhost");
+            string alias = ToAlias(unc, "localhost");
+
+            using var _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{alias}\"") { UseShellExecute = true });
+            AwaitExplorerWindow(alias);
+            Thread.Sleep(1000);
+
+            Timed("IShellLink::Save into watched folder", () =>
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell")!;
+                dynamic shell = Activator.CreateInstance(shellType)!;
+                try
+                {
+                    dynamic lnk = shell.CreateShortcut($@"{alias}\Neue Verknüpfung.lnk");
+                    lnk.TargetPath = @"C:\Windows\notepad.exe";
+                    lnk.Save();
+                }
+                finally
+                {
+                    Marshal.FinalReleaseComObject(shell);
+                }
+            });
+
+            // Explorer notices the new .lnk via CHANGE_NOTIFY and opens it (icon extraction) — give it
+            // time to be mid-flight, then rename like the wizard's final step does.
+            Thread.Sleep(1500);
+            Timed("rename provisional shortcut", () =>
+                File.Move($@"{alias}\Neue Verknüpfung.lnk", $@"{alias}\Editor - Verknüpfung.lnk"));
+
+            Assert.True(File.Exists(Path.Combine(local, "Editor - Verknüpfung.lnk")),
+                $"rename never landed on the backend.{Environment.NewLine}{Lab.RecentLog()}");
+
+            // The folder must still be fully usable afterwards (the freeze outlives the operation).
+            byte[] readBack = Timed("reopen renamed .lnk", () => File.ReadAllBytes($@"{alias}\Editor - Verknüpfung.lnk"));
+            Assert.Equal((byte)'L', readBack[0]);
+            Output.WriteLine($"server log:{Environment.NewLine}{Lab.RecentLog()}");
+        }
+        finally
+        {
+            CloseExplorerWindows("localhost");
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>
+    /// The same double-click, but in the share ROOT — where the user actually was
+    /// (<c>\\localhost\Files\notes.txt</c>). Root paths take different branches than subdirectory
+    /// paths ("" vs "."; F8 lived exactly there), and every other battery case runs in a per-test
+    /// subdirectory, so the root flow had zero coverage.
+    /// </summary>
+    [SkippableFact]
+    public void RealExplorer_DoubleClickInShareRoot_OpensEditor()
+    {
+        Require();
+        string probe = $"root-notes-{_rootTag}.txt";
+        File.WriteAllText(Path.Combine(Lab.WritableShareRoot, probe), "root notes");
+        var notepadsBefore = Process.GetProcessesByName("Notepad").Select(p => p.Id).ToHashSet();
+
+        try
+        {
+            ConnectVia("localhost");
+            string aliasRoot = ToAlias(Lab.WritableShareUnc, "localhost");
+
+            using var _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{aliasRoot}\"") { UseShellExecute = true });
+            dynamic folder = AwaitExplorerWindow(aliasRoot);
+            Thread.Sleep(1500);
+
+            dynamic item = folder.Document.Folder.ParseName(probe)
+                ?? throw new InvalidOperationException($"Explorer window does not see {probe}.{Environment.NewLine}{Lab.RecentLog()}");
+            Timed("invoke default verb in root", () => item.InvokeVerb());
+
+            var deadline = Stopwatch.StartNew();
+            string titles = "";
+            while (deadline.Elapsed < OpTimeout)
+            {
+                titles = NotepadTitles();
+                if (titles.Contains("root-notes", StringComparison.OrdinalIgnoreCase)) break;
+                Thread.Sleep(250);
+            }
+            Output.WriteLine($"editor titles after {deadline.ElapsedMilliseconds} ms: '{titles}'");
+            Assert.True(titles.Contains("root-notes", StringComparison.OrdinalIgnoreCase),
+                $"the editor never opened {probe} from the share-root Explorer window (titles: '{titles}').");
+            AssertDataOpenOnWire(probe);
+        }
+        finally
+        {
+            CloseExplorerWindows("localhost");
+            KillNewNotepads(notepadsBefore);
+            DisconnectAlias("localhost");
+            try { File.Delete(Path.Combine(Lab.WritableShareRoot, probe)); } catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>Shortcut save + wizard rename in the share ROOT, window open — the manual session's exact shape.</summary>
+    [SkippableFact]
+    public void RealExplorer_CreateShortcutInShareRoot_SaveAndRename_DoesNotFreeze()
+    {
+        Require();
+        string provisional = $"Neue Verknüpfung {_rootTag}.lnk";
+        string final = $"Editor {_rootTag} - Verknüpfung.lnk";
+
+        try
+        {
+            ConnectVia("localhost");
+            string aliasRoot = ToAlias(Lab.WritableShareUnc, "localhost");
+
+            using var _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{aliasRoot}\"") { UseShellExecute = true });
+            AwaitExplorerWindow(aliasRoot);
+            Thread.Sleep(1000);
+
+            Timed("IShellLink::Save into share root", () =>
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell")!;
+                dynamic shell = Activator.CreateInstance(shellType)!;
+                try
+                {
+                    dynamic lnk = shell.CreateShortcut($@"{aliasRoot}\{provisional}");
+                    lnk.TargetPath = @"C:\Windows\notepad.exe";
+                    lnk.Save();
+                }
+                finally
+                {
+                    Marshal.FinalReleaseComObject(shell);
+                }
+            });
+
+            Thread.Sleep(1500); // Explorer's icon extraction on the fresh .lnk is mid-flight now
+            Timed("rename provisional shortcut in root", () =>
+                File.Move($@"{aliasRoot}\{provisional}", $@"{aliasRoot}\{final}"));
+
+            Assert.True(File.Exists(Path.Combine(Lab.WritableShareRoot, final)),
+                $"root rename never landed on the backend.{Environment.NewLine}{Lab.RecentLog()}");
+            byte[] readBack = Timed("reopen renamed root .lnk", () => File.ReadAllBytes($@"{aliasRoot}\{final}"));
+            Assert.Equal((byte)'L', readBack[0]);
+        }
+        finally
+        {
+            CloseExplorerWindows("localhost");
+            DisconnectAlias("localhost");
+            foreach (string name in new[] { provisional, final })
+                try { File.Delete(Path.Combine(Lab.WritableShareRoot, name)); } catch { /* best-effort */ }
+        }
+    }
+
+    private readonly string _rootTag = Guid.NewGuid().ToString("N")[..6];
+
+    /// <summary>
+    /// The wire-level truth check for "the editor really loaded the file": the server log must show
+    /// an open of the file with DATA-read intent. A window title is not evidence — the Windows 11
+    /// Notepad shows the file name in its tab even while the body reports "Die Datei … kann nicht
+    /// gefunden werden" (measured: the title-based assertions here were green through exactly that
+    /// failure). The broken flow only ever opened with FILE_READ_ATTRIBUTES (0x80/0x100080), probed,
+    /// and gave up — it never asked for the bytes.
+    /// </summary>
+    protected void AssertDataOpenOnWire(string fileName)
+    {
+        var deadline = Stopwatch.StartNew();
+        bool sawDataOpen = false;
+        string pattern = @"\[create\] '[^']*" + Regex.Escape(fileName) + @"' disp=\w+ access=0x([0-9A-Fa-f]{8})";
+        // Generous: on a loaded machine (mid-suite) the packaged app's activation pipeline alone can
+        // take several seconds before the data open reaches the wire.
+        while (deadline.Elapsed < TimeSpan.FromSeconds(20) && !sawDataOpen)
+        {
+            foreach (Match m in Regex.Matches(Lab.RecentLog(), pattern))
+            {
+                uint access = Convert.ToUInt32(m.Groups[1].Value, 16);
+                const uint dataReadIntent = 0x80000001 | 0x02000000; // GENERIC_READ | FILE_READ_DATA | MAXIMUM_ALLOWED
+                if ((access & dataReadIntent) != 0) { sawDataOpen = true; break; }
+            }
+            if (!sawDataOpen) Thread.Sleep(250);
+        }
+        Output.WriteLine($"server log:{Environment.NewLine}{Lab.RecentLog()}");
+        Assert.True(sawDataOpen,
+            $"the client never opened '{fileName}' with data-read access — it only probed attributes and " +
+            "gave up, i.e. the app is reporting the file as not found despite the window title carrying it.");
+    }
+
+    /// <summary>Waits until a real Explorer window shows <paramref name="folderUnc"/> and returns it.</summary>
+    private dynamic AwaitExplorerWindow(string folderUnc)
+    {
+        Type shellType = Type.GetTypeFromProgID("Shell.Application")!;
+        dynamic shell = Activator.CreateInstance(shellType)!;
+        var deadline = Stopwatch.StartNew();
+        string expected = folderUnc.TrimEnd('\\');
+        while (deadline.Elapsed < OpTimeout)
+        {
+            foreach (dynamic w in shell.Windows())
+            {
+                string? path = null;
+                try { path = (string?)w.Document?.Folder?.Self?.Path; } catch { /* window mid-navigation */ }
+                if (string.Equals(path, expected, StringComparison.OrdinalIgnoreCase))
+                {
+                    Output.WriteLine($"explorer window on '{path}' after {deadline.ElapsedMilliseconds} ms");
+                    return w;
+                }
+            }
+            Thread.Sleep(250);
+        }
+        throw new InvalidOperationException(
+            $"no Explorer window appeared on {expected} within {OpTimeout.TotalSeconds:0}s — opening the " +
+            $"share folder itself froze.{Environment.NewLine}Server log:{Environment.NewLine}{Lab.RecentLog()}");
+    }
+
+    /// <summary>
+    /// Closes every Explorer window whose location lies under the given host — and WAITS until they
+    /// are gone. Quit() is asynchronous; a window still winding down keeps its directory handles (and
+    /// with them the redirector connection) alive, so a fire-and-forget close let the alias connection
+    /// linger into the next lab, where the different lab account turned it into a 15-second 1219 storm.
+    /// </summary>
+    private static void CloseExplorerWindows(string host)
+    {
+        try
+        {
+            Type shellType = Type.GetTypeFromProgID("Shell.Application")!;
+            dynamic shell = Activator.CreateInstance(shellType)!;
+            var deadline = Stopwatch.StartNew();
+            while (deadline.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                bool any = false;
+                foreach (dynamic w in shell.Windows())
+                {
+                    string? path = null;
+                    try { path = (string?)w.Document?.Folder?.Self?.Path; } catch { /* ignore */ }
+                    if (path is not null && path.StartsWith($@"\\{host}\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        any = true;
+                        try { w.Quit(); } catch { /* best-effort */ }
+                    }
+                }
+                if (!any) return;
+                Thread.Sleep(250);
+            }
+        }
+        catch { /* shell gone — nothing to close */ }
+    }
+
+    private static string NotepadTitles() => string.Join(" | ",
+        Process.GetProcessesByName("Notepad").Concat(Process.GetProcessesByName("notepad"))
+            .Select(p => { try { return p.MainWindowTitle; } catch { return ""; } })
+            .Where(t => t.Length > 0));
+
+    private static void KillNewNotepads(HashSet<int> before)
+    {
+        // Close gracefully first: a hard kill leaves the Win11 Notepad's session-restore state
+        // behind, and the NEXT launch then restores tabs / shows a crash prompt instead of loading
+        // the file it was handed — which made the following GUI test's wire oracle time out.
+        var mine = Process.GetProcessesByName("Notepad").Concat(Process.GetProcessesByName("notepad"))
+            .Where(p => !before.Contains(p.Id)).ToList();
+        foreach (Process p in mine)
+            try { p.CloseMainWindow(); } catch { /* best-effort */ }
+        foreach (Process p in mine)
+        {
+            try
+            {
+                if (!p.WaitForExit(3000)) p.Kill(entireProcessTree: true);
+            }
+            catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// The Windows 11 Notepad's open, driven through the REAL API it uses: <c>Windows.Storage</c>.
+    /// The title-based Notepad probes were false-green — the editor window shows the file name in
+    /// its tab even while the body reports the file as not found. StorageFile is the layer that
+    /// fails, so calling it directly is both the honest repro and the regression pin; the manual
+    /// symptom was "Die Datei … kann nicht gefunden werden" on double-click for files that exist.
+    /// </summary>
+    [SkippableFact]
+    public void WindowsStorageApi_OpenTextFileViaLocalhost_ReadsContent()
+    {
+        var (unc, local) = Dir();
+        File.WriteAllText(Path.Combine(local, "notes.txt"), "storage api content");
+
+        try
+        {
+            ConnectVia("localhost");
+            string alias = ToAlias(unc, "localhost");
+
+            string text = Timed("StorageFile open+read", () =>
+            {
+                try
+                {
+                    Windows.Storage.StorageFile file = Windows.Storage.StorageFile
+                        .GetFileFromPathAsync($@"{alias}\notes.txt").AsTask().GetAwaiter().GetResult();
+                    return Windows.Storage.FileIO.ReadTextAsync(file).AsTask().GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    throw new IOException(
+                        $"Windows.Storage failed to open the file ({ex.GetType().Name}: {ex.Message}) — " +
+                        $"this is the packaged-Notepad double-click failure.{Environment.NewLine}" +
+                        $"Server log:{Environment.NewLine}{Lab.RecentLog()}", ex);
+                }
+            });
+
+            Assert.Equal("storage api content", text);
+        }
+        finally
+        {
+            DisconnectAlias("localhost");
+        }
+    }
+
+    /// <summary>Rewrites a lab UNC (<c>\\127.0.0.1\Share\dir</c>) onto an alternative host alias.</summary>
+    protected static string ToAlias(string unc, string host)
+        => $@"\\{host}\{unc[$@"\\{Host}\".Length..]}";
+
+    /// <summary>
+    /// Authenticates the redirector against this lab under an alternative host name. Every distinct
+    /// host string is its own server entry to the redirector, so the lab's <c>\\127.0.0.1</c> login
+    /// does not cover it.
+    /// </summary>
+    protected void ConnectVia(string host)
+    {
+        Require();
+        string share = Lab.WritableShareUnc.Split('\\', StringSplitOptions.RemoveEmptyEntries)[1];
+        NetUse.ConnectWithRetry($@"\\{host}\{share}", Lab.Domain, Lab.User, Lab.Password,
+            Output.WriteLine, Lab.RecentLog);
+    }
+
+    /// <summary>
+    /// Drops the alias connection and waits until the redirector no longer lists it — a connection
+    /// still held open (e.g. by an Explorer window mid-teardown) survives <c>net use /delete</c> and
+    /// greets the next lab's different account with error 1219.
+    /// </summary>
+    protected void DisconnectAlias(string host)
+    {
+        string share = Lab.WritableShareUnc.Split('\\', StringSplitOptions.RemoveEmptyEntries)[1];
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            WindowsSmbLab.RunNet(out _, "use", $@"\\{host}\{share}", "/delete", "/y");
+            WindowsSmbLab.RunNet(out _, "use", $@"\\{host}", "/delete", "/y");
+            WindowsSmbLab.RunNet(out string listing, "use");
+            if (!listing.Contains($@"\\{host}\", StringComparison.OrdinalIgnoreCase))
+                return;
+            Thread.Sleep(500);
+        }
+        Output.WriteLine($@"[lab] warning: a \\{host} connection outlived DisconnectAlias — the next lab may see 1219");
     }
 
     [SkippableFact]

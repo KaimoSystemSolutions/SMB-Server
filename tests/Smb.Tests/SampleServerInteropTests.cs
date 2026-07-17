@@ -93,6 +93,53 @@ public class SampleServerInteropTests(SampleServerLab lab, ITestOutputHelper out
     }
 
     /// <summary>
+    /// Manual-repro capture harness, NOT a regular test: it only runs when
+    /// <c>manual-repro-start.txt</c> exists in the repository root (otherwise it skips). While it
+    /// runs, the example server is up on 127.0.0.1:445 and a human reproduces the failing Explorer
+    /// flows; the harness waits for <c>manual-repro-stop.txt</c> (or 10 minutes), then writes the
+    /// full server log to <c>manual-repro-server.log</c> for offline analysis. Exists because the
+    /// reported Explorer failures (double-click "not found", shortcut freeze) have resisted every
+    /// automated repro up to real Explorer windows — the next data can only come from the real
+    /// manual session, measured.
+    /// </summary>
+    [SkippableFact]
+    public void ManualReproCapture_WaitsForHumanRepro_ThenDumpsServerLog()
+    {
+        string repoRoot = LocateRepoRoot();
+        string startMarker = Path.Combine(repoRoot, "manual-repro-start.txt");
+        Skip.IfNot(File.Exists(startMarker), "manual capture not requested (no manual-repro-start.txt)");
+        Require();
+
+        string stopMarker = Path.Combine(repoRoot, "manual-repro-stop.txt");
+        string logDump = Path.Combine(repoRoot, "manual-repro-server.log");
+        File.Delete(stopMarker);
+
+        // Dump continuously, not only at the end: the first capture attempt died mid-session (external
+        // process kill) and took its never-written log with it. A crash now costs at most two seconds
+        // of tail, and the heartbeat timestamps let the offline analysis see both that the server was
+        // alive and when the capture stopped.
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (deadline.Elapsed < TimeSpan.FromMinutes(10) && !File.Exists(stopMarker))
+        {
+            File.WriteAllText(logDump,
+                $"capture heartbeat {DateTimeOffset.Now:O} (running {deadline.Elapsed.TotalSeconds:0}s)" +
+                $"{Environment.NewLine}{lab.FullLog()}{Environment.NewLine}");
+            Thread.Sleep(2000);
+        }
+
+        File.WriteAllText(logDump, $"capture finished {DateTimeOffset.Now:O}{Environment.NewLine}{lab.FullLog()}{Environment.NewLine}");
+        Output.WriteLine($"captured {deadline.Elapsed.TotalSeconds:0}s of manual repro; log at {logDump}");
+    }
+
+    private static string LocateRepoRoot()
+    {
+        string? dir = AppContext.BaseDirectory;
+        while (dir is not null && !File.Exists(Path.Combine(dir, "Smb.Server.slnx")))
+            dir = Path.GetDirectoryName(dir);
+        return dir ?? throw new InvalidOperationException("repo root not found");
+    }
+
+    /// <summary>
     /// The DFS namespace: the example publishes <c>DfsRoot\Public → \SAMPLE\Files</c>. Browsing the
     /// root share itself must work like any disk share (Explorer opens it before any link is
     /// followed), and file I/O directly in the root must behave.

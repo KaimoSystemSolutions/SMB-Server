@@ -79,6 +79,64 @@ public sealed class AuditFixTests : IDisposable
         Assert.Equal(NtStatus.InvalidParameter, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(10_000_000, sid))).Status);
     }
 
+    /// <summary>
+    /// §3.3.1.1: the sequence window is a SET of outstanding MessageIds, not a low-water mark. A
+    /// pipelined client may put a higher MessageId on the wire before a lower one — measured with the
+    /// real Windows client (robocopy /compress sent its small tail WRITE, mid 57, ahead of the
+    /// 16-credit 1-MiB body WRITE, mid 41). The old implementation jumped the window start to
+    /// "highest seen + charge", so the still-outstanding lower id was rejected as a replay
+    /// (INVALID_PARAMETER) and robocopy fell into its retry loop — a reproducible 25 s freeze.
+    /// </summary>
+    [Fact]
+    public void SequenceWindow_AcceptsOutOfOrderPipelinedMessageIds()
+    {
+        var (d, _, conn) = DevServer(requireSigning: false, negotiator: new DevSpnegoNegotiator());
+        d.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        ulong sid = Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(1, 0, [0x01]))).SessionId;
+
+        // Higher id first (skipping 2–4), then the lower ones it overtook — all must succeed.
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(5, sid))).Status);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(3, sid))).Status);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(2, sid))).Status);
+
+        // A genuine replay of an out-of-order-consumed id is still rejected...
+        Assert.Equal(NtStatus.InvalidParameter, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(3, sid))).Status);
+
+        // ...and the window keeps sliding once the gap closes.
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(4, sid))).Status);
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(6, sid))).Status);
+    }
+
+    /// <summary>
+    /// Frames exempt from strict sequence validation (compound RELATED elements, CANCEL) still occupy
+    /// their MessageIds and must CONSUME them. The first fix of the out-of-order window skipped them
+    /// entirely; every Explorer compound (CREATE+QUERY+CLOSE) then left a permanent gap the window
+    /// start could never slide past, and one credit-window of traffic later the whole connection
+    /// wedged into an InvalidParameter cascade — measured in the 2026-07-16 manual verification round
+    /// (PowerPoint, Notepad and the shell all failing at once, "Problem mit dem Datenabrufen").
+    /// </summary>
+    [Fact]
+    public void SequenceWindow_RelatedElements_ConsumeTheirIds_NoPermanentGap()
+    {
+        var (d, _, conn) = DevServer(requireSigning: false, negotiator: new DevSpnegoNegotiator());
+        d.ProcessMessage(conn, TestHelpers.BuildNegotiateRequest([SmbDialect.Smb311]));
+        ulong sid = Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildSessionSetupRequest(1, 0, [0x01]))).SessionId;
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(2, sid))).Status);
+        Assert.Equal(3UL, conn.SequenceWindowStart);
+
+        // A related element occupies MessageId 3 without strict validation (§3.3.5.2.3)...
+        byte[] related = TestHelpers.BuildEchoRequest(3, sid);
+        BinaryPrimitives.WriteUInt32LittleEndian(related.AsSpan(16, 4), (uint)Smb2HeaderFlags.RelatedOperations);
+        d.ProcessMessage(conn, related);
+
+        // ...but the window start MUST slide past it — id 3 stuck unconsumed is the wedge.
+        Assert.Equal(4UL, conn.SequenceWindowStart);
+
+        Assert.Equal(NtStatus.Success, Smb2Header.Read(d.ProcessMessage(conn, TestHelpers.BuildEchoRequest(4, sid))).Status);
+        Assert.Equal(5UL, conn.SequenceWindowStart);
+    }
+
     // --- Finding H3: DesiredAccess is enforced against the policy's MaximalAccess ---
 
     [Fact]

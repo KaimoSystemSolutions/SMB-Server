@@ -82,6 +82,10 @@ public sealed class WindowsSmbLab : IAsyncLifetime, IWindowsInteropLab
     public string ReadOnlyProbeFile => "readable.txt";
     public string ReadOnlyProbeContent => "read only content";
     public IReadOnlyCollection<string> VisibleShares => [FilesShare, ReadOnlyShare, SlowShare];
+    string IWindowsInteropLab.WritableShareRoot => FilesRoot;
+    string IWindowsInteropLab.Domain => Domain;
+    string IWindowsInteropLab.User => User;
+    string IWindowsInteropLab.Password => Password;
 
     /// <summary>Skips the calling test unless the lab is up. Only the environment may skip.</summary>
     public void Require() => Skip.If(SkipReason is not null, SkipReason);

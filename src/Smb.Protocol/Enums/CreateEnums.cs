@@ -79,6 +79,7 @@ public enum FileInformationClass : byte
     FileAttributeTagInformation = 35,
     FileIdBothDirectoryInformation = 37,
     FileIdFullDirectoryInformation = 38,
+    FileNormalizedNameInformation = 48,
 }
 
 /// <summary>FileSystemInformationClass numbers (Context §16, MS-FSCC §2.5).</summary>
@@ -89,4 +90,5 @@ public enum FsInformationClass : byte
     FileFsDeviceInformation = 4,
     FileFsAttributeInformation = 5,
     FileFsFullSizeInformation = 7,
+    FileFsObjectIdInformation = 8,
 }

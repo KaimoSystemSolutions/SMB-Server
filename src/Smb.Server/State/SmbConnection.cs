@@ -134,11 +134,20 @@ public sealed class SmbConnection
 
     // --- Credit / sequence window (Context §7, §3.3.1.7) ---
 
-    /// <summary>Lower bound of the valid MessageId window.</summary>
+    /// <summary>Lower bound of the valid MessageId window (= lowest MessageId not yet consumed).</summary>
     public ulong SequenceWindowStart { get; set; }
 
     /// <summary>Size of the valid MessageId window (= granted credits).</summary>
     public ulong SequenceWindowSize { get; set; } = 1;
+
+    /// <summary>
+    /// MessageIds at or above <see cref="SequenceWindowStart"/> that have been consumed out of order
+    /// (§3.3.1.1: the sequence window is a SET of outstanding ids — a pipelined client may put a higher
+    /// MessageId on the wire before a lower one). Bounded by the window size; ids leave the set as the
+    /// contiguous consumed prefix slides the window start forward. Touched only on the connection's
+    /// read loop (arrival order), like the window fields above.
+    /// </summary>
+    public HashSet<ulong> ConsumedSequenceIds { get; } = [];
 
     public ushort OutstandingRequestCount { get; set; }
 

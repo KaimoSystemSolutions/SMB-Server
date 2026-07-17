@@ -309,20 +309,49 @@ public sealed partial class Smb2Dispatcher
     private static bool ValidateSequence(SmbConnection connection, Smb2Header header)
     {
         if (!connection.NegotiateDone) return true;
-        if (header.Command is SmbCommand.Negotiate or SmbCommand.Cancel) return true;
-        if (header.Flags.HasFlag(Smb2HeaderFlags.RelatedOperations)) return true;
 
         ushort charge = Math.Max(header.CreditCharge, (ushort)1);
         ulong start = connection.SequenceWindowStart;
         ulong size = connection.SequenceWindowSize == 0 ? 1 : connection.SequenceWindowSize;
 
+        // Frames outside strict validation (§3.3.5.2.3): NEGOTIATE, CANCEL, compound related
+        // elements. Exempt from the replay verdict — but they still OCCUPY their MessageIds. A
+        // related element of a CREATE+QUERY+CLOSE chain carries its own id; skipping consumption
+        // leaves a permanent gap the window start can never slide past, and one credit-window of
+        // traffic later EVERY request is "out of window" — the whole connection wedges into an
+        // InvalidParameter cascade (measured 2026-07-16: Explorer compounds early in the session,
+        // ~500 mids later PowerPoint, Notepad and the shell all failed at once). Consume leniently:
+        // in-window ids are marked, anything else is ignored, nothing is ever rejected.
+        if (header.Command is SmbCommand.Negotiate or SmbCommand.Cancel
+            || header.Flags.HasFlag(Smb2HeaderFlags.RelatedOperations))
+        {
+            for (ulong id = header.MessageId; id < header.MessageId + charge; id++)
+                if (id >= start && id < start + size)
+                    connection.ConsumedSequenceIds.Add(id);
+            while (connection.ConsumedSequenceIds.Remove(connection.SequenceWindowStart))
+                connection.SequenceWindowStart++;
+            return true;
+        }
+
         if (!CreditManager.IsWithinWindow(header.MessageId, start, size) ||
             !CreditManager.IsWithinWindow(header.MessageId + charge - 1, start, size))
             return false;
 
-        ulong consumedUpTo = header.MessageId + charge;
-        if (consumedUpTo > connection.SequenceWindowStart)
-            connection.SequenceWindowStart = consumedUpTo;
+        // §3.3.1.1: the window is a SET of outstanding MessageIds, not a low-water mark. A pipelined
+        // client may put a higher MessageId on the wire before a lower one — measured with the real
+        // client: robocopy /compress sent its small tail WRITE (mid 57) ahead of the 16-credit 1-MiB
+        // body WRITE (mid 41), and jumping the window start to 58 turned the still-outstanding mid 41
+        // into a "replay" → INVALID_PARAMETER → the copy fell into robocopy's retry loop. Consume the
+        // exact ids instead; the start only slides over the contiguous consumed prefix.
+        // Check first, mutate second: a rejected frame (true replay) must leave the window untouched —
+        // the concurrent path relies on failure being idempotent so the sequential path can re-check.
+        for (ulong id = header.MessageId; id < header.MessageId + charge; id++)
+            if (connection.ConsumedSequenceIds.Contains(id))
+                return false; // replay of an already-consumed id (ids below start fail IsWithinWindow)
+        for (ulong id = header.MessageId; id < header.MessageId + charge; id++)
+            connection.ConsumedSequenceIds.Add(id);
+        while (connection.ConsumedSequenceIds.Remove(connection.SequenceWindowStart))
+            connection.SequenceWindowStart++;
         return true;
     }
 

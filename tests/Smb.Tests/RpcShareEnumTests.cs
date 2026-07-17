@@ -33,11 +33,26 @@ public class RpcShareEnumTests
         return TestHelpers.Concat(DcerpcHeader(11, callId), body);
     }
 
-    private static byte[] RequestPdu(uint callId, ushort opnum)
+    private static byte[] RequestPdu(uint callId, ushort opnum, byte[]? stub = null)
     {
         var body = new byte[8];
         BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(6, 2), opnum); // opnum at offset 22
-        return TestHelpers.Concat(DcerpcHeader(0, callId), body);
+        return TestHelpers.Concat(TestHelpers.Concat(DcerpcHeader(0, callId), body), stub ?? []);
+    }
+
+    /// <summary>NetrShareGetInfo request stub: null ServerName, the share name, the info level.</summary>
+    private static byte[] ShareGetInfoStub(string netName, uint level)
+    {
+        byte[] chars = Encoding.Unicode.GetBytes(netName + "\0");
+        int padded = (chars.Length + 3) / 4 * 4;
+        var stub = new byte[4 + 12 + padded + 4];
+        // ServerName referent id = 0 (null unique pointer)
+        BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(4, 4), (uint)(chars.Length / 2));  // max_count
+        BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(8, 4), 0);                          // offset
+        BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(12, 4), (uint)(chars.Length / 2)); // actual_count
+        chars.CopyTo(stub, 16);
+        BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(16 + padded, 4), level);
+        return stub;
     }
 
     private static bool Contains(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle)
@@ -67,6 +82,55 @@ public class RpcShareEnumTests
         Assert.Equal(2, entriesRead);
         Assert.True(Contains(response, Encoding.Unicode.GetBytes("Files")));
         Assert.True(Contains(response, Encoding.Unicode.GetBytes("IPC$")));
+    }
+
+    /// <summary>
+    /// NetrShareGetInfo (Opnum 16) — the call the Windows shell makes while resolving a UNC path
+    /// for a packaged app. Answering it with a DCERPC FAULT (the old behaviour for every opnum but
+    /// 15) made the Windows 11 Notepad report existing files as "not found" while classic Win32
+    /// editors on the same share worked (they never consult srvsvc). Measured 2026-07-16.
+    /// </summary>
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(1u)]
+    public void SrvsvcEndpoint_NetrShareGetInfo_ReturnsShare(uint level)
+    {
+        var endpoint = new SrvsvcEndpoint([new ShareEntry("Files", SrvsvcEndpoint.StypeDisktree, "Data")]);
+        endpoint.HandlePdu(BindPdu(1));
+
+        byte[] response = endpoint.HandlePdu(RequestPdu(2, 16, ShareGetInfoStub("Files", level)));
+
+        Assert.Equal((byte)DcerpcPduType.Response, response[2]);
+        Assert.True(Contains(response, Encoding.Unicode.GetBytes("Files")));
+        uint ret = BinaryPrimitives.ReadUInt32LittleEndian(response.AsSpan(response.Length - 4, 4));
+        Assert.Equal(0u, ret); // ERROR_SUCCESS
+    }
+
+    [Fact]
+    public void SrvsvcEndpoint_NetrShareGetInfo_UnknownShare_IsNetNameNotFound_NotAFault()
+    {
+        var endpoint = new SrvsvcEndpoint([new ShareEntry("Files", SrvsvcEndpoint.StypeDisktree, "Data")]);
+        endpoint.HandlePdu(BindPdu(1));
+
+        byte[] response = endpoint.HandlePdu(RequestPdu(2, 16, ShareGetInfoStub("Nope", 1)));
+
+        Assert.Equal((byte)DcerpcPduType.Response, response[2]); // a RESPONSE, not a fault
+        uint ret = BinaryPrimitives.ReadUInt32LittleEndian(response.AsSpan(response.Length - 4, 4));
+        Assert.Equal(2310u, ret); // NERR_NetNameNotFound
+    }
+
+    /// <summary>Levels with server-local details answer like Windows answers non-admins.</summary>
+    [Fact]
+    public void SrvsvcEndpoint_NetrShareGetInfo_Level2_IsAccessDenied_NotAFault()
+    {
+        var endpoint = new SrvsvcEndpoint([new ShareEntry("Files", SrvsvcEndpoint.StypeDisktree, "Data")]);
+        endpoint.HandlePdu(BindPdu(1));
+
+        byte[] response = endpoint.HandlePdu(RequestPdu(2, 16, ShareGetInfoStub("Files", 2)));
+
+        Assert.Equal((byte)DcerpcPduType.Response, response[2]);
+        uint ret = BinaryPrimitives.ReadUInt32LittleEndian(response.AsSpan(response.Length - 4, 4));
+        Assert.Equal(5u, ret); // ERROR_ACCESS_DENIED
     }
 
     [Fact]

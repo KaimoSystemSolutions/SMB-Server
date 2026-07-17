@@ -73,6 +73,40 @@ all three reproduced by the user in one session, all three root-caused in code r
 | **F7** | **CLOSE of the break holder was never treated as an implicit break acknowledgment.** §3.3.5.9.8: the wait ends on the ack OR the Open being closed (leases: all opens of the key closed). The redirector's standard answer to a batch break on a deferred-close handle is a CLOSE, never an ack — and leasing is not advertised, so Explorer holds **batch oplocks on every open**. `HandleCloseAsync`/`DetachSessionOpens`/`ReleaseDurable` called `ReleaseOwner` but never completed the `BreakWaitTracker` wait. | Creating a shortcut (.lnk) froze Explorer: every immediate reopen (write → icon → preview) parked behind a break whose ack never came and waited out the full 35 s `OplockBreakTimeout`, per reopen. | `BreakOutcome.HolderClosed` + `CompleteOplockBreakOnClose`/`CompleteLeaseBreakOnClose`; `ILeaseManager.ReleaseOwner` returns `bool` ("last open of the key gone", decided atomically under the manager lock); hooks in CLOSE, session/connection teardown (durable-preserve branch releases only the oplock wait — the preserved open keeps its lease) and durable expiry. Break notifications also made spec-shaped (§3.3.4.6/§3.3.4.7): TreeId 0, lease SessionId 0 (unless the frame is encrypted — the host resolves the encryption key by header SessionId), and **unsigned** (§3.2.5.1.3 exempts MessageId 0xFFFF…FF; signed notifications risked the F1-shaped discard one level up). | `BreakBeforeGrantTests` +6 (close-instead-of-ack, lease last-open-of-key, holder connection teardown, late ack after close → FILE_CLOSED, notification shapes signed-session/lease), `WindowsInteropBattery.CreateShortcut_WriteThenImmediateReopen_DoesNotFreeze` |
 | **F8** | **QUERY_DIRECTORY synthesized "." / ".." unconditionally — even for a specific-name pattern.** Explorer's post-CREATE lookup of a new folder (exact name + `SL_RETURN_SINGLE_ENTRY`) got "." as the single entry (the dispatcher caps at 1). Also masked `STATUS_NO_SUCH_FILE` for non-matching patterns (the listing was never empty). | Creating a new folder displayed it literally named "." and the inline-rename box never opened. | Gate the synthetic entries on the pattern actually matching them (`FileSystemName.MatchesWin32Expression(pattern, ".")`, both `LocalFileStore.QueryDirectory` overloads) — "." / ".." behave like any other entry. | `FileBrowseTests` +3 (specific name → only the real entry; + `SL_RETURN_SINGLE_ENTRY`; non-matching → `NO_SUCH_FILE`), `WindowsInteropBattery.Enumerate_ExactName_ReturnsTheRealEntry_NotDot`, `NewFolder_CreateThenRename_Works` |
 
+| # | Cause | Effect on the real client | Fix | Test |
+|---|-------|---------------------------|-----|------|
+| **F9** (2026-07-16, found via the live manual-repro capture after automated repro failed) | **Handle-based name queries were wrong twice over:** QUERY_INFO `FileNormalizedNameInformation` (class 48) was declined as `INVALID_INFO_CLASS`, and `FileNameInformation`/`FileAllInformation` answered with the **leaf name** instead of the share-root-relative path (MS-FSCC §2.1.7 mandates `\dir\file.txt`). | `GetFinalPathNameByHandle` — called by Office's save path, the shell's shortcut handling and every `Windows.Storage`-based app (**Windows 11 Notepad**) — rebuilds the file's UNC path from these answers. With a leaf-only answer the client reconstructed wrong paths and re-opened them: CREATE `Files\doc.pptx` (share component doubled) → NOT_FOUND, CREATE `""` with NonDirectoryFile (leaf lost, share root as a file) → FILE_IS_A_DIRECTORY. User-visible as **"Datei kann nicht gefunden werden" on files that plainly exist** (every double-click in the packaged Notepad) and as **multi-second delays** (Office re-ran its lock-file open ~1 s per retry when class 48 failed; shortcut dialog froze the same way). Plain `File.ReadAllText`/classic Win32 opens never call this → **10 automated repro tests incl. real Explorer windows + real Notepad stayed green** while the manual session failed. | Class 48 implemented (3.1.1-gated per §3.3.5.20.1, `NOT_SUPPORTED` below); FileName/FileAll/NormalizedName now answer `"\" + IFileHandle.Path` (share-root-relative, rename-aware — Office queries the name right after its temp→final rename). | `FileNameQueryTests` (6: classes 9/18/48, dialect gate, share root `"\"`, after-rename), battery `GetFinalPathNameByHandle_OnShareFile_Works` now asserts the **exact** reconstructed path |
+
+| # | Cause | Effect on the real client | Fix | Test |
+|---|-------|---------------------------|-----|------|
+| **F10** (2026-07-16, exposed by the F9 hunt's suite run; W4.1's "credit/sequence window under Windows load" made concrete) | **The sequence window was a low-water mark, not a set.** `ValidateSequence` jumped `SequenceWindowStart` to `MessageId + charge` of whatever arrived, assuming strictly ascending arrival. §3.3.1.1 defines the window as a SET of outstanding ids — a pipelined client may put a higher MessageId on the wire before a lower one. | Measured: robocopy /compress sent its small tail WRITE (mid 57) ahead of the 16-credit 1-MiB body WRITE (mid 41); after mid 57 the start sat at 58, so mid 41 was rejected as a replay (`INVALID_PARAMETER`) and robocopy fell into its retry loop — a reproducible 25 s freeze on every large pipelined copy. Any credit-heavy, out-of-order client load can hit this. | Consume exact ids into `SmbConnection.ConsumedSequenceIds`; the window start only slides over the contiguous consumed prefix. Replays still rejected (consumed ids in-window, and everything below the start). Failure stays idempotent (check-then-mutate) so the concurrent path's failed validation can be repeated by the sequential path. | `AuditFixTests.SequenceWindow_AcceptsOutOfOrderPipelinedMessageIds` (+ the existing H2 replay test unchanged green); `Robocopy_WithCompression_InboundWritesLandIntact` 25 s → 195 ms |
+
+| # | Cause | Effect on the real client | Fix | Test |
+|---|-------|---------------------------|-----|------|
+| **F11** (2026-07-16, found in verification round 3 after F9 alone did not clear the double-click symptom) | **srvsvc answered every opnum except NetrShareEnum with a DCERPC FAULT** — including `NetrShareGetInfo` (16), which the Windows shell calls while resolving a UNC path for a **packaged app**. Secondary: `FSCTL_CREATE_OR_GET_OBJECT_ID`/`FSCTL_GET_OBJECT_ID` (link tracking, issued by the shell on every packaged-app open) were declined. | The Windows 11 Notepad (and every `Windows.Storage`-based app) opened the file for attributes, probed, and **never issued a data open** — the shell aborted activation and the editor reported "Datei … kann nicht gefunden werden" on files that exist, while classic Win32 editors (Notepad++) on the same share read the same file fine: they never consult srvsvc. The failing flow retried several times ⇒ the perceived lag. | `NetrShareGetInfo` implemented (levels 0/1; levels 2/502/503 answer `ERROR_ACCESS_DENIED` exactly like a Windows server answers non-admins; unknown share → `NERR_NetNameNotFound`; never a FAULT). Object-id FSCTLs answer a stable synthesized `FILE_OBJECTID_BUFFER` (FNV of path + ServerGuid). | `RpcShareEnumTests` +4 (levels 0/1, unknown share, level 2), `AdditionalFsctlTests.ObjectIdFsctls_ReturnStableDistinctIds`; all Real-Explorer/Notepad battery cases now carry a **wire oracle** (`AssertDataOpenOnWire`) |
+| **F9a** (same session) | `SET_INFO FileBasicInformation` timestamps: the special value **-2** ("resume implicit updates", MS-FSCC §2.4.7) was passed through as a raw FILETIME; the backend threw and the SET_INFO failed with `INVALID_PARAMETER`. | Office sends -2 during its save dance and retries on failure — the measured multi-second save lag (and the same pattern in the shell's shortcut save). | `ParseBasicInfo` treats 0/-1/-2 uniformly as "do not set". | Covered by the existing basic-info tests plus the save-flow interop cases |
+
+| # | Cause | Effect on the real client | Fix | Test |
+|---|-------|---------------------------|-----|------|
+| **F12** (2026-07-16, verification round 4 — the same hunt, one layer further) | **QUERY_INFO FileSystem class 8 (`FileFsObjectIdInformation`, MS-FSCC §2.5.6) was declined as `INVALID_INFO_CLASS`.** The shell's link tracking asks for the volume object id after essentially every attribute open in a packaged-app flow; NTFS answers it. | The measured capture showed it as the common denominator of ALL THREE remaining symptoms: **six declines per notes.txt double-click** before the packaged Notepad aborted ("nicht gefunden"), plus the retry loops behind the shortcut-creation delay (declines on the `.tmp`/`.lnk`) and the Office save delay (declines on the `.pptx`). | Class 8 answered with a stable per-share synthesized volume object id (ServerGuid ⊕ share-name hash, extended info zero like an NTFS volume). | `FileNameQueryTests.FileFsObjectIdInformation_IsAnsweredAndStable` |
+
+> **The false-green lesson (belongs next to F11).** The Real-Notepad/Explorer battery cases asserted on
+> the editor's window TITLE — and the Windows 11 Notepad shows the file name in its tab even while the
+> body reports the file as not found, so the tests stayed green through the exact failure they were
+> written to catch (the user caught it: "ich glaube du testest falsch"). Every editor-driving case now
+> asserts on the WIRE instead: a successful load must contain an open with data-read intent
+> (`AssertDataOpenOnWire`). UI is testimony; the wire is evidence.
+
+> **How F9 was found — and why every earlier attempt missed it.** The failing operations exist only
+> inside application flows that normalize paths; every .NET-level and even real-Explorer-window repro
+> used opens that never ask for a normalized name. The breakthrough was a **live capture harness**
+> (`ManualReproCapture` in `SampleServerInteropTests`): the lab serves 127.0.0.1:445 while a human
+> reproduces in Explorer/Office, and the full server log is dumped continuously. The capture showed the
+> class-48 declines and the reconstructed-path CREATEs within one second of each other. Permanent
+> diagnostics added along the way: `[create]` failures log name+disposition+header flags (DFS bit),
+> `[query-info]`/`[set-info]` log declined classes, `[ioctl]` logs declined FSCTL codes, `[dfs]` logs
+> every referral question and answer.
+
 > **The generalisable lesson from F1 + F5 — this root cause has now bitten three times.** Every place that
 > builds a response **outside** a central choke point re-decides signing, and re-decides it wrong. First the
 > sequential `BuildError` paths, then `ExecutePreparedFrameAsync` (the gotcha that cost time twice on
@@ -851,4 +885,88 @@ touches the policy and stays synchronous.
     incl. the three new cases, W1.5 tick-off, manual Explorer probe of the three original symptoms. Then the
     hardening backlog (parked CHANGE_NOTIFY slot overwrite in `ChangeNotifyRegistration`, watcher root-event
     "." hazard, `SMB2_REOPEN`/`SMB2_INDEX_SPECIFIED`, DOS wildcards, leasing capability, W2.1 default flip).
+- **2026-07-16 (evening)** — **F9 found and fixed: leaf-only handle name queries + missing
+  FileNormalizedNameInformation broke every path-normalizing client flow** (full table row and the
+  how-it-was-found note in [the freeze-cause section](#freeze-causes--measured-in-the-windows-lab-2026-07-15)).
+  The user re-reported both original symptoms (double-click "kann nicht gefunden werden", shortcut
+  freeze) against a **fresh build containing F6–F8** — so those fixes were real but not the whole story.
+  - **The hunt, in order:** (1) 10 new interop-battery cases written first — `\\localhost` host alias
+    (own redirector server entry; found+handled lab-infra `net use` 1219 retry), Explorer new-text-document
+    flow under the alias, `.lnk` via real `WScript.Shell` COM, real Notepad launch, **real Explorer
+    windows** (double-click + shortcut save/rename, subdir and share root), `GetFinalPathNameByHandle`.
+    **All green — the failure is invisible to every flow that does not normalize paths.** (2) Live
+    manual-repro capture harness (`ManualReproCapture`, start/stop marker files, continuous log dump)
+    measured the user's real session: `class=48 → InvalidInfoClass` retry loops and the
+    reconstructed-path CREATEs (`Files\doc.pptx` → NOT_FOUND, `"" NonDirectoryFile` → FILE_IS_A_DIRECTORY).
+  - **Fix:** `FileInformationClass.FileNormalizedNameInformation = 48` + wire case (same shape as
+    FileNameInformation); dispatcher gates it on dialect 3.1.1 (`NOT_SUPPORTED` otherwise, §3.3.5.20.1);
+    handle-based name queries (9/18/48) answer `"\" + IFileHandle.Path` — share-root-relative with
+    leading backslash (MS-FSCC §2.1.7), rename-aware via `Relocate`.
+  - **Tests:** `FileNameQueryTests` (6 new, dispatcher-level, incl. after-rename and the dialect gate);
+    battery `GetFinalPathNameByHandle_OnShareFile_Works` asserts the exact reconstructed UNC path; the
+    10 hunt tests stay as standing real-client coverage (both labs).
+  - **Diagnostics now permanent:** failed CREATEs log name+disposition+flags, declined QUERY/SET_INFO
+    classes and FSCTLs log their codes, DFS referrals log question+answer.
+  - **Backlog from the hunt (not F9):** (a) DFS-share path normalization (§3.3.5.9) is still
+    unimplemented — a client that *does* send `server\share\path` with `SMB2_FLAGS_DFS_OPERATIONS` to a
+    DFS-flagged share gets a literal (failing) lookup; today only the demo DfsRoot share is affected.
+    (b) `FileAlternateNameInformation` (8.3 names) still `INVALID_INFO_CLASS`. (c) The declined
+    `[ioctl]` codes from the capture (len=120/144 on the disk tree) are now logged — identify and decide
+    on the next capture.
+- **2026-07-16 (evening, same session)** — **F10 found and fixed: the sequence window rejected
+  out-of-order pipelined MessageIds** (full row in the freeze-cause section). The F9 verification suite
+  run failed `Robocopy_WithCompression_InboundWritesLandIntact` reproducibly (25 s timeout); the new
+  `[cmd]`-level diagnosis showed `Write mid=41 charge=16 → InvalidParameter` *after* `Write mid=57 →
+  Success` — the real client had put the small tail write on the wire before the 16-credit 1-MiB body
+  write, and `ValidateSequence`'s "jump the start past whatever arrived" model declared the lower id a
+  replay. Fixed as a consumed-id SET with a sliding contiguous prefix (`SmbConnection.ConsumedSequenceIds`);
+  the shape of W4.1's warning ("Windows stalls on credit starvation / window mishandling") is now a
+  measured, regression-tested case: 25 s → 195 ms. Two important shapes preserved: replays still fail
+  (H2 test unchanged), and a failed validation mutates nothing (the concurrent path's rejected frame is
+  re-validated by the sequential path).
+  - **Lesson for the F1-family ledger:** this is the third bug found *because* a formerly opaque decline
+    got a one-line log with its parameters. Diagnostics are not polish — every declined request that
+    names its "why" converts the next mystery freeze into a grep.
+  - **F10a — the first F10 fix carried a regression, caught by the next manual verification round.**
+    The consumed-id set skipped the strict-validation exemptions (NEGOTIATE/CANCEL/compound RELATED
+    elements) entirely — but a related element still occupies its MessageId. Every Explorer compound
+    (CREATE+QUERY+CLOSE) left a permanent gap the window start could never slide past; one
+    credit-window of traffic later the connection wedged into an all-requests-InvalidParameter cascade
+    (user-visible as "Problem mit dem Datenabrufen": PowerPoint, Notepad and shell failing at once,
+    which also invalidated that round's F9 verification). Fix: exempt frames consume their in-window
+    ids leniently (never rejected). Test:
+    `AuditFixTests.SequenceWindow_RelatedElements_ConsumeTheirIds_NoPermanentGap` — asserts the window
+    START slides past a related element, the state whose corruption was the wedge. **Meta-lesson: the
+    dispatcher-level compound tests never drift 500+ mids, so a window-state bug is invisible to them —
+    only a long real-client session (or an interop case that pushes past one credit window) exposes it.
+    The wedge also explains the mass sample-lab "67/init" failures that were misread as environment.**
+- **2026-07-16 (late evening)** — **F11 + F9a found and fixed; the battery's editor cases got a wire
+  oracle.** Verification round 3 (minimal double-click capture, log window enlarged to 5000 lines,
+  every CREATE/QUERY_INFO now logging its parameters) showed the packaged-Notepad flow: attribute-only
+  opens (`0x80`/`0x100080`, `OpenReparsePoint`), class-34 probes, a declined
+  `FSCTL_CREATE_OR_GET_OBJECT_ID`, two srvsvc round trips, **never a data open** → "Datei … kann nicht
+  gefunden werden" while Notepad++ (classic Win32) read the same file — the user's observation
+  "Notepad++ zeigt Inhalt" was the decisive split. Root causes: srvsvc FAULTed `NetrShareGetInfo`
+  (F11), and Office's save lag was the `-2` FILETIME special failing `SET_INFO` (F9a). After the fixes
+  all Real-Explorer/Notepad cases pass **with the new data-open wire oracle** (title-based assertions
+  were false-green — see the lesson above). The `Windows.Storage` API is now driven directly by the
+  battery (`WindowsStorageApi_OpenTextFileViaLocalhost_ReadsContent`; test project TFM →
+  `net9.0-windows10.0.19041.0`).
+  - Also implemented along the way: `[query-info]`/`[create]`-success parameter logging (the trace
+    that made F11 findable), `SampleServerLab.FullLog` window 800 → 5000 lines.
+  - **Open verification:** one final manual round (user) confirming double-click, shortcut and Office
+    save feel right; then the W5 matrix rows for packaged apps can be ticked.
+  - **Known lab-infra flake #2 (backlog):** `RealNotepad_DoubleClickOnLocalhostFile_OpensIt` is
+    reliably green in isolation (wire oracle satisfied within ~2 s) but reliably RED inside a full
+    suite run, in both labs, even with graceful notepad teardown and no pre-existing instance — the
+    packaged-app activation stack appears to hold per-server state that the lab's rapid
+    connect/disconnect/server-swap churn on one hostname invalidates. Production servers do not swap
+    identities under one name, so this is a lab artefact; the isolated run is the signal. Candidate
+    fix: run the GUI battery cases in their own dotnet-test invocation (fresh process, one lab).
+  - **Known lab-infra flake (backlog):** in FULL-suite runs the two labs swap servers on 127.0.0.1:445
+    mid-run; Explorer windows/alias connections from the first lab's editor tests can outlive their
+    teardown and greet the second lab with error 67/1219 storms, failing 1–2 of its `\\localhost`
+    editor cases (each is green in isolation — verified repeatedly). Candidate fixes: per-lab run tags
+    in window titles + a pre-lab `net use * /delete` scoped to lab hosts, or serialising the editor
+    cases into the first lab only.
 - _(append progress here, tick off items in the phases)_

@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <!-- Windows-targeted so the interop battery can drive the REAL Windows.Storage API (what the
+         Windows 11 Notepad and every packaged app use to open files) against the lab servers. The
+         dispatcher-level tests are unaffected; non-Windows runs were already skip-only. -->
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>

@@ -194,12 +194,23 @@ public sealed partial class Smb2Dispatcher
         if (!result.IsSuccess)
         {
             if (shareKey is not null) _server.Options.ShareModeManager.Close(shareKey, open);
+            // Name + disposition, because "which file failed to open, and was it a lookup or a create"
+            // is the first question every failed-CREATE diagnosis asks — the generic [cmd] line only
+            // carries the MessageId. Header flags included for the DFS bit: a share-prefixed name
+            // ("Share\file") with DfsOperations set means the CLIENT is in DFS mode for this path.
+            _log?.Invoke($"[create] '{request.Name}' disp={disposition} flags={header.Flags} → {result.Status}");
             return BuildError(header, result.Status);
         }
 
         IFileHandle handle = result.Value.Handle;
         CreateOutcome outcome = result.Value.Action;
         open.LocalOpen = handle;
+
+        // The successful twin of the failure log below: name, disposition, access and oplock ask are
+        // what distinguish one client flow from another when correlating a trace (Explorer's probe
+        // opens vs. an app's data open vs. Defender's scan all interleave on one connection).
+        _log?.Invoke($"[create] '{request.Name}' disp={disposition} access=0x{request.DesiredAccess:X8} " +
+                     $"opts={request.Options} oplock={request.RequestedOplockLevel} → {outcome}");
 
         // [M3.3] Per-file DACL enforcement (MS-DTYP §2.5.3.2): evaluate the file's security descriptor
         // against the caller's SIDs and cap the granted access to what the DACL permits. On a backend
@@ -618,9 +629,60 @@ public sealed partial class Smb2Dispatcher
             case FsctlMessage.FsctlDfsGetReferrals:
             case FsctlMessage.FsctlDfsGetReferralsEx:
                 return HandleDfsGetReferrals(header, session, req);
+
+            case FsctlCreateOrGetObjectId:
+            case FsctlGetObjectId:
+                return HandleObjectIdFsctl(header, session, req);
         }
 
+        // The code, because "which FSCTL did the client want that we declined" is unanswerable from
+        // the generic [cmd] line — and a declined FSCTL is exactly where client-visible feature gaps
+        // (resiliency, integrity, USN) first show up in a trace.
+        _log?.Invoke($"[ioctl] ctl=0x{req.CtlCode:X8} → InvalidDeviceRequest");
         return BuildError(header, NtStatus.InvalidDeviceRequest);
+    }
+
+    private const uint FsctlCreateOrGetObjectId = 0x000900C0;
+    private const uint FsctlGetObjectId = 0x0009009C;
+
+    /// <summary>
+    /// FSCTL_CREATE_OR_GET_OBJECT_ID / FSCTL_GET_OBJECT_ID (MS-FSCC §2.3.x): answers with a
+    /// FILE_OBJECTID_BUFFER whose id is synthesized deterministically from the server identity and
+    /// the file's stable path id — the same file always reports the same id, which is all the
+    /// link-tracking consumers need. NTFS volumes answer this; declining it (like FAT does) is
+    /// legal but noisy: the Windows shell issues it on every packaged-app open, so a share that
+    /// declines shows a failed FSCTL in every trace of every double-click.
+    /// </summary>
+    private ResponseSegment HandleObjectIdFsctl(Smb2Header header, SmbSession session, IoctlMessage.Request req)
+    {
+        if (!TryGetOpen(session, req.PersistentId, req.VolatileId, out SmbOpen open) || open.LocalOpen is null)
+            return BuildError(header, NtStatus.FileClosed);
+
+        // FILE_OBJECTID_BUFFER: ObjectId(16) BirthVolumeId(16) BirthObjectId(16) DomainId(16).
+        var buffer = new byte[64];
+        Span<byte> objectId = buffer.AsSpan(0, 16);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(objectId,
+            Fnv1a64(open.LocalOpen.PhysicalPath ?? open.PathName));
+        _server.Options.ServerGuid.AsSpan(0, 8).CopyTo(objectId[8..]);          // disambiguate per server
+        _server.Options.ServerGuid.CopyTo(buffer.AsSpan(16, 16));               // BirthVolumeId = "volume"
+        objectId.CopyTo(buffer.AsSpan(32, 16));                                 // BirthObjectId = ObjectId
+
+        return MaybeSigned(session, RespHeader(header, session),
+            IoctlMessage.BuildResponseBody(req.CtlCode, req.PersistentId, req.VolatileId, buffer));
+    }
+
+    /// <summary>Stable process-independent 64-bit hash (FNV-1a) — the object-id seed.</summary>
+    private static ulong Fnv1a64(string s)
+    {
+        ulong h = 14695981039346656037UL;
+        foreach (char c in s)
+        {
+            h ^= (byte)c;
+            h *= 1099511628211UL;
+            h ^= (byte)(c >> 8);
+            h *= 1099511628211UL;
+        }
+        return h;
     }
 
     /// <summary>
@@ -942,6 +1004,13 @@ public sealed partial class Smb2Dispatcher
             : DfsReferralMessage.ParseRequest(req.Input);
 
         DfsReferralResult? result = ns.Resolve(dfsReq.RequestFileName);
+        // Always log referral traffic: a referral the server answers positively flips the CLIENT into
+        // DFS mode for that path (full-path CREATEs with SMB2_FLAGS_DFS_OPERATIONS), so knowing what
+        // was asked and answered is the first question whenever share-prefixed paths appear in CREATEs.
+        _log?.Invoke($"[dfs] referral '{dfsReq.RequestFileName}' → " +
+                     (result is null || result.Targets.Count == 0
+                         ? "NotFound"
+                         : $"{result.ConsumedPath} ({result.Targets.Count} target(s))"));
         if (result is null || result.Targets.Count == 0)
             return BuildError(header, NtStatus.NotFound);
 
@@ -1293,10 +1362,36 @@ public sealed partial class Smb2Dispatcher
                     return await HandleQueryStreamsAsync(session, header, open, req).ConfigureAwait(false);
                 case FileInformationClass.FileFullEaInformation:
                     return await HandleQueryEaAsync(session, header, open, req).ConfigureAwait(false);
+                // §3.3.5.20.1: FileNormalizedNameInformation is only valid on the 3.1.1 dialect; on
+                // older dialects the failure is NOT_SUPPORTED (a recognized class the connection
+                // cannot serve), not INVALID_INFO_CLASS.
+                case FileInformationClass.FileNormalizedNameInformation
+                    when connection.Dialect != SmbDialect.Smb311:
+                    return BuildError(header, NtStatus.NotSupported);
             }
         }
 
-        FsccFileStat stat = ToStat(await open.LocalOpen.GetInfoAsync().ConfigureAwait(false));
+        // Handle-based name queries (FileName/FileAll/FileNormalizedName) return the path relative to
+        // the SHARE ROOT (MS-FSCC §2.1.7), not the leaf name the stat carries.
+        // GetFinalPathNameByHandle — and with it Office's save path and every Windows.Storage open —
+        // reconstructs the file's full UNC path from this answer; a leaf-only name makes the client
+        // rebuild a wrong path and then fail its re-open with OBJECT_NAME_NOT_FOUND ("file not found"
+        // dialogs on files that plainly exist). IFileHandle.Path relocates on rename, so a renamed open
+        // reports its current location.
+        // Shape difference, measured against the real client (the exact-path assertion in the interop
+        // battery): FileName/FileAll carry the leading backslash (MS-FSCC's own examples), while the
+        // NORMALIZED name must come back WITHOUT it — mrxsmb appends the answer to "\\server\share"
+        // with its own separator, so a leading backslash doubles into "…\share\\dir\file".
+        string shareRelative = ShareRelativeName(open);
+        // Trace every handle query with its class: which class a client asks, in which order, is the
+        // difference between the flows that work (plain Win32) and the ones that failed silently
+        // (Windows.Storage/Office) — and invisible in the generic [cmd] line.
+        _log?.Invoke($"[query-info] type={req.InfoType} class={req.FileInfoClass} '{open.PathName}'");
+
+        FsccFileStat stat = ToStat(await open.LocalOpen.GetInfoAsync().ConfigureAwait(false),
+            nameOverride: (FileInformationClass)req.FileInfoClass == FileInformationClass.FileNormalizedNameInformation
+                ? shareRelative.TrimStart('\\')
+                : shareRelative);
 
         byte[]? buffer = req.InfoType switch
         {
@@ -1306,7 +1401,12 @@ public sealed partial class Smb2Dispatcher
         };
 
         if (buffer is null)
+        {
+            // Which class was declined, on which file — a client that *needs* the class (rather than
+            // probing) fails its API call on this line, so the decline must be attributable.
+            _log?.Invoke($"[query-info] type={req.InfoType} class={req.FileInfoClass} '{open.PathName}' → InvalidInfoClass");
             return BuildError(header, NtStatus.InvalidInfoClass);
+        }
 
         return MaybeSigned(session, RespHeader(header, session), QueryInfoMessage.BuildResponseBody(buffer));
     }
@@ -1417,7 +1517,11 @@ public sealed partial class Smb2Dispatcher
         };
 
         if (status != NtStatus.Success)
+        {
+            if (status == NtStatus.InvalidInfoClass)
+                _log?.Invoke($"[set-info] class={req.FileInfoClass} '{open.PathName}' → InvalidInfoClass");
             return BuildError(header, status);
+        }
 
         if (infoClass == FileInformationClass.FileDispositionInformation)
             // Track the delete intent on the open so CLOSE can break the parent directory lease.
@@ -2178,18 +2282,41 @@ public sealed partial class Smb2Dispatcher
     /// </summary>
     private byte[]? BuildFsInfo(SmbSession session, uint treeId, FsInformationClass infoClass)
     {
+        // Stable per-share "volume" object id (FileFsObjectIdInformation): the server identity with
+        // the share folded into the first eight bytes, so every share looks like its own volume and
+        // reports the same id on every query — which is all the shell's link tracking needs.
+        Span<byte> volumeObjectId = stackalloc byte[16];
+        _server.Options.ServerGuid.CopyTo(volumeObjectId);
+        if (session.TreeConnects.TryGetValue(treeId, out SmbTreeConnect? tree))
+        {
+            ulong shareHash = Fnv1a64(tree.Share.Name.ToUpperInvariant());
+            for (int i = 0; i < 8; i++)
+                volumeObjectId[i] ^= (byte)(shareHash >> (i * 8));
+        }
+
         if (TryGetFileStore(session, treeId, out IFileStore store, out _) && store is IVolumeInfoProvider vip)
         {
             VolumeInfo vi = vip.GetVolumeInfo();
             return FsccStructures.BuildFileSystemInformation(
-                infoClass, vi.Label, vi.SerialNumber, vi.TotalBytes, vi.AvailableBytes);
+                infoClass, vi.Label, vi.SerialNumber, vi.TotalBytes, vi.AvailableBytes, volumeObjectId);
         }
-        return FsccStructures.BuildFileSystemInformation(infoClass, "SHARE", 0x12345678);
+        return FsccStructures.BuildFileSystemInformation(infoClass, "SHARE", 0x12345678, volumeObjectId: volumeObjectId);
     }
 
-    private static FsccFileStat ToStat(FileEntryInfo info) => new()
+    /// <summary>
+    /// MS-FSCC §2.1.7: a handle-based name query answers with the path from the share root, leading
+    /// backslash included ("\dir\file.txt"; the share root itself is "\"). Prefers the handle's
+    /// live path (kept current across renames) over the CREATE-time name.
+    /// </summary>
+    private static string ShareRelativeName(SmbOpen open)
     {
-        Name = info.Name,
+        string rel = (open.LocalOpen?.Path ?? open.PathName).Replace('/', '\\').TrimStart('\\');
+        return "\\" + rel;
+    }
+
+    private static FsccFileStat ToStat(FileEntryInfo info, string? nameOverride = null) => new()
+    {
+        Name = nameOverride ?? info.Name,
         FileAttributes = (uint)info.Attributes,
         EndOfFile = info.EndOfFile,
         AllocationSize = info.AllocationSize,

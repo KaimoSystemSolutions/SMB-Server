@@ -88,7 +88,14 @@ internal static class NetUse
             // spaces so this stays locale-independent without matching a stray 67 inside a path or byte count.
             bool staleCachedConnection = output.Contains(" 67 ");
             bool staleSessionAfterSwap = output.Contains(" 1326 ");
-            if ((staleCachedConnection && attempt < 15) || (staleSessionAfterSwap && attempt < 4))
+            // 1219 ("multiple connections … using more than one user name") is the third member of the
+            // server-swap family: the redirector still holds a session to this host name authenticated
+            // against the PREVIOUS lab's server (different account), and net use /delete cannot remove a
+            // connection that is merely lingering in the client's cache. It clears when the client notices
+            // the old server is gone — same timescale as 67.
+            bool staleForeignUserConnection = output.Contains(" 1219 ");
+            if ((staleCachedConnection && attempt < 15) || (staleSessionAfterSwap && attempt < 4)
+                || (staleForeignUserConnection && attempt < 15))
             {
                 Thread.Sleep(TimeSpan.FromSeconds(1));
                 continue;

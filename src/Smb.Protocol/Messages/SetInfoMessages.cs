@@ -70,7 +70,11 @@ public static class SetInfoMessage
             Attributes = r.ReadUInt32() is var a && a != 0 ? a : null,
         };
 
-        static long? Stamp(long v) => v is 0 or -1 ? null : v;
+        // 0 = leave unchanged, -1 = stop implicit updates, -2 = resume implicit updates (MS-FSCC
+        // §2.4.7). All three mean "do not set a value now". Office sends -2 during its save dance;
+        // passing it through as a raw FILETIME made the backend throw and the SET_INFO fail with
+        // INVALID_PARAMETER, which Office answers with a retry loop — the measured save lag.
+        static long? Stamp(long v) => v is 0 or -1 or -2 ? null : v;
     }
 
     /// <summary>Reads FileRenameInformation (§2.2.39 / MS-FSCC §2.4.x): ReplaceIfExists + target path.</summary>
